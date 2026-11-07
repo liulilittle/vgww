@@ -152,5 +152,33 @@ namespace vgww {
             ip[11] = static_cast<uint8_t>(ip_ck & 0xFF);
         }
 
+        bool RelayEchoReplyToClient(const uint8_t* ip, size_t ip_len,
+                                    const uint8_t client_ip[4],
+                                    const net::WireMac& gateway_mac,
+                                    const net::WireMac& client_mac,
+                                    uint16_t original_id,
+                                    std::vector<uint8_t>& out_frame) {
+            out_frame.clear();
+            size_t segment_len = 0;
+            if (!IcmpSegmentLength(ip, ip_len, segment_len)) {
+                return false;
+            }
+            const size_t header_len =
+                static_cast<size_t>(ip[0] & 0x0F) * 4;
+            const uint8_t* icmp = ip + header_len;
+            if (kIcmpEchoReply != icmp[0]) {
+                return false;
+            }
+            const uint16_t seq =
+                static_cast<uint16_t>((icmp[6] << 8) | icmp[7]);
+            const uint8_t remote_ip[4] = {ip[12], ip[13], ip[14], ip[15]};
+            BuildRelayedEchoReplyFrame(remote_ip, client_ip, gateway_mac,
+                                       client_mac, original_id, seq,
+                                       icmp + kIcmpHeaderLen,
+                                       segment_len - kIcmpHeaderLen,
+                                       out_frame);
+            return !out_frame.empty();
+        }
+
     }  // namespace proto
 }  // namespace vgww

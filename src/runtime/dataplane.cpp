@@ -2977,22 +2977,21 @@ namespace vgww {
                         tag, entry, std::chrono::steady_clock::now())) {
                     return;  // unknown/expired tag: not ours
                 }
-                std::array<uint8_t, 4> remote_wire{};
-                // The reply's IP source is the pinging host.
-                std::memcpy(remote_wire.data(), pkt + 12, 4);
                 std::array<uint8_t, 4> client_wire{};
                 client_wire[0] = entry.client_ip.bytes[12];
                 client_wire[1] = entry.client_ip.bytes[13];
                 client_wire[2] = entry.client_ip.bytes[14];
                 client_wire[3] = entry.client_ip.bytes[15];
-                const uint16_t seq =
-                    static_cast<uint16_t>((icmp[6] << 8) | icmp[7]);
+                // ONE implementation of the reply rewrite lives in proto
+                // (RelayEchoReplyToClient): it takes the ICMP segment length
+                // from the IP total length, so the driver's Ethernet padding
+                // is never forwarded to the client as ICMP payload.
                 std::vector<uint8_t> frame;
-                proto::BuildRelayedEchoReplyFrame(
-                    remote_wire.data(), client_wire.data(), config.gateway.mac,
-                    entry.client_mac, entry.original_id, seq,
-                    icmp + proto::kIcmpHeaderLen,
-                    len - ihl - proto::kIcmpHeaderLen, frame);
+                if (!proto::RelayEchoReplyToClient(
+                        pkt, len, client_wire.data(), config.gateway.mac,
+                        entry.client_mac, entry.original_id, frame)) {
+                    return;  // malformed or not a reply
+                }
                 if (tx_rings[index]->Push(TxFrame(std::move(frame)))) {
                     ++stats->tx_frames;
                 } else {

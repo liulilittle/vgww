@@ -431,6 +431,72 @@ namespace vgww {
         return 0;
     }
 
+    /// The relayed-reply path must size the payload from the IPv4 total
+    /// length, not from the received buffer: the driver hands over the
+    /// PADDED Ethernet frame, so a reply to a 0-payload ping arrives as 60
+    /// bytes and relaying the buffer length would send the client 32 bytes
+    /// of padding as ICMP payload. This reproduces the exact computation
+    /// HandleIcmpReply runs (IcmpSegmentLength -> payload_len -> builder).
+    int TestRelayedReplyIgnoresEthernetPadding() {
+        // 16-byte payload: total length 44, padded to the 60-byte minimum.
+        auto reply = MakeRequest(kIcmpEchoReply, 0x0042, 0x0007, 16);
+        reply.resize(60, 0xAA);  // padding must never reach the client
+
+        size_t segment_len = 0;
+        CHECK(IcmpSegmentLength(reply.data(), reply.size(), segment_len));
+        CHECK(kIcmpHeaderLen + 16 == segment_len);  // not 60 - 20 = 40
+
+        const uint8_t* icmp = reply.data() + kIpv4HeaderLenMin;
+
+        // Drive the SAME entry point the data plane calls.
+        std::vector<uint8_t> frame;
+        CHECK(RelayEchoReplyToClient(reply.data(), reply.size(), kClientIp,
+                                     kGatewayMac, kClientMac, 0x0042,
+                                     frame));
+
+        const uint8_t* ip = frame.data() + net::kEthernetHeaderLen;
+        const uint16_t total = static_cast<uint16_t>((ip[2] << 8) | ip[3]);
+        CHECK(kIpv4HeaderLenMin + kIcmpHeaderLen + 16 == total);
+        CHECK(Verifies(ip, kIpv4HeaderLenMin));
+        const uint8_t* out_icmp = ip + kIpv4HeaderLenMin;
+        CHECK(Verifies(out_icmp, kIcmpHeaderLen + 16));
+        // The 16 real payload bytes survived and no padding followed.
+        CHECK(0 == std::memcmp(out_icmp + kIcmpHeaderLen, icmp + kIcmpHeaderLen, 16));
+        CHECK(frame.size() ==
+              net::kEthernetHeaderLen + kIpv4HeaderLenMin + kIcmpHeaderLen + 16);
+
+        // A 0-payload reply padded to 60 bytes must produce a bare header.
+        auto bare = MakeRequest(kIcmpEchoReply, 0x0001, 0x0002, 0);
+        bare.resize(60, 0xAA);
+        CHECK(IcmpSegmentLength(bare.data(), bare.size(), segment_len));
+        CHECK(kIcmpHeaderLen == segment_len);
+        std::vector<uint8_t> bare_frame;
+        CHECK(RelayEchoReplyToClient(bare.data(), bare.size(), kClientIp,
+                                     kGatewayMac, kClientMac, 0x0001,
+                                     bare_frame));
+        CHECK(net::kEthernetHeaderLen + kIpv4HeaderLenMin + kIcmpHeaderLen ==
+              bare_frame.size());
+
+        // A REQUEST is not a reply: the shared helper must refuse it, or a
+        // spoiled tag could turn an inbound request into a forged reply.
+        auto request = MakeRequest(kIcmpEchoRequest, 0x0001, 0x0002, 8);
+        std::vector<uint8_t> not_reply;
+        CHECK(!RelayEchoReplyToClient(request.data(), request.size(),
+                                      kClientIp, kGatewayMac, kClientMac,
+                                      0x0001, not_reply));
+        CHECK(not_reply.empty());
+
+        // A truncated datagram (total length claims more than we hold) must
+        // be refused rather than relaying a partial payload.
+        auto truncated = MakeRequest(kIcmpEchoReply, 0x0001, 0x0002, 16);
+        std::vector<uint8_t> short_frame;
+        CHECK(!RelayEchoReplyToClient(truncated.data(), 28, kClientIp,
+                                      kGatewayMac, kClientMac, 0x0001,
+                                      short_frame));
+        CHECK(short_frame.empty());
+        return 0;
+    }
+
     /// A zero-length payload must still produce a valid header-only frame.
     int TestRelayedReplyEmptyPayload() {
         std::vector<uint8_t> frame;
@@ -483,6 +549,7 @@ int main() {
     if (vgww::TestEchoReplyIgnoresGarbage()) return 1;
     if (vgww::TestRelayedReplyContents()) return 1;
     if (vgww::TestRelayedReplyEmptyPayload()) return 1;
+    if (vgww::TestRelayedReplyIgnoresEthernetPadding()) return 1;
     if (vgww::TestRelayedReplyIdSeqBoundaries()) return 1;
     if (vgww::TestBuilderAllocationFailurePropagates()) return 1;
     std::puts("test_icmp: ALL PASS");

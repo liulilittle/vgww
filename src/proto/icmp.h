@@ -84,5 +84,24 @@ namespace vgww {
                                         size_t payload_len,
                                         std::vector<uint8_t>& out_frame);
 
+        /// Relays one raw IPv4 echo REPLY datagram (as received from the
+        /// upstream host, possibly padded by the link layer) to `client_ip`
+        /// with the client's original identifier restored.
+        ///
+        /// This is the WHOLE decision the data plane makes for a reply, kept
+        /// here so it is testable and cannot drift from the request path:
+        ///   * the ICMP segment length comes from the IP total length, not
+        ///     from `ip_len` (the driver reports the padded frame length, so
+        ///     a padding-derived length would forward the padding as ICMP
+        ///     payload);
+        ///   * a malformed or non-reply datagram produces no frame.
+        /// Returns false when `out_frame` was left empty.
+        bool RelayEchoReplyToClient(const uint8_t* ip, size_t ip_len,
+                                    const uint8_t client_ip[4],
+                                    const net::WireMac& gateway_mac,
+                                    const net::WireMac& client_mac,
+                                    uint16_t original_id,
+                                    std::vector<uint8_t>& out_frame);
+
     }  // namespace proto
 }  // namespace vgww
