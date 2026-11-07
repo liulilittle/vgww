@@ -22,13 +22,18 @@ jobs:
         with:
           submodules: recursive
 
+      - name: MSVC dev shell (x64)
+        uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x64
+
       - name: Configure
         run: >-
-          cmake -S . -B build -G "Visual Studio 17 2022" -A x64
+          cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release
           -DVGWW_JEMALLOC=OFF
 
       - name: Build
-        run: cmake --build build --config Release --target vgww -- /m
+        run: cmake --build build --target vgww --parallel
 
       - name: Package
         shell: pwsh
@@ -38,7 +43,7 @@ jobs:
           } else { "${{ github.ref_name }}" }
           $stage = "stage/vgww-$tag"
           New-Item -ItemType Directory -Path $stage -Force | Out-Null
-          Copy-Item build/Release/vgww.exe $stage
+          Copy-Item build/vgww.exe $stage
           Copy-Item LICENSE, README.md, README.zh-CN.md $stage
           Compress-Archive -Path "$stage/*" -DestinationPath "vgww-$tag-win64.zip"
           "TAG=$tag" >> $env:GITHUB_ENV
@@ -49,7 +54,7 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           $zip = "vgww-$env:TAG-win64.zip"
-          $existing = gh release view "$env:TAG" --json tagName 2>$null
+          gh release view "$env:TAG" --json tagName *> $null
           if ($LASTEXITCODE -eq 0) {
             gh release upload "$env:TAG" $zip --clobber
           } else {
