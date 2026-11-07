@@ -2362,6 +2362,20 @@ void TestB20WebEnabledDefault() {
     }
     std::remove(path.c_str());
 
+    // A management UI reachable from the LAN must require a token: an empty
+    // token there would accept unauthenticated config writes.
+    CHECK(WebBindIsLoopback("127.0.0.1"));
+    CHECK(WebBindIsLoopback("127.9.9.9"));
+    CHECK(WebBindIsLoopback("::1"));
+    CHECK(WebBindIsLoopback("LOCALHOST"));
+    CHECK(!WebBindIsLoopback("0.0.0.0"));
+    CHECK(!WebBindIsLoopback("::"));
+    CHECK(!WebBindIsLoopback("192.168.0.240"));
+    CHECK(!WebBindIsLoopback(""));
+    CHECK(!WebBindRequiresToken("127.0.0.1"));
+    CHECK(WebBindRequiresToken("0.0.0.0"));
+    CHECK(WebBindRequiresToken("192.168.0.240"));
+
     // Priority rule (shared by main.cpp and the tests).
     CHECK(WebEnabledEffective(true, false, false));
     CHECK(WebEnabledEffective(false, true, false));   // --web forces on

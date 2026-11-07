@@ -72,9 +72,10 @@ TEST(MainStartup, WebOnly) {
     EXPECT_TRUE(o.web_only && o.web && !o.ui && o.headless);
 }
 
-TEST(MainStartup, NoWebIsRedundantNoop) {
+TEST(MainStartup, NoWebOverridesTheConfigDefault) {
+    // web.enabled defaults to true, so --no-web is what turns the server off.
     const vgww::StartupOptions o = vgww::ParseStartupOptions(Args({"--no-web"}));
-    EXPECT_TRUE(!o.web && o.ui);
+    EXPECT_TRUE(!o.web && o.ui && o.no_web && !o.web_only);
 }
 
 TEST(MainStartup, WebThenNoWebOff) {
@@ -310,6 +311,15 @@ TEST(MainHelp, ListsEveryEntryFlag) {
     EXPECT_TRUE(help.find("bridge/leases/about/console") != std::string::npos);
 }
 
+TEST(MainHelp, StatesTheWebUiDefaultAndPrecedence) {
+    // The help text must not contradict WebConfig::enabled (true) or the
+    // --no-web > --web precedence rule in WebEnabledEffective.
+    const std::string help = vgww::PrintUsageString();
+    EXPECT_TRUE(help.find("on by default") != std::string::npos);
+    EXPECT_TRUE(help.find("no-op") == std::string::npos);
+    EXPECT_TRUE(help.find("default: off") == std::string::npos);
+}
+
 TEST(MainHelp, OmitsRemovedFlags) {
     const std::string help = vgww::PrintUsageString();
     // Removed/deleted flags must stay absent.
@@ -346,8 +356,9 @@ namespace {
         {"web-only",         {"--web-only"},            true,  [](const vgww::StartupOptions& o) { return o.web_only && o.headless && !o.ui; }, false, true},
         {"headless",         {"--headless"},            true,  [](const vgww::StartupOptions& o) { return o.headless && !o.ui; },     false, true},
         {"minimized",        {"--minimized"},           true,  [](const vgww::StartupOptions& o) { return o.minimized; },            false, true},
-        // --no-web needs the two-arg probe: a lone --no-web is a no-op that
-        // cannot be told apart from the default (web already off).
+        // --no-web needs the two-arg probe: with the server on by default a
+        // lone --no-web only restates the parser's default, so the probe pairs
+        // it with --web to prove the "off wins" rule.
         {"no-web",           {"--web", "--no-web"},     true,  [](const vgww::StartupOptions& o) { return !o.web; },                 false, true},
         {"ui-page",          {"--ui-page=dashboard"},   true,  [](const vgww::StartupOptions& o) { return o.ui_page == "dashboard"; }, false, true},
         {"ui-debug-port",    {"--ui-debug-port=9123"},  true,  [](const vgww::StartupOptions& o) { return o.ui_debug_port == 9123; }, false, true},
@@ -506,7 +517,7 @@ int main() {
     MainStartup_MinimizedKeepsUi();
     MainStartup_MinimizedAndHeadlessHeadlessWins();
     MainStartup_WebOnly();
-    MainStartup_NoWebIsRedundantNoop();
+    MainStartup_NoWebOverridesTheConfigDefault();
     MainStartup_WebThenNoWebOff();
     MainStartup_ConsoleFlagDocumentedBehavior();
     MainStartup_UiPageParsesValue();
@@ -529,6 +540,7 @@ int main() {
     MainStartup_IsKnownUiPageRejectsUnknownAndEmpty();
     MainHelp_ListsEveryEntryFlag();
     MainHelp_OmitsRemovedFlags();
+    MainHelp_StatesTheWebUiDefaultAndPrecedence();
     MainParity_TestCliFlagThreeLayerParity();
 
     if (0 == g_failures) {

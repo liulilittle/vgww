@@ -868,6 +868,13 @@ namespace {
             }
             if (next_web) {
                 std::string web_error;
+                if (vgww::core::WebBindRequiresToken(next.web.bind) &&
+                    next.web.token.empty()) {
+                    web_error = "web.bind is not loopback and web.token is "
+                                "empty; set web.token before exposing the "
+                                "management UI";
+                    return rollback(web_error);
+                }
                 if (!http.Start(next.web.bind, next.web.port, web_error)) {
                     return rollback(web_error);
                 }
@@ -978,6 +985,14 @@ namespace {
             if (config->web.bind.empty() ||
                 config->web.bind.size() > vgww::core::limits::kMaxAdapterBytes) {
                 std::fprintf(stderr, "vgww: invalid web.bind - WebUI disabled\n");
+            } else if (vgww::core::WebBindRequiresToken(config->web.bind) &&
+                       config->web.token.empty()) {
+                // A LAN-reachable management UI without a token accepts
+                // unauthenticated config writes and privileged actions.
+                std::fprintf(stderr,
+                             "vgww: web.bind %s is not loopback and web.token "
+                             "is empty - WebUI disabled; set web.token\n",
+                             config->web.bind.c_str());
             } else if (!http.Start(config->web.bind, web_port, error)) {
                 std::fprintf(stderr, "vgww: WebUI disabled (%s)\n", error.c_str());
             } else {

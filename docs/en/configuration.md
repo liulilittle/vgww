@@ -128,7 +128,9 @@ overrides: `--adapter=<name>`, `--web-only`, `--help`.
 
 ## WebUI
 
-The embedded HTTP server is **on by default** (`web.enabled` defaults to true); `--no-web` disables it, `--web` forces it on (highest priority) and `--web-only` starts only the WebUI (no driver needed). It listens on `web.port` (default 8080) bound to `web.bind` (default `127.0.0.1` loopback; configure an explicit address for LAN access - the server never binds every interface implicitly):
+The embedded HTTP server is **on by default** (`web.enabled` defaults to true); `--no-web` disables it, `--web` forces it on (highest priority) and `--web-only` starts only the WebUI (no driver needed). It listens on `web.port` (default 8080) bound to `web.bind` (default `127.0.0.1` loopback; configure an explicit address for LAN access - the server never binds every interface implicitly).
+
+A **non-loopback `web.bind` requires a non-empty `web.token`**: without write authentication any host on the LAN could rewrite the configuration and trigger the privileged actions. The server refuses to start in that combination and prints why.
 
 * **Dashboard** — live counters and client list
 * **Port Mapping** — host-port → LAN-client forwarding rules

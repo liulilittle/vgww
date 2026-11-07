@@ -268,13 +268,40 @@ namespace vgww {
             return config_enabled;
         }
 
-        /// batch20 UI scale: the accepted values are "auto" or an absolute
-        /// percent string in the 25-step sequence 100,125,...,500 (17 options).
+        /// True when a management-UI bind address is loopback-only:
+        /// "localhost", 127.0.0.0/8 or ::1. Anything else is reachable from
+        /// the LAN and therefore needs write authentication.
+        inline bool WebBindIsLoopback(const std::string& bind) noexcept {
+            if (bind.empty()) {
+                return false;
+            }
+            std::string lower;
+            lower.reserve(bind.size());
+            for (const char c : bind) {
+                lower.push_back(static_cast<char>(
+                    (c >= 'A' && c <= 'Z') ? (c - 'A' + 'a') : c));
+            }
+            if ("localhost" == lower || "::1" == lower) {
+                return true;
+            }
+            return 0 == lower.rfind("127.", 0);
+        }
+
+        /// The management UI accepts unauthenticated writes only when it is
+        /// bound to loopback. A LAN-reachable bind with an empty token would
+        /// let any host rewrite the config (and run the privileged actions).
+        inline bool WebBindRequiresToken(const std::string& bind) noexcept {
+            return !WebBindIsLoopback(bind);
+        }
+
+
         /// batch22 A1: accepted native appearance values.
         inline bool IsValidThemeValue(const std::string& value) noexcept {
             return value == "dark" || value == "light" || value == "auto";
         }
 
+        /// UI scale: "auto" or an absolute percent in the 25-step sequence
+        /// 100,125,...,500 (17 options).
         inline bool IsValidUiScaleValue(const std::string& value) noexcept {
             if (value == "auto") {
                 return true;
