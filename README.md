@@ -93,6 +93,7 @@ See [docs/en/configuration.md](docs/en/configuration.md) ([中文](docs/zh/confi
 | [Architecture](docs/en/architecture.md) | [架构设计](docs/zh/architecture.md) |
 | [Configuration](docs/en/configuration.md) | [配置说明](docs/zh/configuration.md) |
 | [Driver installation](docs/en/driver-install.md) | [驱动安装与许可说明](docs/zh/driver-install.md) |
+| [Performance](docs/en/performance.md) | [性能](docs/zh/performance.md) |
 
 ## License
 

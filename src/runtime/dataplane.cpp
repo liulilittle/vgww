@@ -21,7 +21,7 @@
 #include "relay/portmap_manager.h"
 #include "relay/tcp_relay.h"
 #include "relay/udp_relay.h"
-#include "runtime/dataplane.h"
+#include "runtime/worker_budget.h"
 #include "tables/neighbors.h"
 #include "tables/rate_limiter.h"
 
@@ -896,6 +896,21 @@ namespace vgww {
                 relay_registry_.resize(worker_count);
                 relay_index_.resize(worker_count);
                 registry_dirty.reserve(worker_count);
+                // batch330: pre-size the per-worker hot containers. Growing
+                // them on the data path reallocates while the registry/accept
+                // mutex is held (a 4096-entry std::vector reallocation is a
+                // memcpy of every shared_ptr) and, for the hash index, forces
+                // rehash spikes exactly when the connection count climbs.
+                // max_conns caps the live relays, so this is a hard bound.
+                for (uint32_t i = 0; i < worker_count; ++i) {
+                    const size_t per_worker =
+                        runtime::PerWorkerReserve(config.perf.max_conns,
+                                                 worker_count);
+                    pending_accepts[i].reserve(per_worker);
+                    pending_teardowns_[i].reserve(per_worker);
+                    relay_registry_[i].reserve(per_worker);
+                    relay_index_[i].reserve(per_worker);
+                }
                 for (uint32_t i = 0; i < worker_count; ++i) {
                     registry_dirty.push_back(
                         std::make_unique<std::atomic<bool>>(false));
