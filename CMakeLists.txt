@@ -62,8 +62,8 @@ endif()
 
 option(VGWW_BUILD_TESTS "Build VGWW unit tests" ON)
 option(VGWW_JEMALLOC "Use jemalloc as the process-wide memory backend" ON)
-set(VGWW_XTCP_DIR "${CMAKE_CURRENT_SOURCE_DIR}/../xtcp" CACHE PATH
-    "Path to the xtcp stack checkout (sibling clone; see README)")
+set(VGWW_XTCP_DIR "${CMAKE_CURRENT_SOURCE_DIR}/third_party/xtcp" CACHE PATH
+    "Path to the xtcp stack checkout (git submodule; see README)")
 
 # jemalloc backend: statically linked from the x64-windows-static vcpkg
 # triplet (jemalloc_s.lib, same install the sibling openppp2 project uses).

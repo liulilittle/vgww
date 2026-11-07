@@ -1,0 +1,54 @@
+name: build
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  windows:
+    runs-on: windows-latest
+    timeout-minutes: 60
+    steps:
+      - name: Checkout (with submodules)
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Toolchain
+        shell: pwsh
+        run: |
+          cmake --version
+          node --version
+
+      - name: Configure
+        run: >-
+          cmake -S . -B build -G "Visual Studio 17 2022" -A x64
+          -DVGWW_JEMALLOC=OFF
+
+      - name: Build
+        run: cmake --build build --config Release -- /m
+
+      - name: Test
+        run: ctest --test-dir build -C Release --output-on-failure
+
+      - name: Gates
+        shell: pwsh
+        run: |
+          $gates = @(
+            "js-syntax", "i18n", "web-a11y", "html-safety", "api-contract",
+            "web-css", "web-logic", "native-i18n", "source-hygiene",
+            "gates-selftest"
+          )
+          $failed = @()
+          foreach ($gate in $gates) {
+            node "scripts/check-$gate.mjs" .
+            if ($LASTEXITCODE -ne 0) { $failed += $gate }
+          }
+          if ($failed.Count -ne 0) {
+            throw "gate(s) failed: $($failed -join ', ')"
+          }

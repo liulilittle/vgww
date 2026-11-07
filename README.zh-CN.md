@@ -1,5 +1,7 @@
 # VGWW — Windows 虚拟网关
 
+[![build](https://github.com/liulilittle/vgww/actions/workflows/build.yml/badge.svg)](https://github.com/liulilittle/vgww/actions/workflows/build.yml)
+
 **VGWW** 是一个高性能的 Windows 用户态软件路由器。它把一台 Windows 电脑变成局域网的默认网关：其他设备只需把网关指向这台机器，即可通过它上网——包括经由本机已连接的 VPN 虚拟网卡。
 
 [English documentation](README.md)
@@ -34,7 +36,15 @@ LAN 客户端 ←→ [WinpkFilter NDIS LWF] → RX 线程（分类/哈希）
 
 环境要求：Visual Studio 2022、CMake ≥ 3.20，首次配置需联网拉取依赖。
 
-用户态 TCP 栈（xtcp）从本地检出消费，经 `VGWW_XTCP_DIR` 指定（默认 `${CMAKE_CURRENT_SOURCE_DIR}/../xtcp`，即与本仓库同级的 xtcp 检出）；检出在其它位置时在配置命令加 `-DVGWW_XTCP_DIR=<path>`。
+用户态 TCP 栈（[xtcp](https://github.com/liulilittle/xtcp)）是 **git 子模块**，位于 `third_party/xtcp`：
+
+```bat
+git clone --recursive https://github.com/liulilittle/vgww.git
+:: 已克隆过本仓库时，补拉子模块：
+git submodule update --init --recursive
+```
+
+`VGWW_XTCP_DIR` 默认 `${CMAKE_CURRENT_SOURCE_DIR}/third_party/xtcp`；要在其它位置检出时，配置命令加 `-DVGWW_XTCP_DIR=<path>`。
 
 ```bat
 cmake -S . -B build -G "Visual Studio 17 2022" -A x64
@@ -88,7 +98,7 @@ VGWW 是自由软件，采用 **GNU Affero 通用公共许可证 v3.0**（AGPL-3
 
 | 组件 | 许可 |
 |---|---|
-| [xtcp](https://github.com/)（用户态 TCP/IP 栈，同级独立检出） | 见 xtcp 仓库 |
+| [xtcp](https://github.com/liulilittle/xtcp)（用户态 TCP/IP 栈，git 子模块） | 见 xtcp 仓库 |
 | nlohmann/json | MIT |
 | Asio | Boost Software License 1.0 |
 | WinpkFilter 用户态头文件（`third_party/ndisapi`） | MIT（NT Kernel） |

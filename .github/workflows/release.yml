@@ -1,0 +1,57 @@
+name: release
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Tag to publish (e.g. v0.1.0)"
+        required: true
+
+permissions:
+  contents: write
+
+jobs:
+  windows:
+    runs-on: windows-latest
+    timeout-minutes: 90
+    steps:
+      - name: Checkout (with submodules)
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Configure
+        run: >-
+          cmake -S . -B build -G "Visual Studio 17 2022" -A x64
+          -DVGWW_JEMALLOC=OFF
+
+      - name: Build
+        run: cmake --build build --config Release --target vgww -- /m
+
+      - name: Package
+        shell: pwsh
+        run: |
+          $tag = if ("${{ github.event_name }}" -eq "workflow_dispatch") {
+            "${{ github.event.inputs.tag }}"
+          } else { "${{ github.ref_name }}" }
+          $stage = "stage/vgww-$tag"
+          New-Item -ItemType Directory -Path $stage -Force | Out-Null
+          Copy-Item build/Release/vgww.exe $stage
+          Copy-Item LICENSE, README.md, README.zh-CN.md $stage
+          Compress-Archive -Path "$stage/*" -DestinationPath "vgww-$tag-win64.zip"
+          "TAG=$tag" >> $env:GITHUB_ENV
+
+      - name: Publish
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          $zip = "vgww-$env:TAG-win64.zip"
+          $existing = gh release view "$env:TAG" --json tagName 2>$null
+          if ($LASTEXITCODE -eq 0) {
+            gh release upload "$env:TAG" $zip --clobber
+          } else {
+            gh release create "$env:TAG" $zip --generate-notes --title "VGWW $env:TAG"
+          }

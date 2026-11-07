@@ -1,5 +1,7 @@
 # VGWW — Virtual Gateway for Windows
 
+[![build](https://github.com/liulilittle/vgww/actions/workflows/build.yml/badge.svg)](https://github.com/liulilittle/vgww/actions/workflows/build.yml)
+
 **VGWW** is a high-performance userspace software router for Windows. It turns a Windows PC into the default gateway of your LAN: other devices simply point their gateway at this machine and reach the internet through it — including through whatever VPN adapter the host has active.
 
 [简体中文文档](README.zh-CN.md)
@@ -38,7 +40,15 @@ A loadable template lives at [`config.example.json`](config.example.json) (clone
 
 Requirements: Visual Studio 2022, CMake ≥ 3.20, network access on first configure.
 
-The userspace TCP stack (xtcp) is consumed from a local checkout via `VGWW_XTCP_DIR` (default `${CMAKE_CURRENT_SOURCE_DIR}/../xtcp`; see [docs/en/configuration.md](docs/en/configuration.md)). Add `-DVGWW_XTCP_DIR=<path>` to the configure command when your checkout lives elsewhere.
+The userspace TCP stack ([xtcp](https://github.com/liulilittle/xtcp)) is a **git submodule** at `third_party/xtcp`:
+
+```bat
+git clone --recursive https://github.com/liulilittle/vgww.git
+:: already cloned? fetch the submodule:
+git submodule update --init --recursive
+```
+
+`VGWW_XTCP_DIR` defaults to `${CMAKE_CURRENT_SOURCE_DIR}/third_party/xtcp`; pass `-DVGWW_XTCP_DIR=<path>` to build against a checkout elsewhere.
 
 ```bat
 cmake -S . -B build -G "Visual Studio 17 2022" -A x64
@@ -92,7 +102,7 @@ Third-party components keep their own licenses:
 
 | Component | License |
 |---|---|
-| [xtcp](https://github.com/) (userspace TCP/IP stack, sibling checkout) | see the xtcp repository |
+| [xtcp](https://github.com/liulilittle/xtcp) (userspace TCP/IP stack, git submodule) | see the xtcp repository |
 | nlohmann/json | MIT |
 | Asio | Boost Software License 1.0 |
 | WinpkFilter user-mode headers (`third_party/ndisapi`) | MIT (NT Kernel) |
