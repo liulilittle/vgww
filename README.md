@@ -4,7 +4,7 @@
 
 **VGWW** is a high-performance userspace software router for Windows. It turns a Windows PC into the default gateway of your LAN: other devices simply point their gateway at this machine and reach the internet through it — including through whatever VPN adapter the host has active.
 
-[简体中文文档](README.zh-CN.md)
+[简体中文](README.zh-CN.md)
 
 ## Why VGWW exists
 

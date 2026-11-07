@@ -4,7 +4,7 @@
 
 **VGWW** 是一个高性能的 Windows 用户态软件路由器。它把一台 Windows 电脑变成局域网的默认网关：其他设备只需把网关指向这台机器，即可通过它上网——包括经由本机已连接的 VPN 虚拟网卡。
 
-[English documentation](README.md)
+[English](README.md)
 
 ## 为什么做 VGWW
 
