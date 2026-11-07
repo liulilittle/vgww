@@ -911,24 +911,40 @@ namespace {
         accept("65536", 65536);
     }
 
+/// batch329: the sample config lives at the repository root. The ctest
+/// working directory depends on the generator (VS: build/Release, Ninja:
+/// build/), so probe the known layouts instead of hardcoding one.
+std::string ExampleConfigPath() {
+    static const char* kCandidates[] = {
+        "../../config.example.json",  // Visual Studio multi-config: build/Release
+        "../config.example.json",     // Ninja single-config: build
+        "config.example.json",        // launched from the repository root
+    };
+    for (const char* candidate : kCandidates) {
+        std::ifstream probe(candidate);
+        if (probe.good()) {
+            return std::string(candidate);
+        }
+    }
+    return std::string();
+}
+
 void TestExampleConfigRoundTrip() {
         // The checked-in sample config must stay loadable and valid, so the
         // template cannot rot into an unaddressable example. A missing
         // example is an explicit failure, never a silent skip (S3-Task4-F1):
         // the ctest WORKING_DIRECTORY registration below guarantees the
         // probe resolves to the repository sample.
-        {
-            std::ifstream probe("../../config.example.json");
-            if (!probe.good()) {
-                std::fprintf(stderr,
-                             "TestExampleConfigRoundTrip: "
-                             "../../config.example.json not found\n");
-                CHECK(false);
-                return;
-            }
+        const std::string example = ExampleConfigPath();
+        if (example.empty()) {
+            std::fprintf(stderr,
+                         "TestExampleConfigRoundTrip: "
+                         "config.example.json not found in any known layout\n");
+            CHECK(false);
+            return;
         }
         std::string error;
-        auto config = Config::LoadFromFile("../../config.example.json", error);
+        auto config = Config::LoadFromFile(example, error);
         CHECK(config.has_value());
         // The shipped bridge section stays disabled with spec values.
         if (config) {
@@ -1722,19 +1738,16 @@ void TestExampleDhcpPoolKeys() {
     // config.example.json uses the pool_start/pool_end spelling; the loader
     // must accept it (both keys present) and wire the same bytes as the
     // "pool" array form.
-    {
-        std::ifstream probe("../../config.example.json");
-        if (!probe.good()) {
-            std::fprintf(stderr,
-                         "TestExampleDhcpPoolKeys: "
-                         "../../config.example.json not found\n");
-            CHECK(false);
-            return;
-        }
+    const std::string example = ExampleConfigPath();
+    if (example.empty()) {
+        std::fprintf(stderr,
+                     "TestExampleDhcpPoolKeys: "
+                     "config.example.json not found in any known layout\n");
+        CHECK(false);
+        return;
     }
     std::string error;
-    const auto cfg =
-        Config::LoadFromFile("../../config.example.json", error);
+    const auto cfg = Config::LoadFromFile(example, error);
     CHECK(cfg.has_value());
     if (!cfg) {
         std::fprintf(stderr, "example load error: %s\n", error.c_str());

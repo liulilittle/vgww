@@ -392,6 +392,13 @@ namespace vgww {
             float ToLogical(int px) const noexcept { return px / scale_; }
             /// Test seam: sets the DPI from a scale factor (clamped >= 0.5).
             void SetDpiForTest(float scale) noexcept;
+
+            /// batch329: pins the desktop work area used by the geometry
+            /// restore and the DPI clamp so tests do not depend on the host
+            /// monitor layout (a small CI work area rejects the restored size
+            /// at load time, before the clamp is reached).
+            void SetWorkAreaForTest(Size work) noexcept;
+            void ClearWorkAreaForTest() noexcept;
             /// Test seam (T8): injects the modifier-key mask RouteKey reads
             /// for its Shift+Tab direction test, instead of the process-wide
             /// ::GetKeyState. bit 0 = Shift, bit 1 = Ctrl, bit 2 = Alt.
@@ -1004,6 +1011,9 @@ namespace vgww {
             bool size_sync_pending_ = false;
             /// Last requested physical size (headless P1 anchor).
             Size last_size_request_{};
+            // batch329: test-only work area override (see SetWorkAreaForTest).
+            Size work_area_override_{};
+            bool has_work_area_override_ = false;
             /// batch28: restored geometry (invalid = use the design defaults).
             ui_state::WindowState restored_;
             bool restore_pending_ = false;

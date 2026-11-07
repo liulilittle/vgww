@@ -172,6 +172,16 @@ namespace vgww {
             ApplyDpi(96.0f * scale);
         }
 
+        void VgwwWindow::SetWorkAreaForTest(Size work) noexcept {
+            work_area_override_ = work;
+            has_work_area_override_ = true;
+        }
+
+        void VgwwWindow::ClearWorkAreaForTest() noexcept {
+            has_work_area_override_ = false;
+            work_area_override_ = Size{};
+        }
+
         Size VgwwWindow::scaled_client_size() const noexcept {
             return Size{DarkTheme().min_window.w * scale_,
                         DarkTheme().min_window.h * scale_};
@@ -218,6 +228,12 @@ namespace vgww {
                         info.rcWork.right - info.rcWork.left,
                         info.rcWork.bottom - info.rcWork.top};
                 }
+            }
+            if (has_work_area_override_) {
+                primary = ui_state::RectI{
+                    0, 0, static_cast<int>(work_area_override_.w),
+                    static_cast<int>(work_area_override_.h)};
+                areas.assign(1, primary);
             }
             if (primary.w <= 0 || primary.h <= 0) {
                 return;
@@ -348,6 +364,11 @@ namespace vgww {
             // primary desktop and needs no window handle, so the headless
             // paths (which have a real desktop in the test harness) clamp the
             // same way the visible ones do.
+            if (has_work_area_override_) {
+                size.w = (std::min)(size.w, work_area_override_.w);
+                size.h = (std::min)(size.h, work_area_override_.h);
+                return size;
+            }
             RECT work{};
             if (::SystemParametersInfoW(SPI_GETWORKAREA, 0, &work, 0)) {
                 size.w = (std::min)(size.w,

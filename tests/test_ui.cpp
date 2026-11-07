@@ -31793,15 +31793,14 @@ static void TestB229DpiFallbackClampsToWorkArea() {
     FixTextMetrics();
     I18n::Instance().SetLang(Lang::En);
 
-    // The primary work area in physical pixels - the same source the window
-    // clamps against (SystemParametersInfoW(SPI_GETWORKAREA)).
-    RECT work{};
-    CHECK(::SystemParametersInfoW(SPI_GETWORKAREA, 0, &work, 0) != FALSE);
-    const float work_w = static_cast<float>(work.right - work.left);
-    const float work_h = static_cast<float>(work.bottom - work.top);
-    CHECK(work_w > 0.0f && work_h > 0.0f);
+    // batch329: pin the work area. Reading the real desktop made this test
+    // fail on small CI screens (0.75 x 768 = 576 px is below the minimum
+    // window size, so the restore is rejected before the clamp runs).
+    const float work_w = 1920.0f;
+    const float work_h = 1080.0f;
 
     VgwwWindow window;
+    window.SetWorkAreaForTest(Size{work_w, work_h});
     // Restore a window that fits at 100% but not at 200%: the clamp at load
     // time accepts it, and the DPI raise is what overflows.
     const float logical_w = work_w * 0.75f;
@@ -31847,6 +31846,7 @@ static void TestB229DpiFallbackClampsToWorkArea() {
     // because a mutation that drops one of them is otherwise invisible.
     {
         VgwwWindow second;
+        second.SetWorkAreaForTest(Size{work_w, work_h});
         {
             wchar_t path[MAX_PATH]{};
             CHECK(::GetTempPathW(MAX_PATH, path) != 0);
@@ -31877,6 +31877,7 @@ static void TestB229DpiFallbackClampsToWorkArea() {
     // and every assertion above would still pass.
     {
         VgwwWindow small;
+        small.SetWorkAreaForTest(Size{work_w, work_h});
         // Small enough to fit with room to spare, but above the window
         // minimum (RestoreWindowState rejects anything smaller and the
         // pending restore would simply be absent).
