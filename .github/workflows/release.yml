@@ -18,22 +18,18 @@ jobs:
     timeout-minutes: 90
     steps:
       - name: Checkout (with submodules)
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
         with:
           submodules: recursive
 
-      - name: MSVC dev shell (x64)
-        uses: ilammy/msvc-dev-cmd@v1
-        with:
-          arch: x64
-
-      - name: Configure
-        run: >-
-          cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release
-          -DVGWW_JEMALLOC=OFF
-
-      - name: Build
-        run: cmake --build build --target vgww --parallel
+      - name: Configure and build
+        shell: cmd
+        run: |
+          for /f "usebackq delims=" %%i in (`"%ProgramFiles(x86)%\Microsoft Visual Studio\Installer\vswhere.exe" -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath`) do set "VSPATH=%%i"
+          if not defined VSPATH exit /b 1
+          call "%VSPATH%\Common7\Tools\VsDevCmd.bat" -arch=x64 -host_arch=x64 || exit /b 1
+          cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DVGWW_JEMALLOC=OFF || exit /b 1
+          cmake --build build --target vgww --parallel || exit /b 1
 
       - name: Package
         shell: pwsh

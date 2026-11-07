@@ -15,32 +15,21 @@ jobs:
     timeout-minutes: 60
     steps:
       - name: Checkout (with submodules)
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
         with:
           submodules: recursive
 
-      - name: MSVC dev shell (x64)
-        uses: ilammy/msvc-dev-cmd@v1
-        with:
-          arch: x64
-
-      - name: Toolchain
-        shell: pwsh
+      - name: Configure, build and test
+        shell: cmd
         run: |
-          cmake --version
-          ninja --version
-          node --version
-
-      - name: Configure
-        run: >-
-          cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release
-          -DVGWW_JEMALLOC=OFF
-
-      - name: Build
-        run: cmake --build build --parallel
-
-      - name: Test
-        run: ctest --test-dir build --output-on-failure
+          for /f "usebackq delims=" %%i in (`"%ProgramFiles(x86)%\Microsoft Visual Studio\Installer\vswhere.exe" -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath`) do set "VSPATH=%%i"
+          if not defined VSPATH exit /b 1
+          call "%VSPATH%\Common7\Tools\VsDevCmd.bat" -arch=x64 -host_arch=x64 || exit /b 1
+          cmake --version || exit /b 1
+          ninja --version || exit /b 1
+          cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DVGWW_JEMALLOC=OFF || exit /b 1
+          cmake --build build --parallel || exit /b 1
+          ctest --test-dir build --output-on-failure || exit /b 1
 
       - name: Gates
         shell: pwsh
