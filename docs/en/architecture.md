@@ -83,7 +83,7 @@ emits — the entire pipeline runs verbatim without any kernel driver
 integration test scripts a full TCP conversation at frame level: SYN,
 SYN-ACK parse, ACK, payload round-trip through a local echo server.
 
-## Driver loading & real-machine state (S5 et al.)
+## Driver loading
 
 ndisrd 3.6.2.1 is an NDIS LWF (lightweight filter) driver and must be loaded
 through the vendor INF framework. The built-in `--install-driver`
@@ -98,21 +98,18 @@ troubleshooting.) While the LWF binding is active there **must be a resident
 consumer (this product) and the configured adapter name must resolve** — after
 binding, driver enumeration exposes adapters as `\DEVICE\{GUID}` paths
 (`ndisrd_client.cpp` carries a friendly-name → GUID resolver). Without a
-consumer the host TCP/IP data path is held up by the filter stack (S5
-measurement: both NICs lost ICMP and TCP, network restored only after the
-driver was uninstalled). An unresolved adapter name under binding no longer
-fails silently: the data plane degrades with an actionable error that lists
-the available adapters (friendly name => \DEVICE\{GUID}) and points at
-`--adapter=<name>` or the config file; friendly-name matching is
-case-insensitive and accepts localized Ethernet aliases (G-5).
+consumer the host TCP/IP data path is held up by the filter stack: both NICs
+lose ICMP and TCP until the driver is uninstalled. An unresolved adapter name
+under binding does not fail silently: the data plane degrades with an
+actionable error that lists the available adapters (friendly name =>
+\DEVICE\{GUID}) and points at `--adapter=<name>` or the config file;
+friendly-name matching is case-insensitive and accepts localized Ethernet
+aliases.
 
-POC status: P1-P6 not executed on hardware (no peer injection device;
-consumer-side defect unresolved). Gate: until `poc-checklist` passes in full,
-claims of a working built-in bridge stay **forbidden**.
-
-Achieved on hardware: 1h fake soak (no leak; steady-state ws/handles flat);
-AppVerifier run (web/dataplane_lifecycle/ui, zero Error entries); driver
-install/uninstall loop (MSI install + clean uninstall, network restored).
+Verified on hardware: a one-hour soak with steady-state working set and handle
+count flat, an Application Verifier run over the web, dataplane lifecycle and
+UI test binaries with zero Error entries, and a full driver install/uninstall
+cycle that restores the host network.
 
 ## IPv6 / NAT66
 

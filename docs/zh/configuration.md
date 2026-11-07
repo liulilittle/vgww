@@ -111,11 +111,11 @@ VGWW 从 JSON 配置文件读取配置（`--config=vgww.json`）。命令行覆�
 * `mode: bypass` 下 DHCPv4/DHCPv6/RA 均不装配（即使各自 `enabled: true`）；`mode: main` 且对应 `enabled: true` 时才装配，且 `ipv6.enabled=false` 会同时关闭 RA 与 DHCPv6。
 * 未知的命令行参数会被拒绝。
 * 缺少 `gateway` 段是致命错误。
-* 桥：`enabled: true` 时 `upstream`/`downstream` 均不能为空且必须不同；`mac_table_size` 越界（`0` 或 >65536）拒绝。桥默认关闭；开启需驱动混杂模式权限（可能需要管理员/驱动重装）。WLAN 端口 v1 不支持；标准驱动版 MTU≤1500。主机侧桥接（Windows 网桥/Hyper-V 虚拟交换机）兼容性未经 POC，**不得作为已支持功能声称**。
+* 桥：`enabled: true` 时 `upstream`/`downstream` 均不能为空且必须不同；`mac_table_size` 越界（`0` 或 >65536）拒绝。桥默认关闭；开启需驱动混杂模式权限（可能需要管理员/驱动重装）。WLAN 端口 v1 不支持；标准驱动版 MTU≤1500。主机侧桥接（Windows 网桥/Hyper-V 虚拟交换机）未经验证，不受支持；不要把内置桥与它组合使用。
 
 ## WebUI
 
-内嵌 HTTP 服务器**默认关闭**；`--web` 显式开启（`set`），`--web-only` 仅启动 WebUI（无需驱动），`--no-web` 为冗余兼容项（默认已关）。它监听 `web.port`（默认 8080），并绑定 `web.bind`（默认 `127.0.0.1` 回环；如需局域网访问请显式配置为监听地址，**不会**隐式绑定所有网卡）：
+内嵌 HTTP 服务器**默认开启**（`web.enabled` 默认 true）；`--no-web` 关闭它，`--web` 强制开启（最高优先级），`--web-only` 仅启动 WebUI（无需驱动）。它监听 `web.port`（默认 8080），并绑定 `web.bind`（默认 `127.0.0.1` 回环；如需局域网访问请显式配置为监听地址，**不会**隐式绑定所有网卡）：
 
 * **Dashboard** — 实时计数器与客户端列表
 * **Port Mapping** — 主机端口 → 局域网客户端转发规则

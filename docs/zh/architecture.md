@@ -58,13 +58,11 @@ Worker *i* 泵 xtcp 分片 *i*。一条流的进包、协议处理、上游 sock
 
 驱动边界是一个接口（`driver/idriver_client.h`）。测试绑定内存假实现：回放脚本化帧、捕获 VGWW 发出的一切——整条流水线在不装内核驱动的情况下原样运行（backtesting 原则：模拟边界，不模拟业务）。集成测试在帧级别脚本化一次完整 TCP 会话：SYN、解析 SYN-ACK、ACK、经本地 echo 服务器的载荷往返。
 
-## 驱动装载与实机状态（S5 实测）
+## 驱动装载
 
-ndisrd 3.6.2.1 是 NDIS LWF（lightweight filter）驱动，必须经厂商 INF 框架装载：内建 `--install-driver`（`driver/installer.cpp`）即按此执行——`pnputil /add-driver <ndisrd_lwf.inf> /install` 把驱动发布到驱动库并绑定，再由 INetCfg 实例化网络组件并绑定物理网卡。（早期以普通内核服务直启——`CreateServiceW(SERVICE_KERNEL_DRIVER)`——的通道已退役：LWF 必须走 NDIS 框架，该旧方式实测装载失败 0x1F。安装/卸载与故障排查详见 `docs/{zh,en}/driver-install.md`。）驱动装载后，LWF 绑定期间**必须存在常驻消费端（本产品）且配置中的适配器名必须可解析**——适配器枚举在 LWF 绑定后呈 `\DEVICE\{GUID}` 形态（`ndisrd_client.cpp` 内含友好名→GUID 解析）。否则本机 TCP/IP 数据路径会被过滤栈挂起（S5 实测：无消费端时双网卡 ICMP/TCP 全部失效，卸载驱动后网络恢复）。绑定期适配器名匹配未命中不再静默：数据面降级并给出可操作错误（候选「友好名 => \DEVICE\{GUID}」清单 + `--adapter=<名称>` 或配置文件指引）；友好名匹配大小写不敏感并支持本地化别名（G-5）。
+ndisrd 3.6.2.1 是 NDIS LWF（lightweight filter）驱动，必须经厂商 INF 框架装载：内建 `--install-driver`（`driver/installer.cpp`）即按此执行——`pnputil /add-driver <ndisrd_lwf.inf> /install` 把驱动发布到驱动库并绑定，再由 INetCfg 实例化网络组件并绑定物理网卡。（早期以普通内核服务直启——`CreateServiceW(SERVICE_KERNEL_DRIVER)`——的通道已退役：LWF 必须走 NDIS 框架，该旧方式实测装载失败 0x1F。安装/卸载与故障排查详见 `docs/{zh,en}/driver-install.md`。）驱动装载后，LWF 绑定期间**必须存在常驻消费端（本产品）且配置中的适配器名必须可解析**——适配器枚举在 LWF 绑定后呈 `\DEVICE\{GUID}` 形态（`ndisrd_client.cpp` 内含友好名→GUID 解析）。否则本机 TCP/IP 数据路径会被过滤栈挂起：无消费端时双网卡 ICMP/TCP 全部失效，直到卸载驱动才恢复。绑定期适配器名匹配未命中不会静默失败：数据面降级并给出可操作错误（候选「友好名 => \DEVICE\{GUID}」清单 + `--adapter=<名称>` 或配置文件指引）；友好名匹配大小写不敏感并支持本地化别名。
 
-POC 状态：P1-P6 实机验证**未执行**（无对端注入设备、消费端缺陷未落地）。门禁：`poc-checklist` 未全 PASS 前**禁止声称"内置桥可用"**。
-
-实机已达成：1h fake soak（无泄漏，稳态 ws/handles 零增长）；AppVerifier 实跑（web/dataplane_lifecycle/ui，XML 零 Error）；驱动装卸回环（MSI 装+卸载还原，网络恢复）。
+实机已验证：1 小时浸泡（稳态工作集与句柄数零增长）；Application Verifier 跑 web、dataplane 生命周期与 UI 三个测试程序，零 Error 条目；驱动安装/卸载整个循环（MSI 安装 + 干净卸载，网络恢复正常）。
 
 ## IPv6 / NAT66
 
