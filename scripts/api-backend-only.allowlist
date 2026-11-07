@@ -1,0 +1,3 @@
+# Routes that exist in src/web/web_api.cpp but are intentionally not called
+# by www/index.html (e.g. no DHCP page yet). Regenerate with:
+#   node scripts/check-api-contract.mjs <repo-root> --update

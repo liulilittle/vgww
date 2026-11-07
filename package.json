@@ -1,0 +1,10 @@
+{
+  "name": "vgww",
+  "version": "0.0.0",
+  "private": true,
+  "description": "Build wrapper so CI and tooling can drive the native CMake + MSVC (build_s4) build through a uniform entry point. Requires the VS2022 CMake binaries on PATH (they are not installed globally).",
+  "scripts": {
+    "build": "cmake --build build_s4 --config Release --target vgww -- /m:1 /nodeReuse:false",
+    "check": "node scripts/check-js-syntax.mjs . && node scripts/check-html-safety.mjs . && node scripts/check-i18n.mjs ."
+  }
+}

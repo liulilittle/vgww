@@ -1,0 +1,4 @@
+# web_css allowlist: class tokens that may appear in the page without a
+# rule in its inline <style>. Each must also have a documented reason in
+# scripts/check-web-css.mjs (ALLOW). Regenerate with --update.
+nav-icon

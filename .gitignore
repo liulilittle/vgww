@@ -1,0 +1,31 @@
+# Build outputs
+VGW-release/
+x64/
+build/
+build-*/
+build_*/
+*.obj
+*.pdb
+*.exe
+*.dll
+Testing/
+
+# Local runtime state
+logs/
+*.log
+vgww_run.log
+test_*.json
+b*_roundtrip*.json
+web-test.json
+leases.json
+dump-leases.json
+*.rules.json
+
+# Local machine configs (never commit real NIC/gateway setups)
+config.json
+config.nic*.json
+
+# Internal working notes / agent state
+.opencode/
+.superpowers/
+COMMITMSG.txt

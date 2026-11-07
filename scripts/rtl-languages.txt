@@ -1,0 +1,21 @@
+# RTL language codes covered by www/index.html I18N table.
+# One language code per line; '#' starts a comment.
+# Every code listed here must have a "lang.rtl" entry in its I18N block
+# (checked by scripts/check-i18n.mjs).
+ar
+he
+fa
+ur
+ug
+ps
+sd
+yi
+dv
+ckb
+pnb
+skr
+azb
+mzn
+glk
+bqi
+aeb

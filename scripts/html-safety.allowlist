@@ -1,0 +1,3 @@
+# html-safety allowlist for scripts/check-html-safety.mjs.
+# Format: <path>:<line> suppresses the finding(s) on that line.
+# Regenerate: node scripts/check-html-safety.mjs <repo-root> --update

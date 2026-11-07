@@ -1,0 +1,58 @@
+WinpkFilter (Windows Packet Filter) 官方获取报告
+任务:下载最新官方 x64 安装包,解包提取 ndisrd.sys 并校验
+执行者:子代理;日期:2026-09-19;主机:Windows 11 Enterprise Build 26200 (x64),PowerShell 64bit
+
+== 1. 版本与来源 ==
+发布版本 : v3.6.2 (asset 版本号 3.6.2.1)
+发布时间 : 2025-10-23T09:12:20Z
+官方仓库 : https://github.com/wiresock/ndisapi (官方渠道,官方下载页 https://www.ntkernel.com/windows-packet-filter/download/ 指向该 GitHub Releases)
+Release 页: https://github.com/wiresock/ndisapi/releases/tag/v3.6.2
+查询方式 : GitHub REST API /repos/wiresock/ndisapi/releases/latest (HTTP 200)
+Asset    : Windows.Packet.Filter.3.6.2.1.x64.msi (API 报 819200 B)
+下载 URL : https://github.com/wiresock/ndisapi/releases/download/v3.6.2/Windows.Packet.Filter.3.6.2.1.x64.msi
+Release 说明确认: 3.6.2 修复 3.6.1 驱动签名证书过期导致无法加载问题;与 3.6.1 二进制兼容;仅重建 Win7+ 驱动。
+官方 Release/下载页均未发布 SHA 校验和(已查 release body,无 checksum 字段)。
+
+== 2. 下载产物 ==
+路径  : E:\vgww\third_party\winpkfilter\Windows.Packet.Filter.3.6.2.1.x64.msi
+大小  : 819200 B (与 API asset.size 一致)
+SHA256: 9C388C0B7F189F7FA98720BAE2CAECF7D64F30910838B80B438ECF8956B8502C
+签名  : Authenticode=Valid;签名者 CN=The Anti-Cloud Corporation (NT KERNEL 主体),
+        Issuer CN=Sectigo Public Code Signing CA EV R36,有效期 2024-06-07 ~ 2027-06-08
+
+== 3. 解包方式 ==
+方式  : msiexec 管理式安装(administrative install,仅解包不安装)
+命令  : msiexec.exe /a "<msi>" /qn TARGETDIR="E:\vgww\third_party\winpkfilter\extract\"
+结果  : ExitCode=0,一次成功;未走 7z/expand/其他替代路径
+解包树: extract\PFiles64\Windows Packet Filter\
+          certificates\sha256\cert_ip.cer (2850 B)
+          drivers\win10\{ndisrd.cat 12032, ndisrd.sys 71024, ndisrd_lwf.inf 2791}
+          drivers\win7 \{ndisrd.cat 14128, ndisrd.sys 60328, ndisrd_lwf.inf 2791}
+          drivers\win8 \{ndisrd.cat 14214, ndisrd.sys 60328, ndisrd_lwf.inf 2791}
+选择 win10 目录(Windows 10/11 适用);win7/win8 为旧系统版本未采用。
+
+== 4. 提取产物(根目录) ==
+E:\vgww\third_party\winpkfilter\ndisrd.sys
+  大小  : 71024 B
+  SHA256: 8623A9C34531CF73DE4286AD518B84AF03A331C78959769A1CA38723E3258984
+  版本资源: FileVersion=3.6.2.1, ProductVersion=3.6.2.1, CompanyName=NT KERNEL,
+            FileDescription=NDIS Filter driver, OriginalFilename=ndisrd.sys,
+            InternalName=ndisrd, LegalCopyright="Copyright (C) NT KERNEL 2000-2025"
+  签名  : Authenticode=Valid;签名者同 MSI (The Anti-Cloud Corporation / Sectigo EV)
+E:\vgww\third_party\winpkfilter\ndisrd_lwf.inf
+  大小  : 2791 B
+  SHA256: 71DBE4B33F3654F3E37D27F507D1CD6ADE70FB9C1A327435155C6C71DD137654
+一致性: 根目录副本 SHA256 == 解包源文件 SHA256 (True)。
+
+== 5. 与历史交付版本对比 ==
+历史(旧机交付): 71024 B,SHA256 前缀 8623A9C3(记录于 .opencode\process.md:283 为 8623A9C34531CF73)
+本次          : 71024 B,SHA256 8623A9C34531CF73DE4286AD518B84AF03A331C78959769A1CA38723E3258984
+结论          : 大小一致、SHA256 前缀逐位一致,判定为同一二进制(均为 3.6.2.1 版),与旧版完全一致。
+
+== 6. 失败与替代路径 ==
+主路径一次成功;无替代路径需求。唯一插曲:校验脚本首次使用 PowerShell 7 的 "??" 运算符,在此 5.1 环境报 ParserError,改为显式 if/else 后立即成功(不涉及下载/解包)。
+
+== 7. 环境与禁令遵守 ==
+系统当前 ndisrd 服务状态: NOT_INSTALLED(未安装任何驱动,与任务背景一致)
+未执行: 驱动安装、sc create、注册表修改、安装器安装模式/GUI 运行、git 提交
+写入范围: 仅 E:\vgww\third_party\winpkfilter\(含 extract 子目录);未触碰其他路径

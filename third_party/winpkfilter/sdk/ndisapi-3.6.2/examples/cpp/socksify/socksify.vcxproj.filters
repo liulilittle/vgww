@@ -1,0 +1,71 @@
+﻿<?xml version="1.0" encoding="utf-8"?>
+<Project ToolsVersion="4.0" xmlns="http://schemas.microsoft.com/developer/msbuild/2003">
+  <ItemGroup>
+    <Filter Include="Source Files">
+      <UniqueIdentifier>{4FC737F1-C7A5-4376-A066-2A32D752A2FF}</UniqueIdentifier>
+      <Extensions>cpp;c;cc;cxx;def;odl;idl;hpj;bat;asm;asmx</Extensions>
+    </Filter>
+    <Filter Include="Header Files">
+      <UniqueIdentifier>{93995380-89BD-4b04-88EB-625FBE52EBFB}</UniqueIdentifier>
+      <Extensions>h;hh;hpp;hxx;hm;inl;inc;ipp;xsd</Extensions>
+    </Filter>
+    <Filter Include="Resource Files">
+      <UniqueIdentifier>{67DA6AB6-F800-4c08-8B7A-83BB121AAD01}</UniqueIdentifier>
+      <Extensions>rc;ico;cur;bmp;dlg;rc2;rct;bin;rgs;gif;jpg;jpeg;jpe;resx;tiff;tif;png;wav;mfcribbon-ms</Extensions>
+    </Filter>
+    <Filter Include="Header Files\common">
+      <UniqueIdentifier>{f58d99f8-6dfc-44e1-9ff2-381efcda5d4d}</UniqueIdentifier>
+    </Filter>
+    <Filter Include="Header Files\common\ndisapi">
+      <UniqueIdentifier>{b7bffef8-2d56-4887-94c9-a3a5c019c40c}</UniqueIdentifier>
+    </Filter>
+    <Filter Include="Header Files\common\proxy">
+      <UniqueIdentifier>{d2c8bd97-dd78-4184-a752-bea62281490c}</UniqueIdentifier>
+    </Filter>
+    <Filter Include="Header Files\common\iphelper">
+      <UniqueIdentifier>{1c70c634-1a25-4ca7-8a49-fd48b2225e0e}</UniqueIdentifier>
+    </Filter>
+  </ItemGroup>
+  <ItemGroup>
+    <ClInclude Include="pch.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="..\common\proxy\proxy_common.h">
+      <Filter>Header Files\common\proxy</Filter>
+    </ClInclude>
+    <ClInclude Include="..\common\proxy\socks5_tcp_proxy_socket.h">
+      <Filter>Header Files\common\proxy</Filter>
+    </ClInclude>
+    <ClInclude Include="..\common\proxy\tcp_proxy_server.h">
+      <Filter>Header Files\common\proxy</Filter>
+    </ClInclude>
+    <ClInclude Include="..\common\proxy\tcp_proxy_socket.h">
+      <Filter>Header Files\common\proxy</Filter>
+    </ClInclude>
+    <ClInclude Include="..\common\iphelper\process_lookup.h">
+      <Filter>Header Files\common\iphelper</Filter>
+    </ClInclude>
+    <ClInclude Include="..\common\ndisapi\local_redirect.h">
+      <Filter>Header Files\common\ndisapi</Filter>
+    </ClInclude>
+    <ClInclude Include="..\common\proxy\socks5_common.h">
+      <Filter>Header Files\common\proxy</Filter>
+    </ClInclude>
+    <ClInclude Include="..\common\ndisapi\simple_packet_filter.h">
+      <Filter>Header Files\common\ndisapi</Filter>
+    </ClInclude>
+  </ItemGroup>
+  <ItemGroup>
+    <ClCompile Include="pch.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="socksify.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+  </ItemGroup>
+  <ItemGroup>
+    <None Include="README.md" />
+    <None Include="vcpkg.json" />
+    <None Include="vcpkg-configuration.json" />
+  </ItemGroup>
+</Project>
