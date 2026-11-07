@@ -2970,6 +2970,14 @@ namespace vgww {
                 if (icmp[0] != proto::kIcmpEchoReply) {
                     return;
                 }
+                // Validate the datagram BEFORE spending the tag (D18: verify
+                // preconditions, then mutate). The tag is one-shot, so a
+                // malformed or truncated reply carrying a live tag must not
+                // burn it - the real reply would then be dropped.
+                size_t segment_len = 0;
+                if (!proto::IcmpSegmentLength(pkt, len, segment_len)) {
+                    return;  // truncated/inconsistent datagram
+                }
                 const uint16_t tag =
                     static_cast<uint16_t>((icmp[4] << 8) | icmp[5]);
                 relay::IcmpRelay::TagEntry entry;
@@ -3004,12 +3012,19 @@ namespace vgww {
             void HandleUdpV6(uint32_t index, xtcp::buf::BufRef& packet) {
                 const uint8_t* ip = packet.Data();  // IPv6 header (L3 buffer)
                 const uint32_t len = packet.Len();
-                if (len < 40 + proto::kUdpHeaderLen) {
+                // The IPv6 payload length is the authoritative datagram
+                // size: the capture can extend past it, and bytes past
+                // the declared datagram are not ours to forward.
+                size_t segment_len = 0;
+                if (!proto::UdpSegmentLengthV6(ip, len, segment_len)) {
                     ++stats->rx_dropped;
                     return;
                 }
                 proto::UdpView uv;
-                if (!proto::ParseUdp(ip + 40, len - 40, uv)) {
+                // Parse INSIDE the declared datagram: reading the UDP
+                // header out of bytes past `segment_len` would invent a
+                // four-tuple the sender never wrote.
+                if (!proto::ParseUdp(ip + 40, segment_len, uv)) {
                     ++stats->rx_dropped;
                     return;
                 }
@@ -3052,15 +3067,9 @@ namespace vgww {
                             }
                         };
                 }
-                // IPv6 payload-length field (IPv6 header + UDP header +
-                // payload) is the authoritative datagram bound
-                const uint16_t pl6 =
-                    static_cast<uint16_t>((ip[4] << 8) | ip[5]);
-                const size_t avail =
-                    (pl6 >= proto::kUdpHeaderLen &&
-                     static_cast<size_t>(pl6) <= len - 40)
-                        ? (static_cast<size_t>(pl6) - proto::kUdpHeaderLen)
-                        : (len - 40 - proto::kUdpHeaderLen);
+                // Send at most the datagram the sender declared, and
+                // never more than the datagram itself (not the capture).
+                const size_t avail = segment_len - proto::kUdpHeaderLen;
                 const size_t declared =
                     (uv.length >= proto::kUdpHeaderLen)
                         ? (static_cast<size_t>(uv.length) -
@@ -3073,12 +3082,18 @@ namespace vgww {
             void HandleUdp(uint32_t index, xtcp::buf::BufRef& packet) {
                 const uint8_t* ip = packet.Data();
                 const uint32_t len = packet.Len();
-                if (len < 28) {
+                // The IPv4 total length is the authoritative datagram
+                // size: the link layer pads short frames and the driver
+                // reports that padded length, so a buffer-derived bound
+                // would forward the padding as UDP payload. The helper
+                // also judges the IHL (batch126 rule, same as ICMP).
+                size_t ihl = 0;
+                size_t segment_len = 0;
+                if (!proto::UdpSegmentLengthV4(ip, len, ihl, segment_len)) {
                     ++stats->rx_dropped;
                     return;
                 }
                 proto::UdpView uv;
-                const size_t ihl = static_cast<size_t>(ip[0] & 0x0F) * 4;
                 // Defense-in-depth: the classifier forwards fragmented UDP to
                 // the host, but if a fragment ever reaches the relay handler
                 // it must be dropped, never sent upstream as a truncated
@@ -3092,7 +3107,8 @@ namespace vgww {
                     ++stats->rx_dropped;
                     return;
                 }
-                if (!proto::ParseUdp(ip + ihl, len - ihl, uv)) {
+                // Parse inside the declared datagram, not the capture.
+                if (!proto::ParseUdp(ip + ihl, segment_len, uv)) {
                     ++stats->rx_dropped;
                     return;
                 }
@@ -3148,18 +3164,15 @@ namespace vgww {
                             }
                         };
                 }
-                const size_t ihl2 = static_cast<size_t>(ip[0] & 0x0F) * 4;
-                // Send exactly the datagram declared by the UDP length field;
-                // the buffer may extend past it with Ethernet padding after a
-                // fragmentation reassembly, and extra bytes would otherwise be
-                // forwarded as payload.
-                const size_t avail = len - ihl2 - proto::kUdpHeaderLen;
+                // Send at most the datagram the sender declared, and
+                // never more than the datagram itself (not the capture).
+                const size_t avail = segment_len - proto::kUdpHeaderLen;
                 const size_t declared =
                     (uv.length >= proto::kUdpHeaderLen)
                         ? (static_cast<size_t>(uv.length) -
                            proto::kUdpHeaderLen)
                         : 0;
-                relay->SendToRemote(ip + ihl2 + proto::kUdpHeaderLen,
+                relay->SendToRemote(ip + ihl + proto::kUdpHeaderLen,
                                    (std::min)(declared, avail));
             }
 

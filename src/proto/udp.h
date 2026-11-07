@@ -6,6 +6,10 @@
 #include "net/checksum.h"
 #include "net/eth.h"
 #include "net/ip_addr.h"
+// The IPv4 IHL predicate is single-sourced in icmp.h (batch126); the
+// datagram-length helpers below must judge IHL exactly like the ICMP
+// relay does, so they reuse it instead of duplicating the rule.
+#include "proto/icmp.h"
 
 #include <cstddef>
 #include <cstdint>
@@ -31,6 +35,72 @@ namespace vgww {
             out.sport = static_cast<uint16_t>((data[0] << 8) | data[1]);
             out.dport = static_cast<uint16_t>((data[2] << 8) | data[3]);
             out.length = static_cast<uint16_t>((data[4] << 8) | data[5]);
+            return true;
+        }
+
+        /// Length of the UDP datagram (header + payload) inside an IPv4
+        /// datagram, taken from the IP total length - the authoritative
+        /// size. The link layer pads short frames to the 60-byte Ethernet
+        /// minimum and the driver reports that padded length, so a
+        /// buffer-derived bound would forward the padding as UDP payload
+        /// (the same rule IcmpSegmentLength applies to ICMP).
+        ///
+        /// `out_header_len` receives the IHL in bytes. Rejects a malformed
+        /// datagram: non-IPv4, illegal IHL, a header that does not fit, or
+        /// a total length below ihl + 8 (no room for the UDP header).
+        /// A total length ABOVE `ip_len` means the capture is shorter than
+        /// the datagram, so the bound falls back to what was captured
+        /// rather than inventing bytes that are not there.
+        inline bool UdpSegmentLengthV4(const uint8_t* ip, size_t ip_len,
+                                       size_t& out_header_len,
+                                       size_t& out_len) noexcept {
+            if (nullptr == ip || ip_len < kIpv4HeaderLenMin) {
+                return false;
+            }
+            if (4 != (ip[0] >> 4)) {
+                return false;
+            }
+            const size_t header_len =
+                static_cast<size_t>(ip[0] & 0x0F) * 4;
+            if (!IsLegalIpv4HeaderLength(header_len) ||
+                header_len + kUdpHeaderLen > ip_len) {
+                return false;
+            }
+            const size_t total_len =
+                (static_cast<size_t>(ip[2]) << 8) |
+                static_cast<size_t>(ip[3]);
+            if (total_len < header_len + kUdpHeaderLen) {
+                return false;
+            }
+            out_header_len = header_len;
+            out_len = (total_len < ip_len ? total_len : ip_len) - header_len;
+            return true;
+        }
+
+        /// Length of the UDP datagram inside an IPv6 packet, taken from
+        /// the payload-length field (the authoritative size). Rejects a
+        /// payload length below 8 (no room for the UDP header) and a
+        /// non-IPv6 buffer. Payload length 0 (a jumbogram, RFC 2675) is
+        /// rejected: VGWW carries no datagrams that large, and treating 0
+        /// as "use the buffer" would forward padding bytes.
+        /// A declared length above what was captured falls back to the
+        /// captured bytes, exactly like the IPv4 helper.
+        inline bool UdpSegmentLengthV6(const uint8_t* ip, size_t ip_len,
+                                       size_t& out_len) noexcept {
+            if (nullptr == ip || ip_len < 40) {
+                return false;
+            }
+            if (6 != (ip[0] >> 4)) {
+                return false;
+            }
+            const size_t payload_len =
+                (static_cast<size_t>(ip[4]) << 8) |
+                static_cast<size_t>(ip[5]);
+            if (payload_len < kUdpHeaderLen) {
+                return false;
+            }
+            const size_t held = ip_len - 40;
+            out_len = payload_len < held ? payload_len : held;
             return true;
         }
 

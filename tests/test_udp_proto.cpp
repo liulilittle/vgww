@@ -43,6 +43,8 @@ namespace {
     using vgww::proto::BuildUdpFrameV6;
     using vgww::proto::kUdpHeaderLen;
     using vgww::proto::ParseUdp;
+    using vgww::proto::UdpSegmentLengthV4;
+    using vgww::proto::UdpSegmentLengthV6;
     using vgww::proto::UdpView;
 
     const WireMac kDstMac{0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0x01};
@@ -392,6 +394,121 @@ namespace {
         CHECK(UdpChecksumVerifiesV6(frame.data() + kEthernetHeaderLen));
     }
 
+    // ===================== datagram length helpers =========================
+
+    // Builds an IPv4 datagram of `ip_len` bytes (starting at the IP header,
+    // no Ethernet) whose IHL nibble and total-length field are caller-set;
+    // every byte starts as 0xAA so a leak of buffer bytes is visible.
+    std::vector<uint8_t> MakeV4Datagram(size_t ip_len, uint8_t ihl_words,
+                                        size_t total_len,
+                                        uint8_t version = 4) {
+        std::vector<uint8_t> d(ip_len, 0xAA);
+        d[0] = static_cast<uint8_t>((version << 4) | (ihl_words & 0x0F));
+        d[2] = static_cast<uint8_t>((total_len >> 8) & 0xFF);
+        d[3] = static_cast<uint8_t>(total_len & 0xFF);
+        d[9] = 17;  // UDP
+        return d;
+    }
+
+    std::vector<uint8_t> MakeV6Packet(size_t ip_len, size_t payload_len,
+                                      uint8_t version = 6) {
+        std::vector<uint8_t> d(ip_len, 0xAA);
+        d[0] = static_cast<uint8_t>(version << 4);
+        d[4] = static_cast<uint8_t>((payload_len >> 8) & 0xFF);
+        d[5] = static_cast<uint8_t>(payload_len & 0xFF);
+        d[6] = 17;  // UDP
+        return d;
+    }
+
+    void TestUdpSegmentLengthV4UsesTheIpTotalLength() {
+        size_t hdr = 0;
+        size_t seg = 0;
+        // A 0-payload UDP datagram is 28 bytes and the link pads the frame
+        // to the 60-byte minimum: the capture holds 46 bytes after the MAC
+        // header, but the datagram ends at 28.
+        auto bare = MakeV4Datagram(46, 5, 28);
+        CHECK(UdpSegmentLengthV4(bare.data(), bare.size(), hdr, seg));
+        CHECK(hdr == 20);
+        CHECK(seg == 8);  // NOT 26 (the padding)
+
+        auto padded = MakeV4Datagram(60, 5, 44);
+        CHECK(UdpSegmentLengthV4(padded.data(), padded.size(), hdr, seg));
+        CHECK(hdr == 20);
+        CHECK(seg == 24);  // 8 header + 16 payload, not 40
+
+        // IHL 6 (24-byte header with options) + 8-byte UDP header.
+        auto options = MakeV4Datagram(60, 6, 32);
+        CHECK(UdpSegmentLengthV4(options.data(), options.size(), hdr, seg));
+        CHECK(hdr == 24);
+        CHECK(seg == 8);
+    }
+
+    void TestUdpSegmentLengthV4RejectsMalformed() {
+        size_t hdr = 0;
+        size_t seg = 0;
+        auto no_l4 = MakeV4Datagram(28, 5, 20);  // total ends at the IP header
+        CHECK(!UdpSegmentLengthV4(no_l4.data(), no_l4.size(), hdr, seg));
+        auto zero_total = MakeV4Datagram(28, 5, 0);
+        CHECK(!UdpSegmentLengthV4(zero_total.data(), zero_total.size(), hdr, seg));
+        auto ihl_zero = MakeV4Datagram(28, 0, 28);
+        CHECK(!UdpSegmentLengthV4(ihl_zero.data(), ihl_zero.size(), hdr, seg));
+        auto ihl_past_end = MakeV4Datagram(28, 15, 32);  // 60-byte header
+        CHECK(!UdpSegmentLengthV4(ihl_past_end.data(), ihl_past_end.size(), hdr,
+                                  seg));
+        auto v6 = MakeV4Datagram(28, 5, 28, 6);
+        CHECK(!UdpSegmentLengthV4(v6.data(), v6.size(), hdr, seg));
+        auto short_buffer = MakeV4Datagram(19, 5, 19);
+        CHECK(!UdpSegmentLengthV4(short_buffer.data(), short_buffer.size(), hdr,
+                                  seg));
+        CHECK(!UdpSegmentLengthV4(nullptr, 0, hdr, seg));
+    }
+
+    void TestUdpSegmentLengthV4ToleratesAShortCapture() {
+        size_t hdr = 0;
+        size_t seg = 0;
+        // The datagram claims more than the capture holds: deliver what we
+        // have, never bytes beyond the capture.
+        auto truncated = MakeV4Datagram(28, 5, 100);
+        CHECK(UdpSegmentLengthV4(truncated.data(), truncated.size(), hdr, seg));
+        CHECK(hdr == 20);
+        CHECK(seg == 8);
+    }
+
+    void TestUdpSegmentLengthV6UsesThePayloadLength() {
+        size_t seg = 0;
+        auto bare = MakeV6Packet(48, 8);
+        CHECK(UdpSegmentLengthV6(bare.data(), bare.size(), seg));
+        CHECK(seg == 8);
+        // A capture that extends past the declared payload must not widen
+        // the datagram: this is the IPv6 form of the padding leak.
+        auto overlong = MakeV6Packet(60, 8);
+        CHECK(UdpSegmentLengthV6(overlong.data(), overlong.size(), seg));
+        CHECK(seg == 8);  // NOT 20
+        auto big = MakeV6Packet(1500, 1400);
+        CHECK(UdpSegmentLengthV6(big.data(), big.size(), seg));
+        CHECK(seg == 1400);
+    }
+
+    void TestUdpSegmentLengthV6RejectsMalformed() {
+        size_t seg = 0;
+        auto no_l4 = MakeV6Packet(48, 0);  // payload length 0: jumbogram only
+        CHECK(!UdpSegmentLengthV6(no_l4.data(), no_l4.size(), seg));
+        auto short_udp = MakeV6Packet(48, 7);
+        CHECK(!UdpSegmentLengthV6(short_udp.data(), short_udp.size(), seg));
+        auto v4 = MakeV6Packet(48, 8, 4);
+        CHECK(!UdpSegmentLengthV6(v4.data(), v4.size(), seg));
+        auto short_buffer = MakeV6Packet(39, 8);
+        CHECK(!UdpSegmentLengthV6(short_buffer.data(), short_buffer.size(), seg));
+        CHECK(!UdpSegmentLengthV6(nullptr, 0, seg));
+    }
+
+    void TestUdpSegmentLengthV6ToleratesAShortCapture() {
+        size_t seg = 0;
+        auto truncated = MakeV6Packet(48, 100);
+        CHECK(UdpSegmentLengthV6(truncated.data(), truncated.size(), seg));
+        CHECK(seg == 8);
+    }
+
 }  // namespace
 
 int main() {
@@ -399,6 +516,13 @@ int main() {
     TestParseUdpReadsBigEndianFields();
     TestParseUdpAcceptsExactlyEightBytes();
     TestParseUdpToleratesATrailingPayload();
+
+    TestUdpSegmentLengthV4UsesTheIpTotalLength();
+    TestUdpSegmentLengthV4RejectsMalformed();
+    TestUdpSegmentLengthV4ToleratesAShortCapture();
+    TestUdpSegmentLengthV6UsesThePayloadLength();
+    TestUdpSegmentLengthV6RejectsMalformed();
+    TestUdpSegmentLengthV6ToleratesAShortCapture();
 
     TestBuildUdpFrameIpv4WireImage();
     TestBuildUdpFrameIpv4EmptyPayload();
