@@ -122,5 +122,5 @@ MSI 会完成驱动签名安装与组件注册。装完后再正常启动 VGWW �
 
 ## 7. 链接
 
-- [架构设计(zh)](architecture.md) · [配置说明(zh)](configuration.md)
+- [架构(zh)](architecture.md) · [配置说明(zh)](configuration.md)
 - 英文版 [Driver installation (en)](../en/driver-install.md)

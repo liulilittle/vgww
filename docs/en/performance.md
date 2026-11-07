@@ -5,7 +5,7 @@ to measure changes instead of guessing. Every number below was measured on the
 development machine (Windows 11, 8-core x64, Release, MSVC 14.44); treat them as
 orders of magnitude, not as a benchmark contract.
 
-## Data path at a glance
+## Data path
 
 ```
 driver (WinpkFilter) ──► RX thread ──classifier──► SPSC ring[worker]  (wait-free)
@@ -24,7 +24,7 @@ Two rules dominate the cost model:
    protocol handling and asio completions all run on the worker that owns its
    shard. Steady-state forwarding performs no mutex acquisition.
 2. **Never block the RX thread.** A full ring drops and counts; TCP recovers by
-   retransmission, UDP is lossy by design. Growing queues instead of dropping
+   retransmission, UDP is lossy. Growing queues instead of dropping
    would move the latency spike to every other flow.
 
 ## Measured baselines

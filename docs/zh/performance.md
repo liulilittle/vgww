@@ -2,7 +2,7 @@
 
 本页说明 VGWW 的时间花在哪里、哪些参数真正有影响、以及如何测量而不是猜。下列数字都在开发机测得（Windows 11、8 核 x64、Release、MSVC 14.44），**只当作数量级参考，不是基准承诺**。
 
-## 数据通路一览
+## 数据通路
 
 ```
 驱动（WinpkFilter）──► RX 线程 ──分类器──► SPSC 环[worker]（无等待）
@@ -25,7 +25,7 @@
 | 项目 | 结果 | 位置 |
 |---|---|---|
 | UDP 流哈希分布（4096 条流打同一服务器） | 最坏桶 **6–7** 项（雪崩修复前是 4096） | `tests/test_udp_relay.cpp`（`TestFlowHashSpreadsBuckets`） |
-| 邻居表 tick（4096 项） | 10 Hz 下 **156.6 µs/次** ≈ 单核 0.16% | 批319 实测 |
+| 邻居表 tick（4096 项） | 10 Hz 下 **156.6 µs/次** ≈ 单核 0.16% | 本项目实测 |
 | 全量单测/集成测试 | **49 个用例约 120 秒**（`ctest -C Release`） | 本地 + CI |
 | CI 作业（配置+构建+测试+10 门禁） | `windows-latest` 上 **约 7 分钟** | GitHub Actions |
 | UDP 回包路径每包分配 | **1 次** `std::vector`（所有权移交 TX 环） | `HandleUdp` 回包 lambda |
