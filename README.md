@@ -93,6 +93,8 @@ See [docs/en/configuration.md](docs/en/configuration.md) ([中文](docs/zh/confi
 | [Architecture](docs/en/architecture.md) | [架构](docs/zh/architecture.md) |
 | [Configuration](docs/en/configuration.md) | [配置说明](docs/zh/configuration.md) |
 | [Driver installation](docs/en/driver-install.md) | [驱动安装与许可说明](docs/zh/driver-install.md) |
+| [Command line](docs/en/cli.md) | [命令行](docs/zh/cli.md) |
+| [HTTP API](docs/en/api.md) | [HTTP 接口](docs/zh/api.md) |
 | [Performance](docs/en/performance.md) | [性能](docs/zh/performance.md) |
 | [Internals](docs/en/internals.md) | [内部实现](docs/zh/internals.md) |
 | [Troubleshooting](docs/en/troubleshooting.md) | [排障指南](docs/zh/troubleshooting.md) |

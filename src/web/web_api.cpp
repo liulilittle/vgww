@@ -2422,7 +2422,7 @@ namespace vgww {
                              if (existing.size() >=
                                  ::vgww::core::limits::kMaxStaticBindings) {
                                  return Response::Error(400, "too many bindings");
-                             }
+                            }
                             if (!dataplane.SetDhcpBinding(mac, ip, hostname)) {
                                 // batch111: the store now also rejects a
                                 // hostname longer than a DHCP option value,
@@ -2430,8 +2430,8 @@ namespace vgww {
                                 return Response::Error(
                                     400, "invalid mac/ip or hostname too long");
                             }
-                             return Response::Json("{\"ok\":true}");
-                         });
+                            return Response::Json("{\"ok\":true}");
+                        });
 
             server.Route("DELETE", "/api/dhcp/bindings",
                          [&dataplane](const Request& request) {
@@ -2544,13 +2544,13 @@ namespace vgww {
                              if (existing.size() >=
                                  ::vgww::core::limits::kMaxStaticBindings6) {
                                  return Response::Error(400, "too many bindings");
-                             }
-                if (!dataplane.SetDhcp6Binding(duid, ip, hostname)) {
+                            }
+                            if (!dataplane.SetDhcp6Binding(duid, ip, hostname)) {
                                 return Response::Error(
                                     400, "invalid duid/ip or hostname too long");
                             }
-                             return Response::Json("{\"ok\":true}");
-                         });
+                            return Response::Json("{\"ok\":true}");
+                        });
 
             server.Route("DELETE", "/api/dhcp6/bindings",
                          [&dataplane](const Request& request) {

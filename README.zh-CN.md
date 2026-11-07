@@ -89,6 +89,8 @@ vgww.exe --config=vgww.json [--adapter=<网卡名>] [--web] [--web-only] [--head
 | [架构](docs/zh/architecture.md) | [Architecture](docs/en/architecture.md) |
 | [配置说明](docs/zh/configuration.md) | [Configuration](docs/en/configuration.md) |
 | [驱动安装与许可说明](docs/zh/driver-install.md) | [Driver installation](docs/en/driver-install.md) |
+| [命令行](docs/zh/cli.md) | [Command line](docs/en/cli.md) |
+| [HTTP 接口](docs/zh/api.md) | [HTTP API](docs/en/api.md) |
 | [性能](docs/zh/performance.md) | [Performance](docs/en/performance.md) |
 | [内部实现](docs/zh/internals.md) | [Internals](docs/en/internals.md) |
 | [排障指南](docs/zh/troubleshooting.md) | [Troubleshooting](docs/en/troubleshooting.md) |
