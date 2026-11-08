@@ -21,6 +21,7 @@
 #include <atomic>
 #include <chrono>
 #include <cstdio>
+#include <stdexcept>
 #include <thread>
 
 namespace {
@@ -147,6 +148,84 @@ namespace {
                          manager.GetStats().dial_failed.load()),
                      static_cast<unsigned long long>(
                          manager.GetStats().accept_errors.load()));
+    }
+
+    /// A throwing accept completion must cost that one connection, not the
+    /// manager thread (which is a std::thread body: an escape terminates the
+    /// process) and not the accept chain (the handler is the only place that
+    /// re-arms it; skipping the re-arm turns the rule deaf while the UI keeps
+    /// listing it).
+    void TestAcceptHandlerThrowKeepsTheRuleAlive() {
+        xtcp::buf::InitPools();
+
+        NullBackend backend;
+        xtcp::XtcpStack stack(&backend);
+        stack.SetMaxConnections(16);
+
+        vgww::core::Config config;
+        config.gateway.ipv4 = kGatewayIp;
+        config.gateway.mask = (0u) | (0u << 8) | (255u << 16) | (255u << 24);
+        config.gateway.mac = {0x30, 0xFC, 0x68, 0x88, 0xB4, 0xA9};
+
+        auto& manager = vgww::relay::PortMapManager::Instance();
+        manager.Stop();
+        vgww::web::RuleStore::Instance().Clear();
+        const uint16_t wan_port = ProbeFreePort();
+        CHECK(0 != wan_port);
+        vgww::web::RuleStore::Instance().AddPortMap(
+            {"tcp", wan_port, "127.0.0.1", 45678});
+
+        const auto send_to_lan = [](uint64_t, const uint8_t*, uint32_t) {
+            return true;
+        };
+        const auto teardown = [](uint64_t, bool) {};
+
+        auto threw = std::make_shared<std::atomic<int>>(0);
+        manager.SetAcceptProbeForTest([threw] {
+            if (0 == threw->fetch_add(1)) {
+                throw std::runtime_error("accept body exploded");
+            }
+        });
+        // A previous test can leave connections queued in this recycled WAN
+        // port's backlog; those complete the moment the loop arms. Snapshot
+        // BEFORE Start so the assertions measure OUR traffic.
+        const uint64_t accepted_before = manager.GetStats().accepted.load();
+        const uint64_t errors_before = manager.GetStats().handler_errors.load();
+        manager.Start(&stack, config, send_to_lan, teardown);
+        CHECK(WaitFor([&] { return manager.LiveAcceptLoops() >= 1; }, 3000));
+
+        // Connections: at least one accept body must throw (handler_errors
+        // rises), and the chain must keep dialing AFTER that - so the dialed
+        // count has to climb by MORE than the number of failures. A single
+        // extra dial would be satisfied by the pre-throw accept and would
+        // not prove the re-arm survived.
+        CHECK(WaitFor(
+            [&] {
+                TryConnect(wan_port);
+                const uint64_t dialed =
+                    manager.GetStats().accepted.load() - accepted_before;
+                const uint64_t failed =
+                    manager.GetStats().handler_errors.load() - errors_before;
+                return failed >= 1 && dialed >= failed + 2;
+            },
+            8000));
+
+        std::printf("B342 accept guard: handler_errors=%llu escaped=%llu "
+                    "accepted=%llu\n",
+                    static_cast<unsigned long long>(
+                        manager.GetStats().handler_errors.load()),
+                    static_cast<unsigned long long>(
+                        manager.GetStats().escaped_handler_errors.load()),
+                    static_cast<unsigned long long>(
+                        manager.GetStats().accepted.load()));
+        // The firewall must stop the exception INSIDE the completion: nothing
+        // may unwind through asio's dispatch frame.
+        CHECK(0 == manager.GetStats().escaped_handler_errors.load());
+
+        manager.Stop();
+        manager.SetAcceptProbeForTest(nullptr);
+        vgww::web::RuleStore::Instance().RemovePortMap(0);
+        vgww::web::RuleStore::Instance().Clear();
     }
 
     /// C6: OnStackData must report the truth - a packet that was actually
@@ -659,6 +738,7 @@ int main() {
     TestSingleOutstandingWanWrite();
     TestWanReadBackpressure();
     TestB83UdpRuleNeverBindsTcpAcceptor();
+    TestAcceptHandlerThrowKeepsTheRuleAlive();
     TestB86MalformedLanIpIsRefusedNotZeroDialed();
     TestB312ApplyRulesIsChangeDriven();   // last: it fails one bind on purpose
 

@@ -19,14 +19,18 @@ namespace vgww {
 
         /// Runs `fn` and swallows anything it throws, counting the event.
         /// `noexcept` by construction: the caller is a completion handler or a
-        /// thread body, where escaping is fatal.
+        /// thread body, where escaping is fatal. Returns false when the body
+        /// threw, so a caller that owns a resource can tear it down instead of
+        /// leaving a half-updated chain behind.
         template <typename Fn>
-        void InvokeHandlerGuarded(std::atomic<uint64_t>& errors,
+        bool InvokeHandlerGuarded(std::atomic<uint64_t>& errors,
                                   Fn&& fn) noexcept {
             try {
                 fn();
+                return true;
             } catch (...) {
                 errors.fetch_add(1, std::memory_order_relaxed);
+                return false;
             }
         }
 

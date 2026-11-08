@@ -188,9 +188,17 @@ namespace vgww {
                     }
                 }
 
-                // 3. Drive WAN-side async operations.
-                io_.poll();
-                io_.run_for(std::chrono::milliseconds(5));
+                // 3. Drive WAN-side async operations. Every completion body
+                // is guarded, so a throw reaching here means the firewall
+                // leaked: unwinding through asio's dispatch frame is
+                // undefined behaviour, so count it rather than retry.
+                try {
+                    io_.poll();
+                    io_.run_for(std::chrono::milliseconds(5));
+                } catch (...) {
+                    stats_.escaped_handler_errors.fetch_add(
+                        1, std::memory_order_relaxed);
+                }
                 std::this_thread::sleep_for(std::chrono::microseconds(200));
             }
         }
@@ -310,102 +318,93 @@ namespace vgww {
                         *accepted,
                         [this, weak, rule_copy, accepted,
                          weak_loop](const std::error_code& err) {
-                            if (err || !running_.load()) {
-                                if (err) {
-                                    ++stats_.accept_errors;
-                                }
+                            // One accepted connection that cannot be served costs that
+                            // connection, never the manager thread and never the accept chain.
+                            const bool body_ok = core::InvokeHandlerGuarded(
+                                stats_.handler_errors, [&] {
+                                    if (accept_probe_) {
+                                        accept_probe_();
+                                    }
+                                    if (err || !running_.load()) {
+                                        if (err) {
+                                            ++stats_.accept_errors;
+                                        }
+                                        return;
+                                    }
+                                    if (auto live = weak.lock()) {
+                                        // Dial the LAN client through the xtcp stack:
+                                        // local = gateway virtual IP : ephemeral port.
+                                        xtcp::core::Endpoint local{};
+                                        local.family = 4;
+                                        local.port = 0;  // ephemeral
+                                        local.addr[0] = 0;  // filled below
+                                        // batch86: sscanf_s reports how many fields it actually
+                                        // converted, and ignoring that return let a short parse dial
+                                        // 0.0.0.0 - a plausible-but-broken endpoint. Every current
+                                        // producer runs ParseIpv4 first; this check keeps a future
+                                        // producer from inheriting the failure silently.
+                                        {
+                                            unsigned a[4] = {0, 0, 0, 0};
+                                            const int got = sscanf_s(
+                                                gateway_ip_text_.c_str(),
+                                                "%u.%u.%u.%u", &a[0], &a[1], &a[2], &a[3]);
+                                            if (4 != got) {
+                                                std::error_code ignored;
+                                                accepted->close(ignored);
+                                                ++stats_.dial_failed;
+                                                return;
+                                            }
+                                            local.addr[0] = (a[0] << 24) | (a[1] << 16) |
+                                                            (a[2] << 8) | a[3];
+                                        }
+                                        xtcp::core::Endpoint remote{};
+                                        remote.family = 4;
+                                        {
+                                            unsigned a[4] = {0, 0, 0, 0};
+                                            const int got = sscanf_s(
+                                                rule_copy.lan_ip.c_str(),
+                                                "%u.%u.%u.%u", &a[0], &a[1], &a[2], &a[3]);
+                                            if (4 != got) {
+                                                std::error_code ignored;
+                                                accepted->close(ignored);
+                                                ++stats_.dial_failed;
+                                                return;
+                                            }
+                                            remote.addr[0] = (a[0] << 24) | (a[1] << 16) |
+                                                             (a[2] << 8) | a[3];
+                                        }
+                                        remote.port = rule_copy.lan_port;
+                                        const uint64_t conn_id = stack_->Connect(local, remote);
+                                        if (0 != conn_id) {
+                                            Relay relay;
+                                            relay.wan = accepted;
+                                            relays_[conn_id] = std::move(relay);
+                                            last_relay_conn_id_.store(conn_id,
+                                                                      std::memory_order_relaxed);
+                                            ++stats_.accepted;
+                                        } else {
+                                            // Stack refused the reverse-NAT dial (cap reached / bad
+                                            // endpoint): do not leak the accepted WAN socket.
+                                            std::error_code ignored;
+                                            accepted->close(ignored);
+                                            ++stats_.dial_failed;
+                                        }
+                                    }
+                                });
+                            if (!body_ok) {
+                                // The body died before taking ownership of the WAN socket.
+                                std::error_code ignored;
+                                accepted->close(ignored);
+                            }
+                            // Re-arm OUTSIDE the guard: a throwing body must never skip it, or
+                            // the rule stops accepting for good while the UI still lists it.
+                            if (running_.load()) {
                                 auto live = weak.lock();
-                                if (live && live->is_open() &&
-                                    running_.load()) {
+                                if (live && live->is_open()) {
                                     if (auto retry = weak_loop.lock()) {
                                         (*retry)();
                                     }
                                 }
-                                return;
-                            }
-                            if (auto live = weak.lock()) {
-                                // Dial the LAN client through the xtcp stack:
-                                // local = gateway virtual IP : ephemeral port.
-                                xtcp::core::Endpoint local{};
-                                local.family = 4;
-                                local.port = 0;  // ephemeral
-                                local.addr[0] = 0;  // filled below
-                                // batch86: sscanf_s reports how many fields it
-                                // actually converted, and the old code ignored
-                                // that return. A short parse leaves the
-                                // zero-initialised octets in place, so the dial
-                                // would silently target 0.0.0.0 instead of
-                                // failing - a plausible-but-broken endpoint.
-                                // Every current producer (POST /api/portmap, the
-                                // native form, and the rules-file loader) runs
-                                // ParseIpv4 first, so this is a redundancy; it is
-                                // written down because the failure mode is a
-                                // wrong ADDRESS, not an error, and a fourth
-                                // producer would inherit it silently.
-                                {
-                                    unsigned a[4] = {0, 0, 0, 0};
-                                    const int got = sscanf_s(
-                                        gateway_ip_text_.c_str(),
-                                        "%u.%u.%u.%u", &a[0], &a[1], &a[2],
-                                        &a[3]);
-                                    if (4 != got) {
-                                        // Reject the relay instead of dialing a
-                                        // zero endpoint. Counted so the surface
-                                        // can see it rather than dropping mute.
-                                        std::error_code ignored;
-                                        accepted->close(ignored);
-                                        ++stats_.dial_failed;
-                                        if (auto retry = weak_loop.lock()) {
-                                            (*retry)();
-                                        }
-                                        return;
-                                    }
-                                    local.addr[0] = (a[0] << 24) |
-                                                    (a[1] << 16) |
-                                                    (a[2] << 8) | a[3];
-                                }
-                                xtcp::core::Endpoint remote{};
-                                remote.family = 4;
-                                {
-                                    unsigned a[4] = {0, 0, 0, 0};
-                                    const int got = sscanf_s(
-                                        rule_copy.lan_ip.c_str(),
-                                        "%u.%u.%u.%u", &a[0], &a[1], &a[2],
-                                        &a[3]);
-                                    if (4 != got) {
-                                        std::error_code ignored;
-                                        accepted->close(ignored);
-                                        ++stats_.dial_failed;
-                                        if (auto retry = weak_loop.lock()) {
-                                            (*retry)();
-                                        }
-                                        return;
-                                    }
-                                    remote.addr[0] = (a[0] << 24) |
-                                                     (a[1] << 16) |
-                                                     (a[2] << 8) | a[3];
-                                }
-                                remote.port = rule_copy.lan_port;
-                                const uint64_t conn_id =
-                                    stack_->Connect(local, remote);
-                                if (0 != conn_id) {
-                                    Relay relay;
-                                    relay.wan = accepted;
-                                    relays_[conn_id] = std::move(relay);
-                                    last_relay_conn_id_.store(
-                                        conn_id, std::memory_order_relaxed);
-                                    ++stats_.accepted;
-                                } else {
-                                    // Stack refused the reverse-NAT dial
-                                    // (cap reached / bad endpoint): do not
-                                    // leak the accepted WAN socket.
-                                    std::error_code ignored;
-                                    accepted->close(ignored);
-                                    ++stats_.dial_failed;
-                                }
-                            }
-                            if (auto retry = weak_loop.lock()) {
-                                (*retry)();  // continue accepting
                             }
                         });
                 };
@@ -458,17 +457,28 @@ namespace vgww {
                 *relay.wan, asio::buffer(*buffer),
                 [this, conn_id, buffer, socket](const std::error_code& err,
                                                 size_t) {
-                    buffer->clear();
-                    stats_.wan_writes_outstanding.fetch_sub(
-                        1, std::memory_order_relaxed);
-                    const auto it = relays_.find(conn_id);
-                    if (relays_.end() == it) return;
-                    it->second.write_in_flight = false;
-                    if (err) {
-                        CloseRelay(conn_id, it->second);
-                        return;
+                    const bool body_ok = core::InvokeHandlerGuarded(
+                        stats_.handler_errors, [&] {
+                            buffer->clear();
+                            stats_.wan_writes_outstanding.fetch_sub(
+                                1, std::memory_order_relaxed);
+                            const auto it = relays_.find(conn_id);
+                            if (relays_.end() == it) return;
+                            it->second.write_in_flight = false;
+                            if (err) {
+                                CloseRelay(conn_id, it->second);
+                                return;
+                            }
+                            PumpOne(conn_id, it->second);  // drain remaining queue
+                        });
+                    if (!body_ok) {
+                        // Half-updated relay after a failed body: drop it instead of
+                        // leaving a write gate that is stuck closed forever.
+                        const auto it = relays_.find(conn_id);
+                        if (relays_.end() != it) {
+                            CloseRelay(conn_id, it->second);
+                        }
                     }
-                    PumpOne(conn_id, it->second);  // drain remaining queue
                 });
         }
 
@@ -486,41 +496,51 @@ namespace vgww {
                 asio::buffer(*buffer),
                 [this, conn_id, buffer, socket](const std::error_code& err,
                                                 size_t n) {
-                    if (err || 0 == n) {
-                        // WAN peer closed: tear the whole relay down.
+                    const bool body_ok = core::InvokeHandlerGuarded(
+                        stats_.handler_errors, [&] {
+                            if (err || 0 == n) {
+                                // WAN peer closed: tear the whole relay down.
+                                const auto it = relays_.find(conn_id);
+                                if (relays_.end() != it) {
+                                    CloseRelay(conn_id, it->second);
+                                }
+                                return;
+                            }
+                            // Forward toward the LAN client through the injected hook (the
+                            // manager thread cannot call the stack directly - no worker
+                            // context on the emit path). C5: a FALSE return means the
+                            // WAN->LAN queue is full (data plane side) - PAUSE the receive
+                            // chain hard: the read stays "armed" (so nothing re-arms)
+                            // until the queue drains and the data plane signals
+                            // ResumePausedWanReads(). A fast WAN can therefore never fill
+                            // the send queue without bound.
+                            if (send_to_lan_ &&
+                                !send_to_lan_(conn_id, buffer->data(),
+                                              static_cast<uint32_t>(n))) {
+                                const auto it = relays_.find(conn_id);
+                                if (relays_.end() == it) {
+                                    return;
+                                }
+                                it->second.wan_read_paused = true;
+                                return;  // wan_read_armed stays true: hard pause
+                            }
+                            const auto it = relays_.find(conn_id);
+                            if (relays_.end() == it || it->second.closed) {
+                                return;
+                            }
+                            if (!socket->is_open()) return;
+                            it->second.wan_read_armed = false;
+                            it->second.wan_read_paused = false;
+                            ArmWanRead(conn_id, it->second);  // continuous read loop
+                        });
+                    if (!body_ok) {
+                        // The delivery path died: drop the relay instead of leaving a
+                        // receive chain that never re-arms.
                         const auto it = relays_.find(conn_id);
                         if (relays_.end() != it) {
                             CloseRelay(conn_id, it->second);
                         }
-                        return;
                     }
-                    // Forward toward the LAN client through the injected
-                    // hook (the manager thread cannot call the stack
-                    // directly - no worker context on the emit path).
-                    // C5: a FALSE return means the WAN->LAN queue is full
-                    // (data plane side) - PAUSE the receive chain hard: the
-                    // read stays "armed" (so nothing re-arms) until the
-                    // queue drains and the data plane signals
-                    // ResumePausedWanReads(). A fast WAN can therefore never
-                    // fill the send queue without bound.
-                    if (send_to_lan_ &&
-                        !send_to_lan_(conn_id, buffer->data(),
-                                      static_cast<uint32_t>(n))) {
-                        const auto it = relays_.find(conn_id);
-                        if (relays_.end() == it) {
-                            return;
-                        }
-                        it->second.wan_read_paused = true;
-                        return;  // wan_read_armed stays true: hard pause
-                    }
-                    const auto it = relays_.find(conn_id);
-                    if (relays_.end() == it || it->second.closed) {
-                        return;
-                    }
-                    if (!socket->is_open()) return;
-                    it->second.wan_read_armed = false;
-                    it->second.wan_read_paused = false;
-                    ArmWanRead(conn_id, it->second);  // continuous read loop
                 });
         }
 

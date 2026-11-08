@@ -22,6 +22,7 @@
 #pragma once
 
 #include "core/allocator.h"
+#include "core/handler_guard.h"
 #include "core/config.h"
 #include "web/web_api.h"
 
@@ -93,6 +94,14 @@ namespace vgww {
                 /// must not move this counter - the old code rebuilt the
                 /// wanted set on every RunLoop pass.
                 std::atomic<uint64_t> apply_passes{0};
+                /// Completion bodies whose exception was swallowed by the
+                /// firewall: that one connection was dropped, while the
+                /// manager thread and the accept chain survive.
+                std::atomic<uint64_t> handler_errors{0};
+                /// Exceptions that escaped a completion handler out of
+                /// io_context::run_for(). Must stay 0 - unwinding through
+                /// asio's dispatch frame is undefined behaviour.
+                std::atomic<uint64_t> escaped_handler_errors{0};
             };
             const Stats& GetStats() const noexcept { return stats_; }
 
@@ -121,6 +130,13 @@ namespace vgww {
             /// signal; safe from any thread - the work is posted onto the
             /// manager's own io_context).
             void ResumePausedWanReads() noexcept;
+
+            /// Test seam: runs inside the accept completion body before the
+            /// WAN socket is dialed. Throwing here proves the firewall holds
+            /// and that the accept chain still re-arms.
+            void SetAcceptProbeForTest(std::function<void()> probe) {
+                accept_probe_ = std::move(probe);
+            }
 
             // ----- xtcp callbacks (worker threads, shard lock held) ----------
             /// Returns true when the data was queued for a known relay;
@@ -201,6 +217,7 @@ namespace vgww {
             bool have_applied_rules_ = false;
             std::atomic<uint64_t> dropped_packets_{0};
             std::atomic<uint64_t> last_relay_conn_id_{0};
+            std::function<void()> accept_probe_;
         };
 
     }  // namespace relay
