@@ -144,16 +144,24 @@ namespace vgww {
                 asio::buffer(recv_buf_),
                 [this, self](const std::error_code& err, size_t n) {
                     const ReceiveDecision decision =
-                        ClassifyReceive(err, n, socket_.is_open());
+                        ClassifyReceive(err, n, self->socket_.is_open());
                     if (ReceiveDecision::kProcess == decision) {
-                        self->on_reply_(self->recv_buf_.data(), n);
+                        // One reply that cannot be rebuilt costs that
+                        // reply, not the worker thread.
+                        ::vgww::core::InvokeHandlerGuarded(self->handler_errors_, [&] {
+                            self->on_reply_(self->recv_buf_.data(), n);
+                        });
                     }
                     if (ReceiveDecision::kStop == decision) {
                         return;  // teardown: never re-arm a dead socket
                     }
                     // n>0 (keep pumping) or a transient error/n==0 (pump
-                    // after a short backoff): the loop must survive both.
-                    PumpReceive(ReceiveDecision::kBackoffReArm == decision);
+                    // after a short backoff): survive both. Guarded
+                    // separately so a throwing delivery never skips it.
+                    ::vgww::core::InvokeHandlerGuarded(self->handler_errors_, [&] {
+                        self->PumpReceive(
+                            ReceiveDecision::kBackoffReArm == decision);
+                    });
                 });
         }
 

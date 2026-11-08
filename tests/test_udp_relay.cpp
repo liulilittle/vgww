@@ -18,9 +18,12 @@
 
 #include <asio.hpp>
 
+#include <atomic>
 #include <chrono>
 #include <cstdio>
 #include <memory>
+#include <stdexcept>
+#include <thread>
 #include <unordered_map>
 #include <vector>
 
@@ -55,7 +58,109 @@ namespace vgww {
         return 0;
     }
 
+    /// Spins the loop until `done()` or a 2 s deadline; a datagram on
+    /// loopback is delivered asynchronously even though send_to is
+    /// synchronous, so a bare poll() can return before the completion.
+    template <typename Pred>
+    void PumpUntil(asio::io_context& io, Pred done) {
+        const auto deadline =
+            std::chrono::steady_clock::now() + std::chrono::seconds(2);
+        while (!done() && std::chrono::steady_clock::now() < deadline) {
+            io.poll();
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        }
+    }
+
+    /// The guard itself: never throws, counts every swallowed exception.
+    int TestHandlerGuardSwallowsAndCounts() {
+        std::atomic<uint64_t> errors{0};
+        bool ran = false;
+        ::vgww::core::InvokeHandlerGuarded(errors, [&ran] { ran = true; });
+        CHECK(ran);
+        CHECK(0 == errors.load());
+        ::vgww::core::InvokeHandlerGuarded(errors, [] {
+            throw std::runtime_error("frame build failed");
+        });
+        CHECK(1 == errors.load());
+        ::vgww::core::InvokeHandlerGuarded(errors, [] { throw 42; });
+        CHECK(2 == errors.load());
+        return 0;
+    }
+
+    /// A handler that throws must cost one datagram, not the flow: the
+    /// exception would otherwise escape io_context::poll(), unwind the
+    /// worker thread and stop the whole data plane.
+    int TestThrowingHandlerKeepsTheReceiveChain() {
+        asio::io_context io;
+        std::error_code err;
+
+        asio::ip::udp::socket peer(io);
+        peer.open(asio::ip::udp::v4(), err);
+        CHECK(!err);
+        peer.bind(asio::ip::udp::endpoint(
+                      asio::ip::make_address_v4("127.0.0.1"), 0),
+                  err);
+        CHECK(!err);
+        const asio::ip::udp::endpoint peer_ep = peer.local_endpoint(err);
+        CHECK(!err);
+
+        asio::ip::udp::socket local(io);
+        local.open(asio::ip::udp::v4(), err);
+        CHECK(!err);
+        local.bind(asio::ip::udp::endpoint(
+                       asio::ip::make_address_v4("127.0.0.1"), 0),
+                   err);
+        CHECK(!err);
+        const asio::ip::udp::endpoint local_ep = local.local_endpoint(err);
+        CHECK(!err);
+
+        relay::UdpRelay::FlowKey key{};
+        const std::array<uint8_t, 4> loop{127, 0, 0, 1};
+        key.client_ip = net::IpAddress::FromV4BigEndian(loop.data());
+        key.remote_ip = net::IpAddress::FromV4BigEndian(loop.data());
+        key.client_port = 5000;
+        key.remote_port = peer_ep.port();
+
+        auto flow = std::make_shared<relay::UdpRelay>(std::move(local), key);
+        flow->ConnectRemote(peer_ep, err);
+        CHECK(!err);
+
+        int calls = 0;
+        size_t last_len = 0;
+        flow->on_remote_data = [&calls, &last_len](const uint8_t*, size_t n) {
+            ++calls;
+            last_len = n;
+            if (1 == calls) {
+                throw std::runtime_error("frame build failed");
+            }
+        };
+        flow->ArmReceive();
+
+        const uint8_t first[4] = {1, 2, 3, 4};
+        peer.send_to(asio::buffer(first, sizeof(first)), local_ep, 0, err);
+        CHECK(!err);
+        PumpUntil(io, [&calls] { return calls >= 1; });
+        CHECK(1 == calls);                  // the throwing body did run
+        CHECK(1 == flow->HandlerErrors());  // and was swallowed
+        CHECK(flow->IsOpen());              // the socket stayed alive
+
+        const uint8_t second[2] = {9, 9};
+        peer.send_to(asio::buffer(second, sizeof(second)), local_ep, 0, err);
+        CHECK(!err);
+        PumpUntil(io, [&calls] { return calls >= 2; });
+        CHECK(2 == calls);                  // the chain re-armed
+        CHECK(2 == last_len);
+        CHECK(1 == flow->HandlerErrors());  // and counted exactly once
+        return 0;
+    }
+
     int RunTests() {
+        if (0 != TestHandlerGuardSwallowsAndCounts()) {
+            return 1;
+        }
+        if (0 != TestThrowingHandlerKeepsTheReceiveChain()) {
+            return 1;
+        }
         if (0 != TestReceiveErrorRearm()) {
             return 1;
         }

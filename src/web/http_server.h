@@ -11,6 +11,8 @@
 // ============================================================================
 #pragma once
 
+#include "core/handler_guard.h"
+
 #include <asio.hpp>
 
 #include <atomic>
@@ -137,6 +139,28 @@ namespace vgww {
 
             uint16_t Port() const noexcept { return port_; }
 
+            /// Per-event failures swallowed by the handler firewall: a
+            /// connection or accepted socket that could not be served while
+            /// the thread and the accept chain stayed intact.
+            uint64_t HandlerErrors() const noexcept {
+                return handler_errors_.load(std::memory_order_relaxed);
+            }
+
+            /// Exceptions that escaped a completion handler out of
+            /// io_context::run(). Must stay 0: unwinding through asio's
+            /// dispatch frame is undefined behaviour, so the firewall has to
+            /// stop the exception first.
+            uint64_t EscapedHandlerErrors() const noexcept {
+                return escaped_errors_.load(std::memory_order_relaxed);
+            }
+
+            /// Test seam: runs inside the accept completion handler before
+            /// the socket is queued. Throwing here proves the firewall holds
+            /// and that the accept chain still re-arms.
+            void SetAcceptProbeForTest(std::function<void()> probe) {
+                accept_probe_ = std::move(probe);
+            }
+
         private:
             void AcceptLoop();
             void StartAccept();
@@ -167,6 +191,9 @@ namespace vgww {
             std::condition_variable conn_cv_;
             std::deque<asio::ip::tcp::socket> conn_queue_;
             std::atomic<bool> running_{false};
+            std::atomic<uint64_t> handler_errors_{0};
+            std::atomic<uint64_t> escaped_errors_{0};
+            std::function<void()> accept_probe_;
             uint16_t port_ = 0;
         };
 

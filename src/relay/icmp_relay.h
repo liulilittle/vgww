@@ -13,10 +13,12 @@
 #pragma once
 
 #include "net/ip_addr.h"
+#include "core/handler_guard.h"
 
 #include <asio.hpp>
 
 #include <array>
+#include <atomic>
 #include <chrono>
 #include <cstdint>
 #include <memory>
@@ -108,6 +110,12 @@ namespace vgww {
 
             asio::ip::icmp::socket& Socket() noexcept { return socket_; }
 
+            /// Completion bodies that threw and were swallowed instead of
+            /// unwinding the worker thread (telemetry/tests).
+            uint64_t HandlerErrors() const noexcept {
+                return handler_errors_.load(std::memory_order_relaxed);
+            }
+
         private:
             /// (Re)arms the async receive. When `backoff` is set the re-arm
             /// happens after a short pause so a burst of socket resets does
@@ -118,6 +126,7 @@ namespace vgww {
             std::function<void(const uint8_t*, size_t)> on_reply_;
             std::array<uint8_t, 2048> recv_buf_{};
             asio::steady_timer retry_timer_{socket_.get_executor()};
+            std::atomic<uint64_t> handler_errors_{0};
         };
 
     }  // namespace relay

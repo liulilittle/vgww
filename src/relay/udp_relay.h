@@ -16,10 +16,12 @@
 #pragma once
 
 #include "net/ip_addr.h"
+#include "core/handler_guard.h"
 
 #include <asio.hpp>
 
 #include <array>
+#include <atomic>
 #include <chrono>
 #include <cstdint>
 #include <functional>
@@ -120,6 +122,12 @@ namespace vgww {
 
             bool IsOpen() const noexcept { return socket_.is_open(); }
 
+            /// Completion bodies that threw and were swallowed instead of
+            /// unwinding the worker thread (telemetry/tests).
+            uint64_t HandlerErrors() const noexcept {
+                return handler_errors_.load(std::memory_order_relaxed);
+            }
+
             // Receive buffer sizing is a memory/coverage trade-off:
             // 8 KiB covers the datagrams real clients expect intact
             // (EDNS0 4096, DNSSEC, TFTP large blocks) at +6 KiB per flow.
@@ -147,6 +155,7 @@ namespace vgww {
             UdpFlowTable* lru_owner_ = nullptr;
             UdpRelay* lru_prev_ = nullptr;
             UdpRelay* lru_next_ = nullptr;
+            std::atomic<uint64_t> handler_errors_{0};
         };
 
         /// Per-worker flow table (owner thread only).

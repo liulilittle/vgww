@@ -64,16 +64,24 @@ namespace vgww {
                 asio::buffer(recv_buf_),
                 [self](const std::error_code& err, size_t n) {
                     if (!err) {
-                        self->OnRemoteData(err, n);
+                        // One datagram that cannot be rebuilt costs that
+                        // datagram, not the worker thread.
+                        ::vgww::core::InvokeHandlerGuarded(self->handler_errors_, [&] {
+                            self->OnRemoteData(err, n);
+                        });
                     }
                     // C4: a transient error (Windows connected-UDP surfaces
                     // ICMP Port Unreachable as connection_reset/aborted) must
                     // NOT end the chain - re-arm and keep the flow alive.
                     // Terminal conditions (socket closed, operation_aborted,
-                    // bad_descriptor) end it.
-                    if (self->socket_.is_open() && self->ShouldRearm(err)) {
-                        self->ArmReceive();
-                    }
+                    // bad_descriptor) end it. Guarded separately so a
+                    // throwing delivery can never skip the re-arm.
+                    ::vgww::core::InvokeHandlerGuarded(self->handler_errors_, [&] {
+                        if (self->socket_.is_open() &&
+                            self->ShouldRearm(err)) {
+                            self->ArmReceive();
+                        }
+                    });
                 });
         }
 

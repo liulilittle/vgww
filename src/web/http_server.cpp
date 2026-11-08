@@ -277,7 +277,16 @@ namespace vgww {
 
         void HttpServer::AcceptLoop() {
             StartAccept();
-            io_->run();
+            // The accept handler guards its own body and re-arms itself, so
+            // run() returns only when Stop() parks the context. An exception
+            // reaching here means the firewall leaked; unwinding through
+            // asio's dispatch frame is undefined behaviour, so it is counted
+            // separately rather than retried.
+            try {
+                io_->run();
+            } catch (...) {
+                escaped_errors_.fetch_add(1, std::memory_order_relaxed);
+            }
         }
 
         void HttpServer::StartAccept() {
@@ -287,16 +296,15 @@ namespace vgww {
             acceptor_->async_accept(
                 *socket,
                 [this, socket](const std::error_code& err) {
-                    if (err) {
-                        // Transient error: keep accepting while running. Once
-                        // Stop() parks the context this handler is not
-                        // re-armed, so run() can return.
-                        if (running_.load()) {
-                            StartAccept();
+                    // One connection that cannot be queued costs that
+                    // connection, not the accept chain.
+                    core::InvokeHandlerGuarded(handler_errors_, [&] {
+                        if (accept_probe_) {
+                            accept_probe_();
                         }
-                        return;
-                    }
-                    {
+                        if (err) {
+                            return;  // transient: the re-arm below retries
+                        }
                         std::lock_guard<std::mutex> lock(conn_mutex_);
                         static constexpr size_t kMaxQueuedConnections = 64;
                         if (conn_queue_.size() >= kMaxQueuedConnections) {
@@ -305,7 +313,9 @@ namespace vgww {
                         } else {
                             conn_queue_.push_back(std::move(*socket));
                         }
-                    }
+                    });
+                    // Outside the guard on purpose: a throwing body must
+                    // never skip the re-arm, or the server goes deaf.
                     conn_cv_.notify_one();
                     if (running_.load()) {
                         StartAccept();
@@ -331,7 +341,12 @@ namespace vgww {
                     socket = std::move(conn_queue_.front());
                     conn_queue_.pop_front();
                 }
-                HandleConnection(std::move(socket));
+                // One request that cannot be answered costs that request,
+                // not the worker thread (and with it half the WebUI's
+                // capacity).
+                core::InvokeHandlerGuarded(
+                    handler_errors_,
+                    [this, &socket] { HandleConnection(std::move(socket)); });
             }
         }
 

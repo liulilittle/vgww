@@ -66,6 +66,82 @@ namespace {
     constexpr const char* kKeysClients[] = {"clients"};
     constexpr const char* kKeysSystem[] = {"proc", "throughput"};
 
+    /// Non-blocking request with a hard deadline. A deaf server must turn
+    /// into a fast assertion failure: asio's synchronous reads have no
+    /// timeout of their own, so a blocking helper would hang until ctest
+    /// killed the process.
+    int HttpRequestWithin(uint16_t port, const std::string& request,
+                          std::string& body, int timeout_ms) {
+        asio::io_context io;
+        asio::ip::tcp::socket socket(io);
+        std::error_code err;
+        socket.connect(asio::ip::tcp::endpoint(
+                           asio::ip::make_address("127.0.0.1"), port),
+                       err);
+        if (err) return -1;
+        asio::write(socket, asio::buffer(request), err);
+        if (err) return -1;
+        socket.non_blocking(true, err);
+        if (err) return -1;
+        std::string text;
+        char buf[4096];
+        const auto deadline = std::chrono::steady_clock::now() +
+                              std::chrono::milliseconds(timeout_ms);
+        while (std::chrono::steady_clock::now() < deadline) {
+            const size_t n = socket.read_some(asio::buffer(buf), err);
+            if (!err) {
+                text.append(buf, n);
+                continue;
+            }
+            if (asio::error::eof == err) break;
+            if (err != asio::error::would_block &&
+                err != asio::error::try_again) {
+                break;
+            }
+            std::this_thread::sleep_for(std::chrono::milliseconds(2));
+        }
+        const size_t body_at = text.find("\r\n\r\n");
+        if (std::string::npos != body_at) body = text.substr(body_at + 4);
+        const size_t space = text.find(' ');
+        return (std::string::npos == space) ? -1
+                                            : atoi(text.c_str() + space + 1);
+    }
+
+    int HttpGetWithin(const std::string& path, uint16_t port,
+                      std::string& body, int timeout_ms) {
+        return HttpRequestWithin(
+            port,
+            "GET " + path +
+                " HTTP/1.1\r\nHost: t\r\nConnection: close\r\n\r\n",
+            body, timeout_ms);
+    }
+
+    int HttpPostWithin(uint16_t port, const std::string& path,
+                       const std::string& payload, std::string& body,
+                       int timeout_ms) {
+        return HttpRequestWithin(
+            port,
+            "POST " + path + " HTTP/1.1\r\nHost: t\r\nContent-Length: " +
+                std::to_string(payload.size()) +
+                "\r\nConnection: close\r\n\r\n" + payload,
+            body, timeout_ms);
+    }
+
+    /// Connects, writes `request`, and closes without reading. Used where the
+    /// point is that the server does NOT answer (a guarded failure).
+    bool SendAndDiscard(uint16_t port, const std::string& request) {
+        asio::io_context io;
+        asio::ip::tcp::socket socket(io);
+        std::error_code err;
+        socket.connect(asio::ip::tcp::endpoint(
+                           asio::ip::make_address("127.0.0.1"), port),
+                       err);
+        if (err) return false;
+        asio::write(socket, asio::buffer(request), err);
+        socket.close(err);  // no read: this connection is expected to die
+        return true;
+    }
+
     /// Blocking HTTP GET returning status + body.
     int HttpGet(const std::string& path, uint16_t port, std::string& body) {
         asio::io_context io;
@@ -1757,6 +1833,114 @@ static void TestB34rInternalErrorDoesNotLeakText() {
     CHECK(std::string::npos == body.find("SECRET-INTERNAL-MARKER-42"));
     // A usable error body is still required (the client must know it failed).
     CHECK(!body.empty());
+    srv.Stop();
+}
+
+// A throw OUTSIDE the per-route try/catch (Dispatch's write guard runs
+// before any route) used to escape HandleConnection, unwind the worker
+// thread body and call std::terminate. One request must cost that request:
+// the worker survives and keeps serving, and the failure is counted.
+static void TestHandlerThrowOutsideDispatchKeepsTheWorker() {
+    using namespace vgww::web;
+    HttpServer srv;
+    srv.Route("GET", "/api/guard-alive", [](const Request&) {
+        return Response::Text("alive", 200);
+    });
+    srv.Route("POST", "/api/guarded", [](const Request&) {
+        return Response::Json("{\"ok\":true}");
+    });
+    // The write guard is called from Dispatch BEFORE the route lookup and
+    // OUTSIDE its try/catch: this is exactly the escape path. Throw only on
+    // the first call so the same server must then serve normally.
+    auto threw = std::make_shared<std::atomic<bool>>(false);
+    srv.SetWriteGuard([threw](const Request&) -> Response {
+        if (!threw->exchange(true)) {
+            throw std::runtime_error("guard exploded");
+        }
+        Response pass = Response::Json("{\"ok\":true}");
+        pass.status = 200;
+        return pass;
+    });
+    std::string err;
+    constexpr uint16_t kPort = 18313;
+    CHECK(srv.Start("127.0.0.1", kPort, err));
+    CHECK(0 == srv.HandlerErrors());
+
+    // The request dies with the swallowed exception: no response is written,
+    // so the client would block on a read. Send and close instead.
+    const bool sent = SendAndDiscard(
+        kPort,
+        "POST /api/guarded HTTP/1.1\r\nHost: t\r\nContent-Length: 0\r\n"
+        "Connection: close\r\n\r\n");
+    CHECK(sent);
+
+    // The failure must be COUNTED (the guard runs on a worker thread).
+    for (int i = 0; i < 400 && 0 == srv.HandlerErrors(); ++i) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(5));
+    }
+    CHECK(1 == srv.HandlerErrors());
+
+    // The pool must be intact: a GET answers, and so does a SECOND POST
+    // (the guard now passes), proving no worker thread was lost.
+    std::string body;
+    CHECK(200 == HttpGetWithin("/api/guard-alive", kPort, body, 1000));
+    CHECK("alive" == body);
+    CHECK(200 == HttpPostWithin(kPort, "/api/guarded", std::string(), body,
+                                1000));
+    CHECK(body.find("\"ok\":true") != std::string::npos);
+    CHECK(1 == srv.HandlerErrors());  // no spurious extra counts
+    CHECK(0 == srv.EscapedHandlerErrors());
+    srv.Stop();
+}
+
+// An accept handler that throws must not end the accept chain. The handler
+// is the ONLY place that re-arms the next accept, so an unguarded throw (or
+// an allocation failure while arming) silently turns the WebUI deaf while
+// the process keeps looking healthy. Two phases: the first completion dies
+// with an exception, the chain must still accept the next connection.
+static void TestAcceptHandlerThrowKeepsAccepting() {
+    using namespace vgww::web;
+    HttpServer srv;
+    srv.Route("GET", "/api/accept-alive", [](const Request&) {
+        return Response::Text("alive", 200);
+    });
+    auto armed = std::make_shared<std::atomic<int>>(0);
+    srv.SetAcceptProbeForTest([armed] {
+        // Throw exactly on the first completed accept.
+        if (0 == armed->fetch_add(1)) {
+            throw std::runtime_error("accept handler exploded");
+        }
+    });
+    std::string err;
+    constexpr uint16_t kPort = 18314;
+    CHECK(srv.Start("127.0.0.1", kPort, err));
+    CHECK(0 == srv.HandlerErrors());
+
+    // First connection: the handler throws, so the socket is never queued
+    // and this request gets no answer. Send and close (a read would block).
+    CHECK(SendAndDiscard(kPort,
+                         "GET /api/accept-alive HTTP/1.1\r\nHost: t\r\n"
+                         "Connection: close\r\n\r\n"));
+
+    // The failure must be counted and the chain must be back in business.
+    std::string body;
+    int second = -1;
+    for (int i = 0; i < 20; ++i) {
+        second = HttpGetWithin("/api/accept-alive", kPort, body, 1000);
+        if (200 == second) {
+            break;
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(20));
+    }
+    std::printf("b343 accept throw: second=%d errors=%llu\n", second,
+                static_cast<unsigned long long>(srv.HandlerErrors()));
+    CHECK(200 == second);
+    CHECK("alive" == body);
+    CHECK(1 == srv.HandlerErrors());
+    // The firewall must stop the exception INSIDE the handler: unwinding
+    // through asio's dispatch frame is undefined behaviour, so nothing may
+    // reach run().
+    CHECK(0 == srv.EscapedHandlerErrors());
     srv.Stop();
 }
 
@@ -5377,6 +5561,8 @@ int main() {
     TestB34oPersistFailureIsCountedAndNotDurable();
     TestB34rWrongMethodIs405Not404();
     TestB34rInternalErrorDoesNotLeakText();
+    TestHandlerThrowOutsideDispatchKeepsTheWorker();
+    TestAcceptHandlerThrowKeepsAccepting();
     TestB34rTokenCompareIsConstantTime();
     TestB34rEmptyTokenNeverDisablesAuth();
     TestB34rQueryTokenIsNotAccepted();
