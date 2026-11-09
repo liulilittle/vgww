@@ -148,7 +148,7 @@ namespace vgww {
             /// Persists dynamic leases to a JSON file (crash/ restart keeps
             /// address mappings stable). Returns false on I/O failure.
             bool DumpLeases(const std::string& path,
-                            std::chrono::steady_clock::time_point now) const;
+                            std::chrono::steady_clock::time_point now);
 
             /// batch34b: WHY a load ended the way it did. The bool alone could
             /// not distinguish "first run, no file yet" (normal) from "the
@@ -159,8 +159,12 @@ namespace vgww {
                 kRestored,   ///< file read and parsed (some entries may
                              ///< still have been dropped as stale)
                 kNoFile,     ///< absent: a normal first run
-                kCorrupt,    ///< unreadable, oversized, bad JSON or an
-                             ///< unsupported schema version
+                kCorrupt,    ///< oversized, bad JSON or an unsupported
+                             ///< schema version (the file IS preserved)
+                kUnreadable  ///< exists but could not be opened even after
+                             ///< bounded retries (transient lock/permission):
+                             ///< nothing was parsed, so nothing may be
+                             ///< overwritten by a later dump
             };
 
             /// Restores leases persisted by DumpLeases. Expired entries are
@@ -185,6 +189,19 @@ namespace vgww {
             /// not be persisted (F4). Monotonic; callers report deltas.
             uint64_t PoolExhaustedCount() const noexcept;
             uint64_t PersistFailureCount() const noexcept;
+            /// batch119: cumulative lease entries dropped while loading the
+            /// persisted document (malformed, expired, outside the LAN,
+            /// reserved by a static binding, or a duplicate address in the
+            /// file). Monotonic; surfaced so the loss is never silent.
+            uint64_t DroppedLeaseCount() const noexcept;
+            /// batch120: true after the lease document was found unreadable
+            /// as DATA (corrupt/oversized/wrong schema) and preserved as
+            /// `<path>.corrupt`; the persisted mappings did not survive.
+            bool LeaseFileCorrupt() const noexcept;
+            /// batch86: true while dumping is refused because the lease file
+            /// could not be read at load time (a transient lock must not be
+            /// answered by overwriting the possibly-valid document).
+            bool PersistBlocked() const noexcept;
             /// batch34j: times the anti-storm rate-window map was cleared
             /// wholesale because it hit kMaxRateEntries.
             uint64_t RateLimitResets() const noexcept;
@@ -269,6 +286,16 @@ namespace vgww {
 
             /// Status counters (F4/F5); atomic so the accessors stay noexcept.
             mutable std::atomic<uint64_t> persist_failures_{0};
+            /// batch119: see DroppedLeaseCount().
+            mutable std::atomic<uint64_t> dropped_leases_{0};
+            /// batch120: see LeaseFileCorrupt().
+            mutable std::atomic<bool> lease_file_corrupt_{false};
+            /// batch85: set when LoadLeases could not even open the file. The
+            /// document may be perfectly valid (a scanner held it for a
+            /// moment), so the next snapshot must NOT overwrite it; every dump
+            /// is refused until a new server instance reads the file
+            /// successfully.
+            mutable std::atomic<bool> persist_blocked_{false};
     /// batch34j: times the per-client rate window map was cleared wholesale
     /// because it hit kMaxRateEntries (anti-storm protection lost briefly).
     mutable std::atomic<uint64_t> rate_limit_resets_{0};

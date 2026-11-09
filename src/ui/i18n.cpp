@@ -103,6 +103,12 @@ namespace vgww {
                 L"运行时绑定仅本次启动有效。如需持久化,请重启后在设置页保存配置",  // LeasesRuntimeHint
                 L"地址池已用尽,新设备拿不到地址。请缩小租约时间或扩大地址池。",  // LeasesPoolExhausted
                 L"租约文件写入失败,重启后已分配的地址可能变化。",  // LeasesPersistFailed
+                L"规则文件写入失败,改动仅存在于内存,重启后将丢失。",  // RulesPersistFailed
+                L"规则文件中有无效条目被跳过,从未生效。",  // RulesDiscarded
+                L"租约文件中有条目在加载时被丢弃(无效/过期/超出网段/被保留/地址重复)。",  // LeasesDropped
+                L"租约文件损坏,已保全为 .corrupt;其中的地址映射未恢复。",  // LeasesCorrupt
+                L"有 DHCP 报文因格式不合法被丢弃(计数见状态页)。",  // LeasesParseRejected
+                L"控制台环形缓冲已丢弃部分历史行。",  // ConsoleDropped
                 L"有端口映射的 WAN 端口被占用,该规则不会转发任何流量。请换一个端口。",  // PortmapPortBusy
                 L"端口映射运行中:已接受 %s 个连接,拨号失败 %s 次。",  // PortmapLiveSummary
                 L"MAC 地址",  // FormMac
@@ -494,6 +500,12 @@ namespace vgww {
                 L"Runtime bindings last for this session; save them on the Settings page to persist after a restart.",  // LeasesRuntimeHint
                 L"The address pool is full - new devices cannot get an address. Shorten the lease time or widen the pool.",  // LeasesPoolExhausted
                 L"The lease file could not be written; addresses may change after a restart.",  // LeasesPersistFailed
+                L"The rule file could not be written; changes are in memory only and will be lost on restart.",  // RulesPersistFailed
+                L"Invalid entries in the rule file were skipped and never took effect.",  // RulesDiscarded
+                L"Some persisted lease entries were dropped while loading (invalid, expired, outside the LAN, reserved or duplicate).",  // LeasesDropped
+                L"The lease file was corrupt and has been preserved as .corrupt; its mappings were not restored.",  // LeasesCorrupt
+                L"Some DHCP messages were dropped as malformed (see the status counters).",  // LeasesParseRejected
+                L"The console ring buffer has dropped some older lines.",  // ConsoleDropped
                 L"A port-map WAN port is already in use; that rule forwards no traffic. Pick another port.",  // PortmapPortBusy
                 L"Port forwarding is live: %s connection(s) accepted, %s dial failure(s).",  // PortmapLiveSummary
                 L"MAC address",  // FormMac

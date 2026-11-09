@@ -69,6 +69,10 @@ namespace vgww {
                 TableElement* table_ = nullptr;
                 EmptyState* empty_ = nullptr;
                 ContextMenu* context_menu_ = nullptr;
+                /// batch115: rule-document write failures (stderr-only before).
+                Text* rules_hint_ = nullptr;
+                /// batch118: invalid entries skipped at load (stderr-only).
+                Text* discarded_hint_ = nullptr;
                 std::string menu_row_;
                 Str pending_error_ = Str::_Count;  ///< shown on the next Update
             };
@@ -85,6 +89,24 @@ namespace vgww {
                 add_ = add_raw;
                 add_raw->on_click = [this] { ShowAddForm(); };
                 host.Add(std::move(bar));
+
+                // batch115: the same "silent loss" class as the lease page -
+                // a rule write failure means the in-memory rules are not on
+                // disk. Warn on the page that owns the rules.
+                auto hint = std::make_unique<Text>(
+                    I18n::Instance().T(Str::RulesPersistFailed),
+                    FontToken::Small, ColorToken::Warning, true);
+                hint->id = "firewall.rules_persist_hint";
+                hint->visible = false;
+                rules_hint_ = static_cast<Text*>(host.Add(std::move(hint)));
+
+                auto discarded = std::make_unique<Text>(
+                    I18n::Instance().T(Str::RulesDiscarded),
+                    FontToken::Small, ColorToken::Warning, true);
+                discarded->id = "firewall.rules_discarded_hint";
+                discarded->visible = false;
+                discarded_hint_ =
+                    static_cast<Text*>(host.Add(std::move(discarded)));
 
                 // R4a: table + empty inside a FillPanel so an empty table
                 // shows a centred placeholder instead of a thin band.
@@ -318,6 +340,29 @@ namespace vgww {
                 empty_->SetMessage(Str::FirewallEmptyHint);  // relabel on a language switch
                 if (add_ != nullptr) {
                     add_->SetLabel(i18n.T(Str::CommonAdd));
+                }
+                if (rules_hint_ != nullptr) {
+                    const bool failed =
+                        snapshot.rules_persist_failures > 0;
+                    if (rules_hint_->visible != failed) {
+                        rules_hint_->visible = failed;
+                        RelayoutHost(*host_);
+                    }
+                    if (failed) {
+                        rules_hint_->SetText(
+                            i18n.T(Str::RulesPersistFailed));
+                    }
+                }
+                if (discarded_hint_ != nullptr) {
+                    const bool dropped = snapshot.rules_discarded > 0;
+                    if (discarded_hint_->visible != dropped) {
+                        discarded_hint_->visible = dropped;
+                        RelayoutHost(*host_);
+                    }
+                    if (dropped) {
+                        discarded_hint_->SetText(
+                            i18n.T(Str::RulesDiscarded));
+                    }
                 }
                 if (pending_error_ != Str::_Count) {
                     const Str message = pending_error_;

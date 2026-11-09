@@ -126,6 +126,36 @@ namespace vgww {
             /// to persist (mappings lost on restart). Monotonic.
             uint64_t dhcp_pool_exhausted = 0;
             uint64_t dhcp_persist_failures = 0;
+            /// batch103: the lease document is at risk beyond the live v4
+            /// counter - DHCPv6 snapshots can fail, and the LAST STOP may
+            /// already have lost its document (the servers are gone by then,
+            /// so the counters no longer exist). True when either is the
+            /// case; the leases page raises the same warning.
+            bool lease_persist_failed = false;
+            /// batch104: v6 pool exhaustion counter (the v4 sibling above is
+            /// `dhcp_pool_exhausted`); the leases page picks by active tab.
+            uint64_t dhcp6_pool_exhausted = 0;
+            /// batch119: cumulative lease entries dropped at load; the leases
+            /// page warns because those mappings silently never applied.
+            uint64_t dhcp_leases_dropped = 0;
+            uint64_t dhcp6_leases_dropped = 0;
+            /// batch120: the lease document was corrupt and preserved aside.
+            bool dhcp_leases_corrupt = false;
+            bool dhcp6_leases_corrupt = false;
+            /// batch121: cumulative DHCPv4 frames refused by strict parsing.
+            uint64_t dhcp_parse_rejected = 0;
+            /// batch122: DHCPv6 sibling.
+            uint64_t dhcp6_parse_rejected = 0;
+            /// batch126: console-ring lines evicted by the bound.
+            uint64_t console_dropped = 0;
+            /// batch115: cumulative rule-document write failures (RuleStore).
+            /// Non-zero means in-memory rule changes are NOT on disk and a
+            /// restart loses them; the firewall page warns instead of letting
+            /// the loss stay stderr-only.
+            uint64_t rules_persist_failures = 0;
+            /// batch118: invalid entries skipped when the rule document was
+            /// loaded (they never took effect); monotonic since attach.
+            uint64_t rules_discarded = 0;
             Counters counters;
 
             vgww::runtime::Dataplane::Throughput throughput;

@@ -314,11 +314,21 @@ namespace vgww {
                             conn_queue_.push_back(std::move(*socket));
                         }
                     });
-                    // Outside the guard on purpose: a throwing body must
-                    // never skip the re-arm, or the server goes deaf.
+                    // Outside the body guard on purpose: a throwing body must
+                    // never skip the re-arm, or the server goes deaf. The
+                    // re-arm itself allocates, so IT is firewalled too: an
+                    // escaping throw would unwind run() and end the accept
+                    // thread (AcceptLoop counts that as "escaped"), while the
+                    // listener goes deaf either way - this counter keeps the
+                    // failure attributable and the thread alive.
                     conn_cv_.notify_one();
                     if (running_.load()) {
-                        StartAccept();
+                        core::InvokeHandlerGuarded(rearm_errors_, [&] {
+                            if (accept_rearm_probe_) {
+                                accept_rearm_probe_();
+                            }
+                            StartAccept();
+                        });
                     }
                 });
         }

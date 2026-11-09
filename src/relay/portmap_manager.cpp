@@ -132,73 +132,89 @@ namespace vgww {
         void PortMapManager::RunLoop() {
             uint64_t tick = 0;
             while (running_.load()) {
-                // 1. Poll the rule version. ApplyRules returns immediately
-                //    unless the store version moved (or a failed bind is
-                //    retried), so the poll frequency is not a cost
-                //    multiplier (batch312).
-                if (tick % 20 == 0) {
-                    ApplyRules();
-                }
-                ++tick;
+                // One iteration that fails (an allocation while rebuilding
+                // the acceptors, a queue element that cannot be moved) costs
+                // that iteration, not the manager thread: the body is
+                // firewalled and the next pass retries the same work. An
+                // escape here would unwind a std::thread body and terminate
+                // the process, leaving every rule listed but dead.
+                core::InvokeHandlerGuarded(stats_.loop_errors, [&] {
+                    if (loop_probe_) {
+                        loop_probe_();
+                    }
+                    // 1. Poll the rule version. ApplyRules returns immediately
+                    //    unless the store version moved (or a failed bind is
+                    //    retried), so the poll frequency is not a cost
+                    //    multiplier (batch312).
+                    if (tick % 20 == 0) {
+                        ApplyRules();
+                    }
+                    ++tick;
 
-                // 2. Drain xtcp callbacks queued by workers.
-                {
-                    std::lock_guard<std::mutex> lock(queue_mutex_);
-                    while (!state_queue_.empty()) {
-                        auto [conn_id, state] = state_queue_.front();
-                        state_queue_.pop_front();
-                        const auto it = relays_.find(conn_id);
-                        if (relays_.end() == it) continue;
-                        // xtcp TcpState: kEstablished = 4; terminal states
-                        // (kClosed = 0, kTimeWait = 10) tear the relay down.
-                        if (state == 4) {
-                            it->second.established = true;
-                            PumpOne(conn_id, it->second);
-                            ArmWanRead(conn_id, it->second);
-                        } else if (state == 7) {
-                            // kCloseWait: the WAN peer half-closed (its FIN
-                            // reached the stack). Propagate the half-close:
-                            // shut OUR send direction of the WAN socket so the
-                            // peer's server drains then sees EOF; its replies
-                            // still flow back through the receive pump. Runs
-                            // on the manager thread that owns `io_` - the same
-                            // thread that drives the wan socket - so asio
-                            // needs no external synchronization.
-                            const bool any =
-                                nullptr != it->second.wan &&
-                                it->second.wan->is_open();
-                            if (any) {
-                                std::error_code ignored;
-                                it->second.wan->shutdown(
-                                    asio::socket_base::shutdown_send, ignored);
+                    // 2. Drain xtcp callbacks queued by workers.
+                    {
+                        std::lock_guard<std::mutex> lock(queue_mutex_);
+                        while (!state_queue_.empty()) {
+                            auto [conn_id, state] = state_queue_.front();
+                            state_queue_.pop_front();
+                            const auto it = relays_.find(conn_id);
+                            if (relays_.end() == it) continue;
+                            // xtcp TcpState: kEstablished = 4; terminal states
+                            // (kClosed = 0, kTimeWait = 10) tear the relay down.
+                            if (state == 4) {
+                                it->second.established = true;
+                                PumpOne(conn_id, it->second);
+                                ArmWanRead(conn_id, it->second);
+                            } else if (state == 7) {
+                                // kCloseWait: the WAN peer half-closed (its FIN
+                                // reached the stack). Propagate the half-close:
+                                // shut OUR send direction of the WAN socket so
+                                // the peer's server drains then sees EOF; its
+                                // replies still flow back through the receive
+                                // pump. Runs on the manager thread that owns
+                                // `io_` - the same thread that drives the wan
+                                // socket - so asio needs no external
+                                // synchronization.
+                                const bool any =
+                                    nullptr != it->second.wan &&
+                                    it->second.wan->is_open();
+                                if (any) {
+                                    std::error_code ignored;
+                                    it->second.wan->shutdown(
+                                        asio::socket_base::shutdown_send,
+                                        ignored);
+                                }
+                            } else if (state == 0 || state == 10) {
+                                CloseRelay(conn_id, it->second);
                             }
-                        } else if (state == 0 || state == 10) {
-                            CloseRelay(conn_id, it->second);
+                        }
+                        while (!data_queue_.empty()) {
+                            auto [conn_id, payload] =
+                                std::move(data_queue_.front());
+                            data_queue_.pop_front();
+                            const auto it = relays_.find(conn_id);
+                            if (relays_.end() == it ||
+                                !it->second.established) {
+                                continue;
+                            }
+                            it->second.pending.emplace_back(std::move(payload));
+                            PumpOne(conn_id, it->second);
                         }
                     }
-                    while (!data_queue_.empty()) {
-                        auto [conn_id, payload] = std::move(data_queue_.front());
-                        data_queue_.pop_front();
-                        const auto it = relays_.find(conn_id);
-                        if (relays_.end() == it || !it->second.established) {
-                            continue;
-                        }
-                        it->second.pending.emplace_back(std::move(payload));
-                        PumpOne(conn_id, it->second);
-                    }
-                }
 
-                // 3. Drive WAN-side async operations. Every completion body
-                // is guarded, so a throw reaching here means the firewall
-                // leaked: unwinding through asio's dispatch frame is
-                // undefined behaviour, so count it rather than retry.
-                try {
-                    io_.poll();
-                    io_.run_for(std::chrono::milliseconds(5));
-                } catch (...) {
-                    stats_.escaped_handler_errors.fetch_add(
-                        1, std::memory_order_relaxed);
-                }
+                    // 3. Drive WAN-side async operations. Every completion
+                    // body is guarded, so a throw reaching here means the
+                    // firewall leaked: unwinding through asio's dispatch
+                    // frame is undefined behaviour, so count it rather than
+                    // retry.
+                    try {
+                        io_.poll();
+                        io_.run_for(std::chrono::milliseconds(5));
+                    } catch (...) {
+                        stats_.escaped_handler_errors.fetch_add(
+                            1, std::memory_order_relaxed);
+                    }
+                });
                 std::this_thread::sleep_for(std::chrono::microseconds(200));
             }
         }
@@ -396,13 +412,23 @@ namespace vgww {
                                 std::error_code ignored;
                                 accepted->close(ignored);
                             }
-                            // Re-arm OUTSIDE the guard: a throwing body must never skip it, or
+                            // Re-arm OUTSIDE the body guard: a throwing body must never skip it, or
                             // the rule stops accepting for good while the UI still lists it.
+                            // The re-arm allocates (socket + accept op), so IT is firewalled
+                            // too: an escape would be caught by the loop's poll guard and
+                            // mis-attributed as an "escaped handler", while the rule silently
+                            // stops accepting.
                             if (running_.load()) {
                                 auto live = weak.lock();
                                 if (live && live->is_open()) {
                                     if (auto retry = weak_loop.lock()) {
-                                        (*retry)();
+                                        core::InvokeHandlerGuarded(
+                                            stats_.rearm_errors, [&] {
+                                                if (accept_rearm_probe_) {
+                                                    accept_rearm_probe_();
+                                                }
+                                                (*retry)();
+                                            });
                                     }
                                 }
                             }

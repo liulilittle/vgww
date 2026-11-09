@@ -42,6 +42,11 @@ namespace vgww {
             /// skip the Snapshot() copy while it is unchanged (audit B F5).
             std::uint64_t Revision() noexcept;
 
+            /// batch126: cumulative lines evicted by the bounded ring (the
+            /// oldest first). A dropped line - possibly an [audit] record -
+            /// must not be a silent loss.
+            std::uint64_t DroppedLineCount() noexcept;
+
             /// Thread-safe snapshot of the captured lines (oldest first).
             std::vector<std::wstring> Snapshot();
 
@@ -51,6 +56,19 @@ namespace vgww {
             /// Test seam: appends one UTF-8 line through the exact same fold
             /// path the reader thread uses (no process-wide redirection).
             void AppendForTest(const std::string& utf8);
+
+            /// Test seam: runs one captured CHUNK through the reader thread's
+            /// exact fold path (tee, line splitting, overflow fold) without
+            /// redirecting the process streams.
+            void HandleCapturedChunkForTest(const std::string& chunk);
+
+            /// Test seam: runs inside the folded-chunk body; throwing proves
+            /// the reader thread's firewall holds.
+            void SetReaderProbeForTest(std::function<void()> probe);
+
+            /// Chunk bodies whose exception was swallowed by the firewall
+            /// (telemetry/tests).
+            std::uint64_t ReaderErrorCountForTest() noexcept;
 
             /// batch22 B4: appends one privileged-operation audit line to the
             /// same ring (so it is visible in the native console, the web

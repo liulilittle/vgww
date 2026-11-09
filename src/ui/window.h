@@ -41,6 +41,7 @@
 #include "ui/renderer.h"
 #include "ui/ui_state.h"
 
+#include <atomic>
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
@@ -705,6 +706,19 @@ namespace vgww {
             /// owner wiring (UiDebugServer) to call DrainOnUiThread.
             std::function<void()> on_ui_debug;
 
+            /// WndProc bodies whose exception was swallowed by the firewall
+            /// (telemetry/tests). WndProcThunk is called by user32: a throw
+            /// escaping it would unwind through DispatchMessage's frame, which
+            /// is undefined behaviour, so the body is firewalled instead.
+            uint64_t HandlerErrors() const noexcept {
+                return handler_errors_.load(std::memory_order_relaxed);
+            }
+
+            /// Test seam: drives the guarded WM_TIMER snapshot path headless
+            /// (the same entry user32 takes), so a throwing on_snapshot_tick
+            /// can be shown to cost that one tick, not the process.
+            LRESULT RunSnapshotTimerTickForTest();
+
         private:
             static constexpr UINT kUiDebugMessage = WM_APP + 5;
             /// M1 (batch2, plan C): never a real generation, so the first
@@ -716,6 +730,11 @@ namespace vgww {
                                                  WPARAM wparam, LPARAM lparam);
             LRESULT WndProc(HWND hwnd, UINT message, WPARAM wparam,
                             LPARAM lparam);
+            /// Runs WndProc behind the exception firewall and falls back to
+            /// DefWindowProc when the body threw, so user32 never sees a C++
+            /// unwind. This is the single OS-facing window-procedure entry.
+            LRESULT RunGuardedWndProc(HWND hwnd, UINT message, WPARAM wparam,
+                                      LPARAM lparam) noexcept;
 
             void ApplyDpi(float dpi) noexcept;
             /// batch28: records the live window rect while the window is in
@@ -1035,6 +1054,7 @@ namespace vgww {
             bool com_initialized_ = false;
             bool exit_requested_ = false;
             bool balloon_shown_ = false;
+            std::atomic<uint64_t> handler_errors_{0};
             bool tray_active_ = false;
             /// batch25b: set when a close request actually hid the window
             /// (headless-observable; SW_HIDE itself is a no-op without hwnd).

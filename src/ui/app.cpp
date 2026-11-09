@@ -3,6 +3,7 @@
 // ============================================================================
 #include "ui/app.h"
 
+#include "core/handler_guard.h"
 #include "ui/controls.h"
 #include "ui/i18n.h"
 #include "ui/pages/page_util.h"
@@ -15,6 +16,7 @@
 #include <windows.h>
 
 #include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <cstdio>
 #include <thread>
@@ -24,6 +26,11 @@ namespace vgww {
     namespace ui {
 
         namespace {
+
+            /// Detached repair-worker bodies that threw and were reported
+            /// instead of terminating the process (a std::thread body is its
+            /// own entry point, so an escape is fatal).
+            std::atomic<uint64_t> g_repair_thread_errors{0};
 
             /// Shell root: 220 px sidebar + filling right column.
             class ShellRoot final : public Element {
@@ -345,16 +352,28 @@ namespace vgww {
             auto state = std::make_shared<RepairAsyncState>();
             repair_state_ = state;
             std::thread([state] {
-                const vgww::driver::ElevatedInstallResult result =
-                    vgww::driver::RunElevatedInstallAndWait();
-                std::lock_guard<std::mutex> lock(state->mutex);
-                state->done = true;
-                state->ok =
-                    vgww::driver::ElevatedInstallOutcome::InstallOk ==
-                    result.outcome;
-                if (!state->ok) {
-                    state->summary = RepairFailureSummary(result);
-                }
+                ::vgww::core::RunDetachedBodyGuarded(
+                    g_repair_thread_errors,
+                    [&] {
+                        const vgww::driver::ElevatedInstallResult result =
+                            vgww::driver::RunElevatedInstallAndWait();
+                        std::lock_guard<std::mutex> lock(state->mutex);
+                        state->done = true;
+                        state->ok =
+                            vgww::driver::ElevatedInstallOutcome::InstallOk ==
+                            result.outcome;
+                        if (!state->ok) {
+                            state->summary = RepairFailureSummary(result);
+                        }
+                    },
+                    [&] {
+                        // The body threw, so there is no result to classify;
+                        // the poller still needs a terminal failed state.
+                        std::lock_guard<std::mutex> lock(state->mutex);
+                        state->done = true;
+                        state->ok = false;
+                        state->summary = L"driver repair failed";
+                    });
             }).detach();
         }
 

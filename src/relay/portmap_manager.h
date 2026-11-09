@@ -102,6 +102,15 @@ namespace vgww {
                 /// io_context::run_for(). Must stay 0 - unwinding through
                 /// asio's dispatch frame is undefined behaviour.
                 std::atomic<uint64_t> escaped_handler_errors{0};
+                /// Manager-thread iteration bodies that threw and were
+                /// swallowed by the thread-body firewall: that pass was lost
+                /// (rules/queue work retried next pass), the thread survived.
+                /// Distinct from handler_errors (per-connection completions).
+                std::atomic<uint64_t> loop_errors{0};
+                /// Accept re-arms whose socket/accept allocation threw and was
+                /// swallowed: the rule cannot re-arm (deaf until the rule set
+                /// changes), but the manager thread survives.
+                std::atomic<uint64_t> rearm_errors{0};
             };
             const Stats& GetStats() const noexcept { return stats_; }
 
@@ -136,6 +145,19 @@ namespace vgww {
             /// and that the accept chain still re-arms.
             void SetAcceptProbeForTest(std::function<void()> probe) {
                 accept_probe_ = std::move(probe);
+            }
+
+            /// Test seam: runs at the top of every manager-thread iteration,
+            /// before the rule poll. Throwing here proves the thread-body
+            /// firewall holds and the loop keeps running.
+            void SetLoopProbeForTest(std::function<void()> probe) {
+                loop_probe_ = std::move(probe);
+            }
+
+            /// Test seam: runs inside the guarded accept RE-ARM; throwing
+            /// proves an arm failure cannot crash the manager thread.
+            void SetAcceptRearmProbeForTest(std::function<void()> probe) {
+                accept_rearm_probe_ = std::move(probe);
             }
 
             // ----- xtcp callbacks (worker threads, shard lock held) ----------
@@ -218,6 +240,8 @@ namespace vgww {
             std::atomic<uint64_t> dropped_packets_{0};
             std::atomic<uint64_t> last_relay_conn_id_{0};
             std::function<void()> accept_probe_;
+            std::function<void()> loop_probe_;
+            std::function<void()> accept_rearm_probe_;
         };
 
     }  // namespace relay

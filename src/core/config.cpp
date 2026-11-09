@@ -12,11 +12,16 @@
 #include <iphlpapi.h>
 #include <algorithm>
 #include <atomic>
-
 #include <charconv>
 #include <chrono>
 #include <cstdio>
+#include <cwchar>
+#include <cwctype>
+#include <filesystem>
 #include <fstream>
+#include <map>
+#include <memory>
+#include <mutex>
 #include <sstream>
 #include <stdexcept>
 
@@ -26,6 +31,41 @@ namespace vgww {
         namespace {
 
             using nlohmann::json;
+
+            // Test seams owned here so the loaders defined earlier in this
+            // translation unit can read them.
+            std::mutex g_flush_hook_mutex;
+            std::function<bool(std::intptr_t)> g_flush_hook;
+            std::mutex g_open_hook_mutex;
+            std::function<unsigned long(const std::string&)> g_open_hook;
+
+            // batch94: one write lock per document path. Config::UpdateFile
+            // holds it across load->mutate->publish, and whole-document
+            // publishers (POST /api/config) hold it across their publish, so
+            // a read-modify-write can never publish a snapshot from before
+            // the other writer's change (lost update).
+            std::mutex g_file_mutex_registry;
+            std::map<std::string, std::unique_ptr<std::mutex>>
+                g_file_mutexes;
+
+            /// batch107: ConfigFileLock's blocking wait (ms). The test seam
+            /// SetConfigLockWaitForTest overrides it; default 30 s.
+            std::atomic<int64_t> g_lock_wait_ms{30000};
+
+            /// P82 test seam: an override for the lock NAME (see
+            /// SetConfigLockNameOverrideForTest).
+            std::mutex g_lock_name_mutex;
+            std::function<std::string(const std::string& path)>
+                g_lock_name_override;
+
+            std::mutex& FileMutexFor(const std::string& path) {
+                std::lock_guard<std::mutex> guard(g_file_mutex_registry);
+                std::unique_ptr<std::mutex>& slot = g_file_mutexes[path];
+                if (!slot) {
+                    slot = std::make_unique<std::mutex>();
+                }
+                return *slot;
+            }
 
             /// Parses an IPv6 address with an optional "/length" suffix into
             /// 16 wire-order bytes (declared early; defined below with the
@@ -1572,12 +1612,22 @@ namespace vgww {
 
         std::optional<Config> Config::LoadFromFile(const std::string& path,
                                                    std::string& error) {
+            // The error out-parameter is authoritative: the parse helpers
+            // signal failure through it, so a caller that reuses a string
+            // still holding an earlier message would be told "no config" for
+            // a perfectly good file (batch109: an UpdateFile after a rejected
+            // write failed this way and the valid retry never published).
+            error.clear();
             json root;
 
 #ifdef _WIN32
             // Long-path aware open via wide API + \\?\ prefix (32767).
             std::string raw;
             bool raw_ok = false;
+            // batch84: classification for the failure paths below.
+            bool open_file_exists = true;
+            unsigned long open_error_code = 0;
+            bool open_simulated_failure = false;
 
             {
                 // UTF-8 -> wide
@@ -1628,8 +1678,62 @@ namespace vgww {
                     }
 
                     FILE* f = nullptr;
+                    // batch84: a config briefly held open by an AV scanner or
+                    // the search indexer (sharing/lock violation while the
+                    // file exists) used to abort startup exactly like a
+                    // genuinely corrupt document. Reads are idempotent, so
+                    // giving a transient holder a few milliseconds to let go
+                    // costs nothing on the normal path (first attempt wins)
+                    // and keeps the daemon bootable. A missing file is never
+                    // retried.
+                    constexpr int kOpenAttempts = 3;
 
-                    if (0 == ::_wfopen_s(&f, wpath.c_str(), L"rb") && nullptr != f)
+                    for (int attempt = 0;; ++attempt)
+                    {
+                        unsigned long simulated = 0;
+
+                        {
+                            std::function<unsigned long(const std::string&)> hook;
+
+                            {
+                                std::lock_guard<std::mutex> lock(g_open_hook_mutex);
+                                hook = g_open_hook;
+                            }
+
+                            if (hook)
+                            {
+                                simulated = hook(path);
+                            }
+                        }
+
+                        const DWORD attrs = ::GetFileAttributesW(wpath.c_str());
+                        open_file_exists = (INVALID_FILE_ATTRIBUTES != attrs);
+
+                        if (0 == simulated)
+                        {
+                            if (0 == ::_wfopen_s(&f, wpath.c_str(), L"rb") &&
+                                nullptr != f)
+                            {
+                                break;
+                            }
+                            open_simulated_failure = false;
+                            open_error_code = static_cast<unsigned long>(
+                                ::GetLastError());
+                        }
+                        else
+                        {
+                            open_simulated_failure = true;
+                            open_error_code = simulated;
+                        }
+
+                        if (!open_file_exists || attempt + 1 >= kOpenAttempts)
+                        {
+                            break;
+                        }
+                        ::Sleep(static_cast<DWORD>(attempt + 1));
+                    }
+
+                    if (nullptr != f)
                     {
                         ::fseek(f, 0, SEEK_END);
                         long sz = ::ftell(f);
@@ -1667,13 +1771,34 @@ namespace vgww {
                     return std::nullopt;
                 }
             }
+            else if (open_simulated_failure)
+            {
+                // Every attempt was injected as failing: the fallback path is
+                // bypassed so the simulated lock is reported, not silently
+                // ignored by opening the file a second way.
+                error = "config file is not readable: " + path + " (error " +
+                        std::to_string(open_error_code) + ")";
+                return std::nullopt;
+            }
             else
             {
                 std::ifstream stream(path, std::ios::binary | std::ios::ate);
 
                 if (!stream)
                 {
-                    error = "cannot open config file: " + path;
+                    // batch84: report a missing file apart from one that
+                    // exists but cannot be opened (permissions / a persistent
+                    // lock) - "cannot open" hid which of the two happened.
+                    if (!open_file_exists)
+                    {
+                        error = "config file not found: " + path;
+                    }
+                    else
+                    {
+                        error = "config file is not readable: " + path +
+                                " (error " +
+                                std::to_string(open_error_code) + ")";
+                    }
                     return std::nullopt;
                 }
 
@@ -1935,6 +2060,32 @@ namespace vgww {
             }
 #endif
 
+#ifdef _WIN32
+            /// batch95: kernel object name for the per-document cross-process
+            /// lock - the absolute, case-folded path hashed to a stable name.
+            std::wstring ConfigLockName(const std::string& path) {
+                std::wstring wide = ToWideLongPath(path);
+                if (wide.empty()) {
+                    return std::wstring();
+                }
+                std::wstring abs(32767, L'\0');
+                const DWORD len = ::GetFullPathNameW(wide.c_str(), 32767,
+                                                     abs.data(), nullptr);
+                if (0 == len || len >= 32767) {
+                    return std::wstring();
+                }
+                abs.resize(len);
+                for (wchar_t& c : abs) {
+                    c = static_cast<wchar_t>(::towlower(c));
+                }
+                const size_t hashed = std::hash<std::wstring>{}(abs);
+                wchar_t name[48] = {};
+                std::swprintf(name, 48, L"Local\\vgww-cfg-%016llx",
+                              static_cast<unsigned long long>(hashed));
+                return std::wstring(name);
+            }
+#endif
+
             /// Bare lowercase hex (no separators) as the loader expects.
             std::string DuidHex(const std::vector<uint8_t>& duid) {
                 static const char* kHex = "0123456789abcdef";
@@ -2131,54 +2282,485 @@ namespace vgww {
 #endif
         }
 
-        bool Config::SaveToFile(const std::string& path,
-                                std::string& error) const {
-            error.clear();
-            if (path.empty()) {
-                error = "empty config path";
+        namespace {
+            /// Device flush behind the test seam: production always calls the
+            /// real FlushFileBuffers (and its result is never ignored).
+            bool FlushToDevice(std::intptr_t handle) noexcept {
+                std::function<bool(std::intptr_t)> hook;
+                {
+                    std::lock_guard<std::mutex> lock(g_flush_hook_mutex);
+                    hook = g_flush_hook;
+                }
+                if (hook) {
+                    return hook(handle);
+                }
+#if defined(_WIN32)
+                return 0 !=
+                       ::FlushFileBuffers(reinterpret_cast<HANDLE>(handle));
+#else
+                (void)handle;
+                return true;
+#endif
+            }
+        }  // namespace
+
+        void SetFileFlushHookForTest(std::function<bool(std::intptr_t)> hook) {
+            std::lock_guard<std::mutex> lock(g_flush_hook_mutex);
+            g_flush_hook = std::move(hook);
+        }
+
+        void SetConfigOpenFailureHookForTest(
+            std::function<unsigned long(const std::string& path)> hook) {
+            std::lock_guard<std::mutex> lock(g_open_hook_mutex);
+            g_open_hook = std::move(hook);
+        }
+
+        unsigned long SimulatedOpenFailure(const std::string& path) {
+            std::function<unsigned long(const std::string&)> hook;
+            {
+                std::lock_guard<std::mutex> lock(g_open_hook_mutex);
+                hook = g_open_hook;
+            }
+            return hook ? hook(path) : 0;
+        }
+
+        void SetConfigLockWaitForTest(std::chrono::milliseconds wait) {
+            const int64_t ms = wait.count() > 0 ? wait.count() : 30000;
+            g_lock_wait_ms.store(ms, std::memory_order_relaxed);
+        }
+
+        void SetConfigLockNameOverrideForTest(
+            const std::function<std::string(const std::string& path)>&
+                override) {
+            std::lock_guard<std::mutex> lock(g_lock_name_mutex);
+            g_lock_name_override = override;
+        }
+
+        std::wstring ConfigLockNameWithOverride(const std::string& path) {
+            std::lock_guard<std::mutex> lock(g_lock_name_mutex);
+            if (g_lock_name_override) {
+                const std::string name = g_lock_name_override(path);
+                return std::wstring(name.begin(), name.end());
+            }
+            return ConfigLockName(path);
+        }
+
+        bool SetAsideFile(const std::string& path,
+                          const std::string& suffix) {
+            if (path.empty() || suffix.empty()) {
                 return false;
             }
-            const std::string data = ToJsonString();
-#ifdef _WIN32
-            // U1: unique temp name per write, shared process-wide with the
-            // web worker's POST /api/config (see MakeUniqueSiblingPath); a
-            // shared {config}.tmp would let one writer truncate the other
-            // mid-write. The atomic rename below still publishes a complete
-            // file.
-            const std::string tmp = MakeUniqueSiblingPath(path);
+            // batch108: the rename must not steal a document another process
+            // is publishing (a second VGWW process writing the same rules or
+            // lease file). Refuse when the destination's lock cannot be taken;
+            // every caller already handles false (keeps/retries later).
+            ConfigFileLock file_lock(path);
+            if (!file_lock.locked()) {
+                return false;
+            }
+            const std::string aside = path + suffix;
+#if defined(_WIN32)
+            const std::wstring wpath = ToWideLongPath(path);
+            const std::wstring waside = ToWideLongPath(aside);
+            if (wpath.empty() || waside.empty()) {
+                return false;
+            }
+            // MoveFileExW refuses to move a directory, so a directory at the
+            // destination simply keeps failing for the caller instead of being
+            // silently renamed aside (proven by removing a belt-and-braces
+            // FILE_ATTRIBUTE_DIRECTORY check: no test changed outcome). POSIX
+            // rename WOULD move a directory, hence the is_regular_file gate in
+            // that branch.
+            // Replace the previous aside copy: the latest unreadable file is
+            // the one worth keeping, and the pile must stay bounded to one.
+            ::DeleteFileW(waside.c_str());
+            return 0 != ::MoveFileExW(wpath.c_str(), waside.c_str(),
+                                      MOVEFILE_WRITE_THROUGH);
+#else
+            std::error_code ec;
+            if (!std::filesystem::is_regular_file(path, ec)) {
+                return false;
+            }
+            if (0 != std::filesystem::remove(aside, ec)) {
+                ec.clear();
+            }
+            std::filesystem::rename(path, aside, ec);
+            return !ec;
+#endif
+        }
+
+        AtomicWriteOutcome WriteFileAtomicDurable(
+            const std::string& path, const std::string& data,
+            std::string& error,
+            const std::function<bool(const std::string&)>& validator) {
+            error.clear();
+            if (path.empty()) {
+                error = "empty path";
+                return AtomicWriteOutcome::kIoError;
+            }
+            // batch106: one cross-process lock per DESTINATION path. The rule
+            // document and the DHCP lease documents call this directly, so
+            // this is the only place that can protect them from a second
+            // process (--headless WebUI beside the normal launch) replacing
+            // the whole file. Same-thread nesting (Config::UpdateFile's outer
+            // ConfigFileLock) is mutex recursion, not a deadlock.
+            ConfigFileLock file_lock(path);
+            // batch107: a lock that timed out must stop the write here, not
+            // silently publish without cross-process exclusion.
+            if (!file_lock.locked()) {
+                error = "destination is locked by another process: " + path;
+                return AtomicWriteOutcome::kIoError;
+            }
+#if defined(_WIN32)
+            const std::string tmp = Config::MakeUniqueSiblingPath(path);
             const std::wstring wtmp = ToWideLongPath(tmp);
             if (wtmp.empty()) {
-                error = "config path conversion failed";
-                return false;
+                error = "path conversion failed";
+                return AtomicWriteOutcome::kIoError;
             }
             FILE* f = nullptr;
             if (0 != ::_wfopen_s(&f, wtmp.c_str(), L"wb") || nullptr == f) {
                 error = "cannot open temporary file: " + tmp;
-                return false;
+                return AtomicWriteOutcome::kIoError;
             }
             const size_t written = ::fwrite(data.data(), 1, data.size(), f);
-            ::fflush(f);
-            // Durability: fflush drains the CRT buffer only; FlushFileBuffers
-            // pushes the tmp bytes to the volume BEFORE the atomic rename
-            // publishes them (same discipline as web_api.cpp's writer).
+            const bool flushed = 0 == ::fflush(f);
             const intptr_t os_handle = ::_get_osfhandle(::_fileno(f));
-            if (-1 != os_handle) {
-                (void)::FlushFileBuffers(
-                    reinterpret_cast<HANDLE>(os_handle));
-            }
+            const bool synced = (-1 != os_handle) && FlushToDevice(os_handle);
             const int close_ok = ::fclose(f);
-            if (written != data.size() || 0 != close_ok) {
+            if (written != data.size() || !flushed || !synced ||
+                0 != close_ok) {
                 ::DeleteFileW(wtmp.c_str());
-                error = "short write to temporary file: " + tmp;
-                return false;
+                error = "short write, flush or close error: " + tmp;
+                return AtomicWriteOutcome::kIoError;
             }
-            if (!PublishConfigTempFile(tmp, path, error)) {
-                return false;
+            if (validator && !validator(tmp)) {
+                ::DeleteFileW(wtmp.c_str());
+                error = "validation rejected the temporary file: " + tmp;
+                return AtomicWriteOutcome::kValidationFailed;
             }
-            return true;
+            if (!Config::PublishConfigTempFile(tmp, path, error)) {
+                return AtomicWriteOutcome::kIoError;
+            }
+            return AtomicWriteOutcome::kOk;
 #else
-            error = "SaveToFile requires Windows";
-            return false;
+            const std::string tmp = Config::MakeUniqueSiblingPath(path);
+            {
+                std::ofstream out(tmp, std::ios::binary);
+                if (!out) {
+                    error = "cannot open temporary file: " + tmp;
+                    return AtomicWriteOutcome::kIoError;
+                }
+                out.write(data.data(),
+                          static_cast<std::streamsize>(data.size()));
+                out.flush();
+                if (!out) {
+                    std::error_code ignored;
+                    std::filesystem::remove(tmp, ignored);
+                    error = "short write: " + tmp;
+                    return AtomicWriteOutcome::kIoError;
+                }
+            }
+            if (validator && !validator(tmp)) {
+                std::error_code ignored;
+                std::filesystem::remove(tmp, ignored);
+                error = "validation rejected the temporary file: " + tmp;
+                return AtomicWriteOutcome::kValidationFailed;
+            }
+            std::error_code ec;
+            std::filesystem::rename(tmp, path, ec);
+            if (ec) {
+                std::error_code removed;
+                std::filesystem::remove(tmp, removed);
+                error = "atomic replace failed: " + path;
+                return AtomicWriteOutcome::kIoError;
+            }
+            return AtomicWriteOutcome::kOk;
+#endif
+        }
+
+        bool Config::SaveToFile(const std::string& path,
+                                std::string& error) const {
+            // batch94: the same per-path lock UpdateFile() holds, so a
+            // whole-document save cannot publish between another writer's
+            // load and publish.
+            std::lock_guard<std::mutex> lock(FileMutexFor(path));
+            // batch95: ...then exclude other processes (a headless WebUI next to
+            // the normal launch) for the same load->mutate->publish window.
+            ConfigFileLock file_lock(path);
+            // batch107: without the cross-process lock the publish could
+            // replace another process's document; refuse instead.
+            if (!file_lock.locked()) {
+                error = "destination is locked by another process: " + path;
+                return false;
+            }
+            // batch110: the publish itself refuses unloadable documents, so
+            // every caller is covered even if it skipped ValidateConfig.
+            std::string ignored;
+            const auto validator = [&ignored](const std::string& temp) {
+                return Config::LoadFromFile(temp, ignored).has_value();
+            };
+            return AtomicWriteOutcome::kOk ==
+                   WriteFileAtomicDurable(path, ToJsonString(), error,
+                                          validator);
+        }
+
+        std::mutex& Config::FileMutex(const std::string& path) {
+            return FileMutexFor(path);
+        }
+
+        bool Config::SaveToFilePreservingBindings(const std::string& path,
+                                                  std::string& error) const {
+            std::lock_guard<std::mutex> lock(FileMutexFor(path));
+            ConfigFileLock file_lock(path);
+            if (!file_lock.locked()) {
+                // batch107: no mutual exclusion -> no publish.
+                error = "destination is locked by another process: " + path;
+                return false;
+            }
+            Config merged = *this;
+            std::string load_error;
+            const auto disk = Config::LoadFromFile(path, load_error);
+            if (disk) {
+                size_t dropped = 0;
+                for (const auto& binding : disk->dhcp.static_bindings) {
+                    const bool known = std::any_of(
+                        merged.dhcp.static_bindings.begin(),
+                        merged.dhcp.static_bindings.end(),
+                        [&binding](const StaticBinding& b) {
+                            return b.mac == binding.mac;
+                        });
+                    if (known) {
+                        continue;
+                    }
+                    if (merged.dhcp.static_bindings.size() >=
+                        limits::kMaxStaticBindings) {
+                        // batch116: a disk-only binding cannot be merged.
+                        // Publishing the snapshot anyway would erase it, so
+                        // count it and refuse the save below.
+                        ++dropped;
+                        continue;
+                    }
+                    merged.dhcp.static_bindings.push_back(binding);
+                }
+                for (const auto& binding :
+                     disk->ipv6.dhcpv6.static_bindings) {
+                    const bool known = std::any_of(
+                        merged.ipv6.dhcpv6.static_bindings.begin(),
+                        merged.ipv6.dhcpv6.static_bindings.end(),
+                        [&binding](const Dhcp6StaticBinding& b) {
+                            return b.duid == binding.duid;
+                        });
+                    if (known) {
+                        continue;
+                    }
+                    if (merged.ipv6.dhcpv6.static_bindings.size() >=
+                        limits::kMaxStaticBindings6) {
+                        ++dropped;
+                        continue;
+                    }
+                    merged.ipv6.dhcpv6.static_bindings.push_back(binding);
+                }
+                if (dropped > 0) {
+                    error = "settings not saved: " + std::to_string(dropped) +
+                            " binding(s) on disk do not fit the " +
+                            std::to_string(limits::kMaxStaticBindings) +
+                            "-entry cap; add them on the bindings page or "
+                            "remove entries there first";
+                    return false;
+                }
+            }
+            // batch109: the merged document must still load; see UpdateFile.
+            std::string ignored;
+            const auto validator = [&ignored](const std::string& temp) {
+                return Config::LoadFromFile(temp, ignored).has_value();
+            };
+            return AtomicWriteOutcome::kOk ==
+                   WriteFileAtomicDurable(path, merged.ToJsonString(), error,
+                                          validator);
+        }
+
+        bool Config::UpdateFile(const std::string& path,
+                                const std::function<void(Config&)>& mutate,
+                                std::string& error) {
+            std::lock_guard<std::mutex> lock(FileMutexFor(path));
+            ConfigFileLock file_lock(path);
+            if (!file_lock.locked()) {
+                // batch107: no mutual exclusion -> no publish (see SaveToFile).
+                error = "destination is locked by another process: " + path;
+                return false;
+            }
+            auto disk = Config::LoadFromFile(path, error);
+            if (!disk) {
+                return false;
+            }
+            mutate(*disk);
+            // batch109: never publish a document the loader refuses - one
+            // such write would make every later start reject the config
+            // wholesale ("brick"). Same validator the HTTP replace path uses.
+            std::string ignored;
+            const auto validator = [&ignored](const std::string& temp) {
+                return Config::LoadFromFile(temp, ignored).has_value();
+            };
+            return AtomicWriteOutcome::kOk ==
+                   WriteFileAtomicDurable(path, disk->ToJsonString(), error,
+                                          validator);
+        }
+
+        bool UpsertDhcpBinding(const std::string& path, const MacAddress& mac,
+                               uint32_t ip, const std::string& hostname,
+                               std::string& error) {
+            if (path.empty()) {
+                error = "persistence disabled (no config path)";
+                return false;
+            }
+            bool full = false;
+            const bool written = Config::UpdateFile(
+                path,
+                [&mac, ip, &hostname, &full](Config& disk) {
+                    auto& list = disk.dhcp.static_bindings;
+                    for (auto& b : list) {
+                        if (b.mac == mac) {
+                            b.ip = ip;
+                            b.hostname = hostname;
+                            return;
+                        }
+                    }
+                    if (list.size() >= limits::kMaxStaticBindings) {
+                        full = true;
+                        return;
+                    }
+                    StaticBinding added;
+                    added.mac = mac;
+                    added.ip = ip;
+                    added.hostname = hostname;
+                    list.push_back(std::move(added));
+                },
+                error);
+            if (written && full) {
+                error = "too many bindings";
+                return false;
+            }
+            return written;
+        }
+
+        bool DeleteDhcpBinding(const std::string& path, const MacAddress& mac,
+                               std::string& error) {
+            if (path.empty()) {
+                error = "persistence disabled (no config path)";
+                return false;
+            }
+            return Config::UpdateFile(
+                path,
+                [&mac](Config& disk) {
+                    auto& list = disk.dhcp.static_bindings;
+                    list.erase(std::remove_if(list.begin(), list.end(),
+                                              [&mac](const StaticBinding& b) {
+                                                  return b.mac == mac;
+                                              }),
+                               list.end());
+                },
+                error);
+        }
+
+        bool UpsertDhcp6Binding(const std::string& path,
+                                const std::vector<uint8_t>& duid,
+                                const std::array<uint8_t, 16>& ip,
+                                const std::string& hostname,
+                                std::string& error) {
+            if (path.empty()) {
+                error = "persistence disabled (no config path)";
+                return false;
+            }
+            bool full = false;
+            const bool written = Config::UpdateFile(
+                path,
+                [&duid, &ip, &hostname, &full](Config& disk) {
+                    auto& list = disk.ipv6.dhcpv6.static_bindings;
+                    for (auto& b : list) {
+                        if (b.duid == duid) {
+                            b.ip = ip;
+                            b.hostname = hostname;
+                            return;
+                        }
+                    }
+                    if (list.size() >= limits::kMaxStaticBindings6) {
+                        full = true;
+                        return;
+                    }
+                    Dhcp6StaticBinding added;
+                    added.duid = duid;
+                    added.ip = ip;
+                    added.hostname = hostname;
+                    list.push_back(std::move(added));
+                },
+                error);
+            if (written && full) {
+                error = "too many bindings";
+                return false;
+            }
+            return written;
+        }
+
+        bool DeleteDhcp6Binding(const std::string& path,
+                                const std::vector<uint8_t>& duid,
+                                std::string& error) {
+            if (path.empty()) {
+                error = "persistence disabled (no config path)";
+                return false;
+            }
+            return Config::UpdateFile(
+                path,
+                [&duid](Config& disk) {
+                    auto& list = disk.ipv6.dhcpv6.static_bindings;
+                    list.erase(std::remove_if(
+                                   list.begin(), list.end(),
+                                   [&duid](const Dhcp6StaticBinding& b) {
+                                       return b.duid == duid;
+                                   }),
+                               list.end());
+                },
+                error);
+        }
+
+        ConfigFileLock::ConfigFileLock(const std::string& path, bool blocking) {
+#ifdef _WIN32
+            if (path.empty()) {
+                return;
+            }
+            const std::wstring name = ConfigLockNameWithOverride(path);
+            if (name.empty()) {
+                return;
+            }
+            HANDLE handle = ::CreateMutexW(nullptr, FALSE, name.c_str());
+            if (nullptr == handle) {
+                return;
+            }
+            const DWORD wait = ::WaitForSingleObject(
+                handle, blocking ? static_cast<DWORD>(g_lock_wait_ms.load(
+                                       std::memory_order_relaxed))
+                                 : 0UL);
+            if (WAIT_OBJECT_0 == wait || WAIT_ABANDONED == wait) {
+                handle_ = handle;
+                locked_ = true;
+                return;
+            }
+            ::CloseHandle(handle);
+#else
+            (void)path;
+            (void)blocking;
+#endif
+        }
+
+        ConfigFileLock::~ConfigFileLock() {
+#ifdef _WIN32
+            if (nullptr != handle_) {
+                HANDLE handle = static_cast<HANDLE>(handle_);
+                if (locked_) {
+                    ::ReleaseMutex(handle);
+                }
+                ::CloseHandle(handle);
+            }
 #endif
         }
 
@@ -2272,6 +2854,15 @@ namespace vgww {
                 }
             }
             return out;
+        }
+
+        bool ParseIpv6(const std::string& text,
+                       std::array<uint8_t, 16>& out) {
+            if (std::string::npos != text.find('/')) {
+                return false;  // a prefix length is not an address
+            }
+            int prefix_len = -1;
+            return ParseIpv6Address(text, out, prefix_len) && -1 == prefix_len;
         }
 
     }  // namespace core

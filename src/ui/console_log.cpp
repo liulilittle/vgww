@@ -3,6 +3,7 @@
 // ============================================================================
 #include "ui/console_log.h"
 
+#include "core/handler_guard.h"
 #include "ui/pages/page_util.h"  // batch31 P0-1: the ONE UTF-8 Widen
 
 #include <windows.h>
@@ -35,6 +36,8 @@ namespace vgww {
                 std::mutex g_line_mutex;
                 std::deque<std::wstring> g_lines;
                 std::uint64_t g_revision = 0;
+                /// batch126: see DroppedLineCount().
+                std::uint64_t g_dropped = 0;
 
                 std::mutex g_install_mutex;
                 bool g_installed = false;
@@ -161,6 +164,7 @@ namespace vgww {
                     g_lines.push_back(std::move(line));
                     while (g_lines.size() > kMaxLines) {
                         g_lines.pop_front();
+                        ++g_dropped;
                     }
                     ++g_revision;
                 }
@@ -171,6 +175,42 @@ namespace vgww {
                     }
                     DWORD written = 0;
                     ::WriteFile(handle, bytes, count, &written, nullptr);
+                }
+
+                /// Capture chunks whose fold path threw and was swallowed
+                /// (telemetry/tests). The reader thread is a std::thread body
+                /// and ReaderRun is noexcept: an escaping throw would call
+                /// std::terminate and take the whole app down.
+                std::atomic<uint64_t> g_reader_errors{0};
+                /// Test seam: runs at the top of every folded chunk.
+                std::function<void()> g_reader_probe;
+
+                /// Folds one captured chunk into the ring (tee included).
+                /// Firewalled: a throw costs this chunk, never the process.
+                void ConsumeCapturedChunk(const char* data, size_t len,
+                                          HANDLE tee,
+                                          std::string& pending) noexcept {
+                    ::vgww::core::InvokeHandlerGuarded(g_reader_errors, [&] {
+                        if (g_reader_probe) {
+                            g_reader_probe();
+                        }
+                        Tee(tee, data, static_cast<DWORD>(len));
+                        pending.append(data, len);
+                        std::size_t newline = 0;
+                        while ((newline = pending.find('\n')) !=
+                               std::string::npos) {
+                            std::string line = pending.substr(0, newline);
+                            pending.erase(0, newline + 1);
+                            if (!line.empty() && line.back() == '\r') {
+                                line.pop_back();
+                            }
+                            AppendLine(line);
+                        }
+                        if (pending.size() > kMaxPendingBytes) {
+                            AppendLine(pending);
+                            pending.clear();
+                        }
+                    });
                 }
 
                 void ReaderRun(HANDLE read_h, HANDLE tee) noexcept {
@@ -189,28 +229,15 @@ namespace vgww {
                         // B F2: teeing to both console handles duplicated
                         // every line); a nil handle (GUI double-click) is a
                         // no-op.
-                        Tee(tee, buffer, got);
-                        pending.append(buffer, got);
-                        std::size_t newline = 0;
-                        while ((newline = pending.find('\n')) !=
-                               std::string::npos) {
-                            std::string line = pending.substr(0, newline);
-                            pending.erase(0, newline + 1);
-                            if (!line.empty() && line.back() == '\r') {
-                                line.pop_back();
-                            }
-                            AppendLine(line);
-                        }
-                        if (pending.size() > kMaxPendingBytes) {
-                            AppendLine(pending);
-                            pending.clear();
-                        }
+                        ConsumeCapturedChunk(buffer, got, tee, pending);
                     }
                     if (!pending.empty()) {
-                        if (pending.back() == '\r') {
-                            pending.pop_back();
-                        }
-                        AppendLine(pending);
+                        ::vgww::core::InvokeHandlerGuarded(g_reader_errors, [&] {
+                            if (pending.back() == '\r') {
+                                pending.pop_back();
+                            }
+                            AppendLine(pending);
+                        });
                     }
                 }
 
@@ -358,6 +385,11 @@ namespace vgww {
                 return g_revision;
             }
 
+            std::uint64_t DroppedLineCount() noexcept {
+                std::lock_guard<std::mutex> lock(g_line_mutex);
+                return g_dropped;
+            }
+
             std::vector<std::wstring> Snapshot() {
                 std::lock_guard<std::mutex> lock(g_line_mutex);
                 return std::vector<std::wstring>(g_lines.begin(),
@@ -382,6 +414,21 @@ namespace vgww {
                 }
             }
 
+            void HandleCapturedChunkForTest(const std::string& chunk) {
+                static thread_local std::string scratch;
+                ConsumeCapturedChunk(chunk.data(), chunk.size(), nullptr,
+                                     scratch);
+                scratch.clear();
+            }
+
+            void SetReaderProbeForTest(std::function<void()> probe) {
+                g_reader_probe = std::move(probe);
+            }
+
+            std::uint64_t ReaderErrorCountForTest() noexcept {
+                return g_reader_errors.load(std::memory_order_relaxed);
+            }
+
             void AppendAuditLine(const std::string& utf8) {
                 // batch22 B4: privileged operations are recorded in the same
                 // ring used by the native console / web console page / disk log.
@@ -391,6 +438,7 @@ namespace vgww {
             void ClearForTest() noexcept {
                 std::lock_guard<std::mutex> lock(g_line_mutex);
                 g_lines.clear();
+                g_dropped = 0;
                 ++g_revision;
             }
 

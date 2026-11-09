@@ -4,6 +4,7 @@
 // ============================================================================
 #include "ui/window.h"
 
+#include "core/handler_guard.h"
 #include "ui/controls.h"
 #include "ui/console_log.h"
 #include "ui/i18n.h"
@@ -876,10 +877,13 @@ namespace vgww {
             // Threading (T6 review M2): the UI shell owns no secondary thread.
             // RunMessageLoop - and every WndProc/timer/tray callback it
             // dispatches - runs on the calling thread (the process main thread
-            // in the app entry point), so there is no thread entry point here
-            // that needs a try/catch. The only background threads in the app
-            // are the T4/T5 snapshot publisher and command worker, which
-            // already contain their own exceptions (T4-F1 M4).
+            // in the app entry point). There is no thread entry point that
+            // needs a try/catch, but WndProc IS an OS-facing callback
+            // (user32 calls it through DispatchMessageW): RunGuardedWndProc
+            // firewalls the body so a throw never unwinds through user32. The
+            // only background threads in the app are the T4/T5 snapshot
+            // publisher and command worker, which already contain their own
+            // exceptions (T4-F1 M4).
             if (nullptr == hwnd_) {
                 return;
             }
@@ -3934,7 +3938,28 @@ namespace vgww {
             if (nullptr == self->hwnd_) {
                 self->hwnd_ = hwnd;  // valid during CreateWindowExW messages
             }
-            return self->WndProc(hwnd, message, wparam, lparam);
+            return self->RunGuardedWndProc(hwnd, message, wparam, lparam);
+        }
+
+        LRESULT VgwwWindow::RunGuardedWndProc(HWND hwnd, UINT message,
+                                              WPARAM wparam,
+                                              LPARAM lparam) noexcept {
+            LRESULT result = 0;
+            const bool body_ok = core::InvokeHandlerGuarded(
+                handler_errors_, [&] {
+                    result = WndProc(hwnd, message, wparam, lparam);
+                });
+            if (!body_ok) {
+                // The message body failed (an allocation in a page handler,
+                // a throwing callback): let the default procedure answer it
+                // rather than unwinding through user32's dispatch frame.
+                return ::DefWindowProcW(hwnd, message, wparam, lparam);
+            }
+            return result;
+        }
+
+        LRESULT VgwwWindow::RunSnapshotTimerTickForTest() {
+            return RunGuardedWndProc(hwnd_, WM_TIMER, kSnapshotTimerId, 0);
         }
 
     }  // namespace ui

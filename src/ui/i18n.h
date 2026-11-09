@@ -125,6 +125,23 @@ namespace vgww {
             /// batch33z: the two DHCPv4 faults that used to be stderr-only.
             LeasesPoolExhausted,
             LeasesPersistFailed,
+            /// batch115: the rule document could not be written; changes are
+            /// in memory only and will be lost on restart.
+            RulesPersistFailed,
+            /// batch118: entries in the rule document were invalid and were
+            /// skipped at load; they never took effect.
+            RulesDiscarded,
+            /// batch119: persisted lease entries were dropped at load
+            /// (malformed, expired, outside the LAN, reserved or duplicated).
+            LeasesDropped,
+            /// batch120: the lease document itself was corrupt and preserved
+            /// aside; the persisted mappings did not survive.
+            LeasesCorrupt,
+            /// batch121: DHCP frames refused by strict parse validation
+            /// (malformed clients on the LAN).
+            LeasesParseRejected,
+            /// batch126: console-ring lines were evicted by the bound.
+            ConsoleDropped,
             /// batch34f: a port-map rule whose WAN port could not be bound.
             PortmapPortBusy,
             /// batch34f: forwarding is live; summary line.

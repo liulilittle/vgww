@@ -228,6 +228,149 @@ namespace {
         vgww::web::RuleStore::Instance().Clear();
     }
 
+    /// The RE-ARM half: the next async_accept allocates a socket + operation.
+    /// An allocation failure there used to escape the completion handler and
+    /// be misattributed as an "escaped handler"; the rule went deaf at that
+    /// point. With the firewall it is counted as a re-arm error and the
+    /// connection already dialed is unaffected.
+    void TestAcceptRearmThrowKeepsTheManagerAlive() {
+        xtcp::buf::InitPools();
+
+        NullBackend backend;
+        xtcp::XtcpStack stack(&backend);
+        stack.SetMaxConnections(16);
+
+        vgww::core::Config config;
+        config.gateway.ipv4 = kGatewayIp;
+        config.gateway.mask = (0u) | (0u << 8) | (255u << 16) | (255u << 24);
+        config.gateway.mac = {0x30, 0xFC, 0x68, 0x88, 0xB4, 0xA9};
+
+        auto& manager = vgww::relay::PortMapManager::Instance();
+        manager.Stop();
+        vgww::web::RuleStore::Instance().Clear();
+        const uint16_t wan_port = ProbeFreePort();
+        CHECK(0 != wan_port);
+        vgww::web::RuleStore::Instance().AddPortMap(
+            {"tcp", wan_port, "127.0.0.1", 45678});
+
+        const auto send_to_lan = [](uint64_t, const uint8_t*, uint32_t) {
+            return true;
+        };
+        const auto teardown = [](uint64_t, bool) {};
+
+        manager.Start(&stack, config, send_to_lan, teardown);
+        CHECK(WaitFor([&] { return manager.LiveAcceptLoops() >= 1; }, 3000));
+
+        const uint64_t accepted_before = manager.GetStats().accepted.load();
+        CHECK(WaitFor(
+            [&] {
+                TryConnect(wan_port);
+                return manager.GetStats().accepted.load() >=
+                       accepted_before + 1;
+            },
+            8000));
+
+        auto threw = std::make_shared<std::atomic<int>>(0);
+        manager.SetAcceptRearmProbeForTest([threw] {
+            if (0 == threw->fetch_add(1)) {
+                throw std::runtime_error("re-arm exploded");
+            }
+        });
+        const uint64_t rearm_before = manager.GetStats().rearm_errors.load();
+        const uint64_t accepted_mid = manager.GetStats().accepted.load();
+        CHECK(WaitFor(
+            [&] {
+                TryConnect(wan_port);
+                return manager.GetStats().accepted.load() >= accepted_mid + 1;
+            },
+            8000));
+        CHECK(WaitFor(
+            [&] {
+                return manager.GetStats().rearm_errors.load() >=
+                       rearm_before + 1;
+            },
+            3000));
+        CHECK(0 == manager.GetStats().escaped_handler_errors.load());
+        std::printf("b-rearm portmap: rearm=%llu accepted=%llu\n",
+                    static_cast<unsigned long long>(
+                        manager.GetStats().rearm_errors.load()),
+                    static_cast<unsigned long long>(
+                        manager.GetStats().accepted.load()));
+
+        manager.SetAcceptRearmProbeForTest(nullptr);
+        manager.Stop();
+        vgww::web::RuleStore::Instance().Clear();
+    }
+
+    /// A throwing RunLoop ITERATION must cost that iteration, not the manager
+    /// thread: the thread body is a std::thread entry, so an escape calls
+    /// std::terminate and takes the whole process down. The next pass must
+    /// retry the work (here: build the acceptors) and keep forwarding.
+    void TestRunLoopThrowKeepsTheManagerAlive() {
+        xtcp::buf::InitPools();
+
+        NullBackend backend;
+        xtcp::XtcpStack stack(&backend);
+        stack.SetMaxConnections(16);
+
+        vgww::core::Config config;
+        config.gateway.ipv4 = kGatewayIp;
+        config.gateway.mask = (0u) | (0u << 8) | (255u << 16) | (255u << 24);
+        config.gateway.mac = {0x30, 0xFC, 0x68, 0x88, 0xB4, 0xA9};
+
+        auto& manager = vgww::relay::PortMapManager::Instance();
+        manager.Stop();
+        vgww::web::RuleStore::Instance().Clear();
+        const uint16_t wan_port = ProbeFreePort();
+        CHECK(0 != wan_port);
+        vgww::web::RuleStore::Instance().AddPortMap(
+            {"tcp", wan_port, "127.0.0.1", 45678});
+
+        const auto send_to_lan = [](uint64_t, const uint8_t*, uint32_t) {
+            return true;
+        };
+        const auto teardown = [](uint64_t, bool) {};
+
+        auto threw = std::make_shared<std::atomic<int>>(0);
+        manager.SetLoopProbeForTest([threw] {
+            if (0 == threw->fetch_add(1)) {
+                throw std::runtime_error("loop body exploded");
+            }
+        });
+        const uint64_t loops_before = manager.GetStats().loop_errors.load();
+        manager.Start(&stack, config, send_to_lan, teardown);
+
+        // The throw happens BEFORE the first ApplyRules, so only a surviving
+        // thread reaches the next pass and builds the acceptor.
+        CHECK(WaitFor(
+            [&] {
+                return manager.GetStats().loop_errors.load() >=
+                       loops_before + 1;
+            },
+            3000));
+        CHECK(WaitFor(
+            [&] { return manager.LiveAcceptLoops() >= 1; }, 3000));
+
+        // And it still forwards: a real WAN connection is accepted + dialed.
+        const uint64_t accepted_before = manager.GetStats().accepted.load();
+        CHECK(WaitFor(
+            [&] {
+                TryConnect(wan_port);
+                return manager.GetStats().accepted.load() >=
+                       accepted_before + 1;
+            },
+            8000));
+        std::printf("B-loop guard: loop_errors=%llu accepted=%llu\n",
+                    static_cast<unsigned long long>(
+                        manager.GetStats().loop_errors.load()),
+                    static_cast<unsigned long long>(
+                        manager.GetStats().accepted.load()));
+
+        manager.SetLoopProbeForTest(nullptr);
+        manager.Stop();
+        vgww::web::RuleStore::Instance().Clear();
+    }
+
     /// C6: OnStackData must report the truth - a packet that was actually
     /// queued returns true, and only a packet refused by the hard cap is
     /// dropped+counted. The old enqueue-then-test report made the 64th packet
@@ -739,6 +882,8 @@ int main() {
     TestWanReadBackpressure();
     TestB83UdpRuleNeverBindsTcpAcceptor();
     TestAcceptHandlerThrowKeepsTheRuleAlive();
+    TestAcceptRearmThrowKeepsTheManagerAlive();
+    TestRunLoopThrowKeepsTheManagerAlive();
     TestB86MalformedLanIpIsRefusedNotZeroDialed();
     TestB312ApplyRulesIsChangeDriven();   // last: it fails one bind on purpose
 

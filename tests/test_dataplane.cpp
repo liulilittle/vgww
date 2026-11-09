@@ -40,6 +40,7 @@
 #include <cstring>
 #include <mutex>
 #include <set>
+#include <stdexcept>
 #include <thread>
 
 #ifndef _WIN32
@@ -2594,6 +2595,48 @@ int main() {
     raw->InjectNow(BuildSynTo({127, 0, 0, 1}, 51004, dead_port));
     CHECK(WaitFor(
         [&] { return ContainsRst(raw->SentDown(), dead_port); }, 5000));
+
+    // A THROWING dial completion must cost only that connection. Before the
+    // guard, the exception unwound the worker thread, RunGuarded counted it
+    // and flipped `running` - the WHOLE data plane stopped. Now the throw is
+    // swallowed and counted, the client still gets its RST, and the worker
+    // keeps serving new flows.
+    uint16_t dead_port2 = 0;
+    {
+        asio::io_context io;
+        asio::ip::tcp::acceptor probe(io);
+        std::error_code ec;
+        probe.open(asio::ip::tcp::v4(), ec);
+        probe.bind(asio::ip::tcp::endpoint(asio::ip::address_v4::loopback(), 0),
+                   ec);
+        if (!ec) {
+            dead_port2 = probe.local_endpoint().port();
+        }
+        probe.close(ec);
+    }
+    CHECK(0 != dead_port2);
+    {
+        std::atomic<int> threw{0};
+        dataplane.SetDialCompletionProbeForTest([&threw] {
+            if (0 == threw.fetch_add(1)) {
+                throw std::runtime_error("dial body exploded");
+            }
+        });
+        const uint64_t handler_errors_before =
+            dataplane.GetStats().handler_errors.load();
+        raw->InjectNow(BuildSynTo({127, 0, 0, 1}, 51007, dead_port2));
+        CHECK(WaitFor(
+            [&] { return ContainsRst(raw->SentDown(), dead_port2); }, 5000));
+        CHECK(1 == threw.load());
+        CHECK(dataplane.GetStats().handler_errors.load() ==
+              handler_errors_before + 1);
+        // The worker survived: a later flow still completes its handshake.
+        raw->InjectNow(BuildSynTo({127, 0, 0, 1}, 51008, 45678));
+        CHECK(WaitFor(
+            [&] { return 0 != FindServerIsn(raw->SentDown(), 51008, 45678); },
+            5000));
+        dataplane.SetDialCompletionProbeForTest(nullptr);
+    }
 
     // ----- scripted conversation through the relay ---------------------
     const uint32_t server_isn =

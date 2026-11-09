@@ -584,6 +584,18 @@ namespace vgww {
             return persist_failures_.load(std::memory_order_relaxed);
         }
 
+        uint64_t DhcpServer::DroppedLeaseCount() const noexcept {
+            return dropped_leases_.load(std::memory_order_relaxed);
+        }
+
+        bool DhcpServer::LeaseFileCorrupt() const noexcept {
+            return lease_file_corrupt_.load(std::memory_order_relaxed);
+        }
+
+        bool DhcpServer::PersistBlocked() const noexcept {
+            return persist_blocked_.load(std::memory_order_relaxed);
+        }
+
         bool DhcpServer::AllowFrame(const net::WireMac& client_mac,
                                     std::chrono::steady_clock::time_point now) {
             std::lock_guard<std::mutex> lock(mutex_);
@@ -983,7 +995,48 @@ namespace vgww {
 
         bool DhcpServer::DumpLeases(
             const std::string& path,
-            std::chrono::steady_clock::time_point now) const {
+            std::chrono::steady_clock::time_point now) {
+            // batch85: never overwrite a file this server could not read (it
+            // may be a perfectly valid snapshot that was briefly locked).
+            // batch87: retry the read first; once it succeeds the disk leases
+            // are merged (LoadLeases keeps live leases and drops disk entries
+            // whose address is already taken) and the block clears, so the
+            // operator does not need a restart.
+            if (persist_blocked_.load(std::memory_order_relaxed)) {
+                // batch87: retry the read first. Live leases are snapshotted so
+                // a DISK entry that names an address a live client already
+                // holds can be dropped after the merge: one address, one owner
+                // (batch134), even across the blocked-start recovery.
+                std::unordered_map<net::WireMac, Lease, net::WireMacHash> live;
+                {
+                    std::lock_guard<std::mutex> lock(
+                        const_cast<std::mutex&>(mutex_));
+                    live = leases_;
+                }
+                size_t dropped = 0;
+                const LoadOutcome outcome = LoadLeases(path, now, &dropped);
+                if (LoadOutcome::kUnreadable == outcome) {
+                    ++persist_failures_;
+                    return false;
+                }
+                persist_blocked_.store(false, std::memory_order_relaxed);
+                {
+                    std::lock_guard<std::mutex> lock(
+                        const_cast<std::mutex&>(mutex_));
+                    std::unordered_set<uint32_t> live_ips;
+                    for (const auto& kv : live) {
+                        live_ips.insert(kv.second.ip);
+                    }
+                    for (auto it = leases_.begin(); it != leases_.end();) {
+                        if (0 == live.count(it->first) &&
+                            live_ips.end() != live_ips.find(it->second.ip)) {
+                            it = leases_.erase(it);
+                        } else {
+                            ++it;
+                        }
+                    }
+                }
+            }
             // batch81: the lock covers ONLY the snapshot copy (same defect as
             // Dhcp6Server::DumpLeases - measured 86-484 ms of blocked renews
             // while the dump ran, versus a sub-millisecond baseline). Doing the
@@ -1054,83 +1107,21 @@ namespace vgww {
             json << "]}";
             // Atomic replace: a plain truncating write leaves a torn file
             // if the process dies mid-dump, and LoadLeases would then drop
-            // every lease that survives was recoverable. Write to a sibling
-            // temp then rename over the target (same filesystem, atomic).
-            // F4: every failure path below must be observable (counted and
-            // logged) instead of a silent `return false`.
-            const auto fail = [this](const char* what, unsigned long code) {
+            // every lease that was recoverable. batch82: the temp+flush+
+            // publish discipline is the SAME one the config, rules and (now)
+            // the v6 lease writer use - one implementation, so a device flush
+            // that fails is a failure in every writer instead of being
+            // silently ignored here (S2) and there (C6/C9). Every failure
+            // path is observable (counted and logged).
+            const std::string data = json.str();
+            std::string write_error;
+            if (core::AtomicWriteOutcome::kOk !=
+                core::WriteFileAtomicDurable(path, data, write_error)) {
                 ++persist_failures_;
                 std::fprintf(stderr,
-                             "[vgww] dhcp: lease dump failed: %s (code=%lu)\n",
-                             what, code);
+                             "[vgww] dhcp: lease dump failed: %s\n",
+                             write_error.c_str());
                 return false;
-            };
-            const std::string tmp = path + ".tmp";
-            std::string data = json.str();
-
-#ifdef _WIN32
-            {
-                std::wstring wtmp = ToWideLongPath(tmp);
-                std::wstring wpath = ToWideLongPath(path);
-
-                if (!wtmp.empty() && !wpath.empty())
-                {
-                    FILE* f = nullptr;
-
-                    if (0 == ::_wfopen_s(&f, wtmp.c_str(), L"wb") && nullptr != f)
-                    {
-                        const size_t written =
-                            ::fwrite(data.data(), 1, data.size(), f);
-                        const bool flushed = 0 == ::fflush(f);
-                        // F4: fflush only drains the CRT buffer; the data
-                        // must reach the device before the rename makes the
-                        // name visible.
-                        const HANDLE handle = reinterpret_cast<HANDLE>(
-                            ::_get_osfhandle(::_fileno(f)));
-                        const bool synced =
-                            (INVALID_HANDLE_VALUE != handle) &&
-                            (0 != ::FlushFileBuffers(handle));
-                        const int close_ok = ::fclose(f);
-
-                        if (written == data.size() && flushed && synced &&
-                            0 == close_ok)
-                        {
-                            if (::MoveFileExW(wtmp.c_str(), wpath.c_str(), MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH))
-                            {
-                                return true;
-                            }
-                            ::DeleteFileW(wtmp.c_str());
-                            return fail("atomic replace failed",
-                                        static_cast<unsigned long>(
-                                            ::GetLastError()));
-                        }
-
-                        ::DeleteFileW(wtmp.c_str());
-                        return fail("short write, flush or close error",
-                                    static_cast<unsigned long>(errno));
-                    }
-                }
-            }
-#endif
-            std::ofstream file(tmp);
-            if (!file) {
-                return fail("cannot open temp file",
-                            static_cast<unsigned long>(errno));
-            }
-            file << data;
-            file.flush();
-            file.close();
-            if (!file) {  // flush/close error: keep old file
-                return fail("short write, flush or close error",
-                            static_cast<unsigned long>(errno));
-            }
-            std::error_code ec;
-            std::filesystem::rename(tmp, path, ec);
-            if (ec) {
-                std::error_code ignore;
-                std::filesystem::remove(tmp, ignore);
-                return fail("atomic replace failed",
-                            static_cast<unsigned long>(ec.value()));
             }
             return true;
         }
@@ -1152,6 +1143,16 @@ namespace vgww {
             size_t dropped = 0;
             nlohmann::json parsed;
 
+            // batch82: a file the loader cannot read is preserved as
+            // `<path>.corrupt` instead of being silently overwritten by the
+            // next dump. Otherwise a torn/garbage file destroyed every future
+            // restart's mappings AND erased the only evidence of the loss.
+            const auto corrupt = [&path, this]() {
+                core::SetAsideFile(path, ".corrupt");
+                lease_file_corrupt_.store(true, std::memory_order_relaxed);
+                return LoadOutcome::kCorrupt;
+            };
+
 #ifdef _WIN32
             {
                 std::wstring wpath = ToWideLongPath(path);
@@ -1159,17 +1160,90 @@ namespace vgww {
                 if (!wpath.empty())
                 {
                     FILE* f = nullptr;
+                    // batch85: a scanner/indexer can hold the lease file for a
+                    // few milliseconds. Opening it is idempotent, so retry a
+                    // bounded number of times; if it still will not open, the
+                    // document is NOT corrupt (it was never read) and must not
+                    // be overwritten by the next snapshot.
+                    bool open_file_exists = true;
+                    bool open_simulated = false;
+                    unsigned long open_error = 0;
+                    constexpr int kOpenAttempts = 3;
 
-                    if (0 == ::_wfopen_s(&f, wpath.c_str(), L"rb") && nullptr != f)
+                    for (int attempt = 0;; ++attempt)
+                    {
+                        const unsigned long simulated =
+                            core::SimulatedOpenFailure(path);
+                        const DWORD attrs = ::GetFileAttributesW(wpath.c_str());
+                        open_file_exists = (INVALID_FILE_ATTRIBUTES != attrs);
+
+                        if (0 == simulated)
+                        {
+                            if (0 == ::_wfopen_s(&f, wpath.c_str(), L"rb") &&
+                                nullptr != f)
+                            {
+                                break;
+                            }
+                            open_simulated = false;
+                            open_error = static_cast<unsigned long>(
+                                ::GetLastError());
+                        }
+                        else
+                        {
+                            open_simulated = true;
+                            open_error = simulated;
+                        }
+
+                        if (!open_file_exists || attempt + 1 >= kOpenAttempts)
+                        {
+                            break;
+                        }
+                        ::Sleep(static_cast<DWORD>(attempt + 1));
+                    }
+
+                    if (nullptr == f &&
+                        (open_file_exists || open_simulated))
+                    {
+                        if (open_file_exists && !open_simulated)
+                        {
+                            // A directory can never become readable; that is
+                            // a misconfiguration, not a transient lock.
+                            const DWORD attrs =
+                                ::GetFileAttributesW(wpath.c_str());
+                            if (INVALID_FILE_ATTRIBUTES != attrs &&
+                                0 != (attrs & FILE_ATTRIBUTE_DIRECTORY))
+                            {
+                                return corrupt();
+                            }
+                        }
+                        persist_blocked_.store(true,
+                                               std::memory_order_relaxed);
+                        std::fprintf(stderr,
+                                     "[vgww] dhcp: lease file not readable (%s, "
+                                     "error %lu); persistence paused so the file "
+                                     "is not overwritten\n",
+                                     path.c_str(), open_error);
+                        return LoadOutcome::kUnreadable;
+                    }
+
+                    if (nullptr != f)
                     {
                         ::fseek(f, 0, SEEK_END);
                         long sz = ::ftell(f);
                         ::fseek(f, 0, SEEK_SET);
                         constexpr long kLeaseCap = static_cast<long>(::vgww::core::limits::kMaxLeasesBytes);
+                        // batch82: ftell == -1 is an I/O failure, not an empty
+                        // file; treating it as empty reported "leases restored"
+                        // while discarding everything the file held.
+                        if (sz < 0)
+                        {
+                            ::fclose(f);
+                            return corrupt();
+                        }
                         if (sz > kLeaseCap)
                         {
                             ::fclose(f);
-                            return LoadOutcome::kCorrupt;
+                            return corrupt();
                         }
                         std::string raw;
 
@@ -1195,7 +1269,7 @@ namespace vgww {
                         }
                         catch (...)
                         {
-                            return LoadOutcome::kCorrupt;
+                            return corrupt();
                         }
 
                         goto parsed_ok;
@@ -1208,12 +1282,13 @@ namespace vgww {
                 if (!file) return LoadOutcome::kNoFile;
                 auto sz2 = file.tellg();
                 constexpr std::streamoff kLeaseCap2 = static_cast<std::streamoff>(::vgww::core::limits::kMaxLeasesBytes);
-                if (sz2 > kLeaseCap2) return LoadOutcome::kCorrupt;
+                if (sz2 < 0) return corrupt();
+                if (sz2 > kLeaseCap2) return corrupt();
                 file.seekg(0, std::ios::beg);
                 try {
                     file >> parsed;
                 } catch (...) {
-                    return LoadOutcome::kCorrupt;
+                    return corrupt();
                 }
             }
 #ifdef _WIN32
@@ -1226,13 +1301,13 @@ namespace vgww {
                 const auto ver = parsed.find("version");
                 if (ver == parsed.end() || !ver->is_number_integer() ||
                     ver->get<int>() != 1) {
-                    return LoadOutcome::kCorrupt;  // schema may have changed: don't misparse
+                    return corrupt();  // schema may have changed: don't misparse
                 }
                 const auto it = parsed.find("leases");
-                if (it == parsed.end() || !it->is_array()) return LoadOutcome::kCorrupt;
+                if (it == parsed.end() || !it->is_array()) return corrupt();
                 parsed = *it;
             }
-            if (!parsed.is_array()) return LoadOutcome::kCorrupt;
+            if (!parsed.is_array()) return corrupt();
             std::lock_guard<std::mutex> lock(mutex_);
             // batch134: one address, one owner. Every other entry point already
             // enforces this (UpsertBinding checks config bindings, runtime
@@ -1329,6 +1404,8 @@ namespace vgww {
             if (dropped_out != nullptr) {
                 *dropped_out = dropped;
             }
+            dropped_leases_.fetch_add(static_cast<uint64_t>(dropped),
+                                      std::memory_order_relaxed);
             return LoadOutcome::kRestored;
         }
 

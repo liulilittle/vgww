@@ -8,6 +8,7 @@
 // the full 2000-line ring.
 // ============================================================================
 #include "ui/pages/page.h"
+#include "ui/pages/page_util.h"
 
 #include "ui/console_log.h"
 #include "ui/renderer.h"
@@ -843,14 +844,18 @@ namespace vgww {
             private:
                 ConsoleLogView* view_ = nullptr;
                 Button* copy_ = nullptr;
+                Element* host_ = nullptr;
                 /// batch116: the console was the only data page with no
                 /// empty placeholder, so an empty ring rendered as a blank card
                 /// indistinguishable from a broken view.
                 EmptyState* empty_ = nullptr;
+                /// batch126: evicted ring lines (possibly audit records).
+                Text* dropped_hint_ = nullptr;
                 std::uint64_t last_rev_ = 0;
             };
 
             void ConsolePage::Build(Element& host, PageContext& ctx) {
+                host_ = &host;
                 // batch20 item 7: the captured output could not be copied at all;
                 // a Copy button puts the whole ring on the clipboard.
                 auto bar = std::make_unique<StackPanel>(Orientation::Horizontal,
@@ -881,6 +886,12 @@ namespace vgww {
                     }
                 };
                 host.Add(std::move(bar));
+                auto dropped = std::make_unique<Text>(
+                    I18n::Instance().T(Str::ConsoleDropped), FontToken::Small,
+                    ColorToken::Warning, true);
+                dropped->id = "console.dropped_hint";
+                dropped->visible = false;
+                dropped_hint_ = static_cast<Text*>(host.Add(std::move(dropped)));
                 auto card = std::make_unique<Card>(
                     Padding{14.0f, 10.0f, 14.0f, 10.0f}, 8.0f);
                 card->id = "console.panel";
@@ -895,9 +906,18 @@ namespace vgww {
             }
 
             void ConsolePage::Update(const UiSnapshot& snapshot, I18n& i18n) {
-                (void)snapshot;
                 if (copy_ != nullptr) {
                     copy_->SetLabel(i18n.T(Str::ConsoleCopy));
+                }
+                if (dropped_hint_ != nullptr) {
+                    const bool dropped = snapshot.console_dropped > 0;
+                    if (dropped_hint_->visible != dropped) {
+                        dropped_hint_->visible = dropped;
+                        RelayoutHost(*host_);
+                    }
+                    if (dropped) {
+                        dropped_hint_->SetText(i18n.T(Str::ConsoleDropped));
+                    }
                 }
                 if (view_ == nullptr) {
                     return;

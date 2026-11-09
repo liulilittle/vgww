@@ -15,6 +15,7 @@
 #include "proto/ndp.h"
 #include "proto/udp.h"
 
+#include <atomic>
 #include <cstdio>
 #include <cstring>
 #include <filesystem>
@@ -995,8 +996,40 @@ namespace {
         CHECK(1 == on_1000);
         CHECK("first" == owner_1000);
         CHECK(1 == dropped);
+        CHECK(1 == server.DroppedLeaseCount());  // batch119: surfaced, not silent
 
         std::remove(path.c_str());
+    }
+
+    // batch122: DHCPv6 parse refusals are counted like the v4 sibling.
+    void TestB122ParseRejects6AreCounted() {
+        Dhcp6View view{};
+        std::vector<uint8_t> garbage(32, 0);
+        const uint64_t before = ParseRejected6Count();
+        CHECK(!ParseDhcp6Frame(garbage.data(), garbage.size(), view));
+        CHECK(before + 1 == ParseRejected6Count());
+    }
+
+    // batch120: v6 sibling of TestB120LeaseFileCorruptIsFlagged.
+    void TestB120Leases6FileCorruptIsFlagged() {
+        Config config = MakeConfig();
+        Dhcp6Server server(config);
+        const std::string path = "test_dhcp6_leases_b120.json";
+        {
+            std::ofstream out(path);
+            out << "{\"version\":99}";
+        }
+        size_t dropped = 0;
+        CHECK(server.LoadLeases(path, std::chrono::steady_clock::now(),
+                                &dropped) ==
+              Dhcp6Server::LoadOutcome::kCorrupt);
+        CHECK(server.LeaseFileCorrupt());
+        {
+            std::ifstream aside(path + ".corrupt");
+            CHECK(aside.good());
+        }
+        std::remove(path.c_str());
+        std::remove((path + ".corrupt").c_str());
     }
 
     void TestLeases6LoadSkipsIllegal() {
@@ -1148,6 +1181,178 @@ namespace {
                                Dhcp6Server::OfferStage::kAck) == a);
         CHECK(restored.Acquire(kOtherDuid, 2, t0,
                                Dhcp6Server::OfferStage::kAck) == b);
+        std::remove(path.c_str());
+    }
+
+    // --- 13b. batch82: shared durable writer + corrupt-file preservation ---
+
+    void TestLease6DumpFlushFailureKeepsPreviousSnapshot() {
+        Config config = MakeConfig();
+        Dhcp6Server server(config);
+        const auto t0 = std::chrono::steady_clock::now();
+        CHECK(!IsZeroAddr(server.Acquire(kClientDuid, 1, t0,
+                                         Dhcp6Server::OfferStage::kAck)));
+
+        const std::string path = "b-flush-dhcp6-leases.json";
+        std::remove(path.c_str());
+        CHECK(server.DumpLeases(path, t0));
+        std::string original;
+        {
+            std::ifstream first(path, std::ios::binary);
+            original.assign(std::istreambuf_iterator<char>(first),
+                            std::istreambuf_iterator<char>());
+        }
+        CHECK(!original.empty());
+
+        vgww::core::SetFileFlushHookForTest(
+            [](std::intptr_t) { return false; });
+        const uint64_t before = server.PersistFailureCount();
+        const bool saved =
+            server.DumpLeases(path, t0 + std::chrono::seconds(5));
+        vgww::core::SetFileFlushHookForTest(nullptr);
+        CHECK(!saved);
+        CHECK(server.PersistFailureCount() == before + 1);
+        {
+            std::ifstream again(path, std::ios::binary);
+            CHECK(std::string((std::istreambuf_iterator<char>(again)),
+                              std::istreambuf_iterator<char>()) == original);
+        }
+
+        CHECK(server.DumpLeases(path, t0 + std::chrono::seconds(6)));
+        std::remove(path.c_str());
+    }
+
+    void TestCorruptLease6FilePreserved() {
+        Dhcp6Server server(MakeConfig());
+        const std::string path = "b-corrupt-dhcp6-leases.json";
+        const std::string aside = path + ".corrupt";
+        std::remove(path.c_str());
+        std::remove(aside.c_str());
+        const std::string garbage = "{\"version\":1,\"leases\":[{\"duid\":";
+        {
+            std::ofstream out(path, std::ios::binary);
+            out << garbage;
+        }
+        CHECK(server.LoadLeases(path, std::chrono::steady_clock::now(),
+                                nullptr) ==
+              Dhcp6Server::LoadOutcome::kCorrupt);
+        std::ifstream kept(aside, std::ios::binary);
+        CHECK(kept.good());
+        CHECK(std::string((std::istreambuf_iterator<char>(kept)),
+                          std::istreambuf_iterator<char>()) == garbage);
+        std::ifstream gone(path, std::ios::binary);
+        CHECK(!gone.good());
+        std::remove(aside.c_str());
+    }
+
+    // batch85: same discipline as v4 - a transient holder is retried, and a
+    // file that still will not open is kUnreadable (kept, not overwritten).
+    void TestLease6LoadTransientLockIsNotCorrupt() {
+        Config config = MakeConfig();
+        const auto t0 = std::chrono::steady_clock::now();
+        const std::string path = "b-lock-dhcp6-leases.json";
+        std::remove(path.c_str());
+        {
+            Dhcp6Server writer(config);
+            CHECK(!IsZeroAddr(writer.Acquire(
+                kClientDuid, 1, t0, Dhcp6Server::OfferStage::kAck)));
+            CHECK(writer.DumpLeases(path, t0));
+        }
+
+        Dhcp6Server server(config);
+        std::atomic<int> calls{0};
+        vgww::core::SetConfigOpenFailureHookForTest(
+            [&calls](const std::string&) -> unsigned long {
+                return (calls.fetch_add(1) + 1) <= 2 ? 32u : 0u;
+            });
+        size_t dropped = 0;
+        const auto outcome = server.LoadLeases(path, t0, &dropped);
+        vgww::core::SetConfigOpenFailureHookForTest(
+            std::function<unsigned long(const std::string&)>());
+        CHECK(outcome == Dhcp6Server::LoadOutcome::kRestored);
+        CHECK(calls.load() == 3);
+        CHECK(server.LeaseCount() == 1);
+        std::remove(path.c_str());
+    }
+
+    void TestLease6LoadUnreadablePausesDump() {
+        Config config = MakeConfig();
+        const auto t0 = std::chrono::steady_clock::now();
+        const std::string path = "b-lock2-dhcp6-leases.json";
+        std::remove(path.c_str());
+        {
+            Dhcp6Server writer(config);
+            CHECK(!IsZeroAddr(writer.Acquire(
+                kClientDuid, 1, t0, Dhcp6Server::OfferStage::kAck)));
+            CHECK(writer.DumpLeases(path, t0));
+        }
+        std::string original;
+        {
+            std::ifstream in(path, std::ios::binary);
+            original.assign(std::istreambuf_iterator<char>(in),
+                            std::istreambuf_iterator<char>());
+        }
+
+        Dhcp6Server server(config);
+        vgww::core::SetConfigOpenFailureHookForTest(
+            [](const std::string&) -> unsigned long { return 32u; });
+        const auto outcome = server.LoadLeases(path, t0, nullptr);
+        CHECK(outcome == Dhcp6Server::LoadOutcome::kUnreadable);
+        CHECK(server.LeaseCount() == 0);
+
+        const uint64_t failures = server.PersistFailureCount();
+        CHECK(!server.DumpLeases(path, t0 + std::chrono::seconds(60)));
+        CHECK(server.PersistFailureCount() == failures + 1);
+        {
+            std::ifstream in(path, std::ios::binary);
+            CHECK(std::string((std::istreambuf_iterator<char>(in)),
+                              std::istreambuf_iterator<char>()) == original);
+        }
+        vgww::core::SetConfigOpenFailureHookForTest(
+            std::function<unsigned long(const std::string&)>());
+
+        Dhcp6Server fresh(config);
+        CHECK(fresh.LoadLeases(path, t0, nullptr) ==
+              Dhcp6Server::LoadOutcome::kRestored);
+        std::remove(path.c_str());
+    }
+
+    // batch87: blocked v6 lease writer recovers on the next dump.
+    void TestLease6DumpRecoversFromBlocked() {
+        Config config = MakeConfig();
+        const auto t0 = std::chrono::steady_clock::now();
+        const std::string path = "b-recover-dhcp6-leases.json";
+        std::remove(path.c_str());
+        {
+            Dhcp6Server writer(config);
+            CHECK(!IsZeroAddr(writer.Acquire(
+                kClientDuid, 1, t0, Dhcp6Server::OfferStage::kAck)));
+            CHECK(writer.DumpLeases(path, t0));
+        }
+
+        Dhcp6Server server(config);
+        vgww::core::SetConfigOpenFailureHookForTest(
+            [](const std::string&) -> unsigned long { return 32u; });
+        CHECK(server.LoadLeases(path, t0, nullptr) ==
+              Dhcp6Server::LoadOutcome::kUnreadable);
+        vgww::core::SetConfigOpenFailureHookForTest(
+            std::function<unsigned long(const std::string&)>());
+        CHECK(server.PersistBlocked());
+
+        CHECK(!IsZeroAddr(server.Acquire(kOtherDuid, 7, t0,
+                                         Dhcp6Server::OfferStage::kAck)));
+        const size_t live = server.LeaseCount();
+        CHECK(live == 1);
+
+        CHECK(server.DumpLeases(path, t0 + std::chrono::seconds(60)));
+        CHECK(!server.PersistBlocked());
+        const size_t merged = server.LeaseCount();
+        CHECK(merged >= live);
+
+        Dhcp6Server reloaded(config);
+        CHECK(reloaded.LoadLeases(path, t0, nullptr) ==
+              Dhcp6Server::LoadOutcome::kRestored);
+        CHECK(reloaded.LeaseCount() == merged);
         std::remove(path.c_str());
     }
 
@@ -2330,9 +2535,16 @@ int main() {
     TestB114Acquire6WalkDoesNotScanLeasesPerCandidate();
     TestPoolSkipsNetworkIid();
     TestB134Leases6LoadRejectsDuplicateAddress();
+    TestB120Leases6FileCorruptIsFlagged();
+    TestB122ParseRejects6AreCounted();
     TestLeases6LoadSkipsIllegal();
     TestLegacyLeaseMissingExpiresRestored6();
     TestLeases6RoundTrip();
+    TestLease6DumpFlushFailureKeepsPreviousSnapshot();
+    TestCorruptLease6FilePreserved();
+    TestLease6LoadTransientLockIsNotCorrupt();
+    TestLease6LoadUnreadablePausesDump();
+    TestLease6DumpRecoversFromBlocked();
     TestB81DumpLeasesDoesNotStallLockHolders();
     TestLoadCap();
     TestRateLimitPerDuid();

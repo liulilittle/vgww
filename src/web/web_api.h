@@ -20,6 +20,7 @@
 #include <functional>
 #include <memory>
 #include <mutex>
+#include <set>
 #include <string>
 #include <utility>
 #include <vector>
@@ -57,6 +58,34 @@ namespace vgww {
             std::string mac;  ///< client MAC "AA:BB:CC:DD:EE:FF"
             uint32_t uplink_kbps = 0;
             uint32_t downlink_kbps = 0;
+            /// P82: stable identity assigned on insert (0 = not yet stored).
+            /// Rate limits are deleted by MAC, but the identity is what the
+            /// cross-process merge and the tombstone set key on; the trailing
+            /// position keeps the existing aggregate initialisers valid.
+            uint64_t id = 0;
+        };
+
+        /// P82: the tombstone ceiling. A rule document carries every deletion
+        /// since the last compaction; past this bound the writer refuses new
+        /// deletions (the loader rejects a longer list as corrupt, so exceeding
+        /// it would brick the file on the next restart).
+        constexpr size_t kMaxTombstones = 8192;
+
+        /// P82: a parsed rule document - pure data, no singleton state. The
+        /// load and merge helpers operate on this so their behaviour is
+        /// testable without a RuleStore instance.
+        struct RuleDocument {
+            std::vector<PortMappingRule> port_maps;
+            std::vector<BanEntry> bans;
+            std::vector<RateLimitRule> rate_limits;
+            /// Deleted rule ids (membership; the merge keys on this).
+            std::set<uint64_t> tombstones;
+            /// The same ids in the order they were deleted - the document's
+            /// "removed" array is written in this order.
+            std::vector<uint64_t> tombstone_order;
+            /// Entries the parser dropped (invalid, duplicate identity or
+            /// duplicate id). Tombstoned entries are NOT counted here.
+            size_t discarded = 0;
         };
 
         /// batch129: a zero-copy, read-only VIEW over an immutable snapshot.
@@ -148,6 +177,21 @@ namespace vgww {
             /// removed) instead of discovering it after a restart.
             size_t PersistFailureCount() const noexcept;
 
+            /// batch86: true while rule persistence is paused because the
+            /// file could not be read at attach time (it may be valid but
+            /// briefly locked). The status surface reports it so "why did my
+            /// change not survive a restart" has a visible cause.
+            bool PersistBlocked() const noexcept;
+
+            /// batch91: successful blocked->writable recoveries (exactly one
+            /// per blockage, including the corrupt-file preservation path).
+            size_t RecoveryCount() const noexcept;
+
+            /// batch92: true when every staged rule revision is on disk (also
+            /// true when persistence is disabled). Mutation responses report it
+            /// so a caller can tell "applied in memory but not saved" apart
+            /// from a durable success.
+            bool PersistUpToDate() const noexcept;
             uint64_t Rev() const noexcept;
             // For monotonic anchor (B6): seq_cst load/store ensures
             // Binding::Poll never misses a bump across threads.
@@ -181,6 +225,11 @@ namespace vgww {
             /// unknown (already removed, or never existed) - never removes a
             /// different rule.
             bool RemovePortMapById(uint64_t id);
+            /// P82: same removal with an explicit refusal channel. `refused`
+            /// is set when the removal was NOT performed because the tombstone
+            /// store is full (the caller must answer 500, not 404); it is
+            /// always false when the return value is true.
+            bool RemovePortMapById(uint64_t id, bool& refused);
             void RemovePortMap(size_t index);
             /// batch34d: check-and-erase under ONE lock. The API used to call
             /// PortMaps().size() (lock #1) and then RemovePortMap(index)
@@ -188,6 +237,8 @@ namespace vgww {
             /// the user deleted a DIFFERENT rule than the one they clicked.
             /// Returns false when the index is out of range.
             bool RemovePortMapChecked(size_t index);
+            /// P82: same, with the refusal channel (see RemovePortMapById).
+            bool RemovePortMapChecked(size_t index, bool& refused);
 
             /// batch129: zero-copy immutable snapshot (see PortMaps()).
             RuleList<BanEntry> Bans() const;
@@ -205,6 +256,8 @@ namespace vgww {
             /// Returns false when the id is unknown - a stale or already
             /// removed row can never delete a different ban.
             bool RemoveBanById(uint64_t id);
+            /// P82: same removal with the refusal channel (tombstone full).
+            bool RemoveBanById(uint64_t id, bool& refused);
             /// batch88: same contract as RemovePortMapChecked - the range check
             /// and the erase happen under ONE lock, and the returned bool is the
             /// truth about the mutation. RemoveBan's void return forced callers
@@ -212,6 +265,8 @@ namespace vgww {
             /// describe a vector that no longer existed by erase time.
             /// Returns false when the index is out of range (nothing removed).
             bool RemoveBanChecked(size_t index);
+            /// P82: same, with the refusal channel (tombstone full).
+            bool RemoveBanChecked(size_t index, bool& refused);
 
             /// Immutable snapshot for lock-free enforcement reads (RCU-style:
             /// the data plane polls this periodically, one atomic load).
@@ -227,7 +282,43 @@ namespace vgww {
             /// pre-check had to re-implement the upsert scan by hand, so a
             /// client REPLACING a rule could be told "too many ratelimits".
             bool SetRateLimitChecked(RateLimitRule rule);
+            /// P82: removes the rule keyed by `mac`. `refused` is set when the
+            /// removal was NOT performed because the tombstone store is full.
             bool RemoveRateLimit(const std::string& mac);
+            /// P82: same removal with the refusal channel (tombstone full).
+            bool RemoveRateLimit(const std::string& mac, bool& refused);
+
+            /// batch34o: the outcomes a load can have. `kMissing` is the
+            /// first-run case and is NOT an error; `kCorrupt` means the file
+            /// exists but cannot be trusted and must be reported; batch85
+            /// `kUnreadable` means it exists but could not even be OPENED
+            /// (transient lock/permission) - nothing was parsed, so it must
+            /// neither be preserved-aside nor overwritten.
+            enum class LoadOutcome { kOk, kMissing, kCorrupt, kUnreadable };
+
+            /// P82: parses the rule document at `path` WITHOUT touching any
+            /// singleton state. Entries whose id is in the document's tombstone
+            /// list are skipped (and NOT counted in `discarded`); entries with
+            /// no id keep id 0 (the caller mints one); a "removed" list longer
+            /// than kMaxTombstones makes the whole document kCorrupt.
+            static LoadOutcome ReadRuleDocument(const std::string& path,
+                                                RuleDocument& doc);
+
+            /// P82: merges `disk` into `memory` IN PLACE under the tombstone
+            /// union. Memory entries win over disk entries with the same id or
+            /// the same identity (proto+wan_port / BanTargetKey / MAC); a disk
+            /// entry whose id is tombstoned is skipped; a disk-only entry with
+            /// id 0 is minted through `mint_id`; entries beyond the per-kind
+            /// cap are dropped. Returns the number of dropped disk entries.
+            /// `memory.tombstones`/`tombstone_order` become the union.
+            static size_t MergeRuleDocuments(
+                RuleDocument& memory, const RuleDocument& disk,
+                const std::function<uint64_t()>& mint_id);
+
+            /// P82 test seam: forces the process id salt (and resets the
+            /// shared counter) so id minting is deterministic. Zero is bumped
+            /// to 1 (the salt must be non-zero).
+            void SetRuleIdSaltForTest(uint64_t salt);
 
             /// batch136: replaces the rule keyed by `old_mac` with `rule` in a
             /// SINGLE critical section - all-or-nothing.
@@ -260,6 +351,14 @@ namespace vgww {
                 std::vector<PortMappingRule> port_maps;
                 std::vector<BanEntry> bans;
                 std::vector<RateLimitRule> rate_limits;
+                /// P82: the tombstone set at stage time (insertion order), so
+                /// the writer can emit "removed" without taking mutex_ again.
+                std::vector<uint64_t> tombstones;
+                /// P82: publish this snapshot as-is, WITHOUT adopting the
+                /// on-disk rules. Clear() sets it: a deliberate wipe must not
+                /// be undone by re-importing the document it is about to
+                /// replace.
+                bool direct = false;
             };
 
             mutable std::mutex mutex_;
@@ -290,26 +389,58 @@ namespace vgww {
             std::shared_ptr<const PersistSnapshot> pending_snapshot_;
             std::atomic<uint64_t> persisted_rev_{0};
 
-            void StagePersistLocked();  ///< caller holds mutex_
+            void StagePersistLocked(bool direct = false);  ///< caller holds mutex_
             void FlushPersist();        ///< caller holds NO lock
             /// batch34o D5: returns false when the file could not be written.
             /// The caller must NOT advance the persisted revision in that case.
             bool WriteSnapshot(const std::string& path,
                                const PersistSnapshot& snapshot);
-            /// batch34o: the three outcomes a load can have. `kMissing` is the
-            /// first-run case and is NOT an error; `kCorrupt` means the file
-            /// exists but cannot be trusted and must be reported.
-            enum class LoadOutcome { kOk, kMissing, kCorrupt };
             LoadOutcome LoadLockedChecked();  ///< caller holds mutex_
-            /// Monotonic rule identity. Rules are removed by id, never by
-            /// position, so a concurrent add cannot redirect a removal.
-            uint64_t next_rule_id_ = 1;
-            /// batch138: same monotonic identity for bans (they had none).
-            uint64_t next_ban_id_ = 1;
+            /// P82: takes over a parsed document: mints ids for id-0 entries,
+            /// registers every id in used_ids_, installs the vectors and the
+            /// tombstone set, bumps rev_ and publishes the snapshots. Caller
+            /// holds mutex_.
+            void AdoptDocumentLocked(RuleDocument& doc);
+            /// P82: records a deletion. Returns false (and changes nothing)
+            /// when the tombstone ceiling is reached - the caller then refuses
+            /// the removal instead of dropping it without a trace. Caller holds
+            /// mutex_.
+            bool AddTombstoneLocked(uint64_t id);
+            /// P82: mints a process-unique rule id. Layout:
+            ///   bit 63     = marker (new ids are >= 2^63; legacy ids are not)
+            ///   bits 62..32 = salt32 (CSPRNG ^ pid, non-zero)
+            ///   bits 31..0  = counter31 (shared by all three rule kinds)
+            /// Caller holds mutex_.
+            uint64_t MintRuleIdLocked();
+            /// P82: generates the process salt once (CsprngBytes ^ pid, non-zero).
+            void EnsureSaltLocked();
+            /// batch85: true while persistence must not touch the file because
+            /// it could not be read at attach time (guarded by mutex_).
+            bool persist_blocked_ = false;
+            /// batch87: while blocked, a flush first retries the load; a
+            /// document that is readable again is merged with the changes the
+            /// operator made while persistence was paused (deduplicated by
+            /// the same identities the loaders use), the block is cleared and
+            /// the flush proceeds. Returns false when the file is still not
+            /// readable (the block stays). Caller holds mutex_.
+            bool RecoverBlockedLocked(bool& corrupt_detected);
+            /// P82: process-unique id salt (0 = not generated yet).
+            uint64_t id_salt_ = 0;
+            /// P82: shared monotonic counter (starts at 1).
+            uint32_t id_counter_ = 1;
+            /// P82: every id this process minted or loaded - the collision
+            /// guard for minting.
+            std::set<uint64_t> used_ids_;
+            /// P82: deleted rule ids (guarded by mutex_).
+            std::set<uint64_t> tombstones_;
+            /// P82: the same ids in deletion order (the document's "removed").
+            std::vector<uint64_t> tombstone_order_;
             /// batch34o: entries dropped by the last load (see accessor).
             size_t discarded_rules_ = 0;
             /// batch34o D5: count of failed rule-file writes.
             std::atomic<size_t> persist_failures_{0};
+            /// batch91: see RecoveryCount().
+            std::atomic<size_t> recovery_count_{0};
         };
 
         /// Registers all /api/* routes on `server`. `config_path` is the JSON
@@ -362,9 +493,17 @@ namespace vgww {
                 std::lock_guard<std::mutex> lock(mutex_);
                 return ++attempt_id_;
             }
-            void Record(bool ok, const std::string& error) {
+            /// batch111: the outcome must be attributed to the attempt that
+            /// produced it. Two in-flight applies can finish out of order;
+            /// an untagged Record made the late completion of an older
+            /// attempt overwrite a newer result and look like its own.
+            void Record(uint64_t attempt_id, bool ok,
+                        const std::string& error) {
                 std::lock_guard<std::mutex> lock(mutex_);
-                ++completed_id_;
+                if (attempt_id < completed_id_) {
+                    return;  // stale completion: newer result already stored
+                }
+                completed_id_ = attempt_id;
                 ok_ = ok;
                 error_ = error;
             }
@@ -389,13 +528,18 @@ namespace vgww {
         using RepairRequester = std::function<bool()>;
         using AutostartSetter = std::function<bool(bool)>;
         using AuditLog = std::function<void(const std::string&)>;
+        /// batch126: cumulative console-ring lines evicted by the bound.
+        using ConsoleDroppedProvider = std::function<uint64_t()>;
         /// batch37t: apply a just-saved config to the running app. The UI
+        /// receives the attempt id so its completion is attributed to the
+        /// save that queued it (batch111).
         /// entry point queues it to the UI/command thread and returns true;
         /// with no native UI (headless/web-only) it returns false and the
         /// response keeps the honest "applies on restart" note. The callback
         /// must NOT apply synchronously: the apply stops the HTTP server, and
         /// doing that on an HTTP worker would self-join.
-        using ConfigApplier = std::function<bool(const core::Config&)>;
+        using ConfigApplier =
+            std::function<bool(const core::Config&, uint64_t attempt_id)>;
         void RegisterApi(HttpServer& server, runtime::Dataplane& dataplane,
                          const core::Config& config,
                          const std::string& config_path,
@@ -405,7 +549,8 @@ namespace vgww {
                          AutostartSetter autostart_setter = {},
                          AuditLog audit_log = {},
                          ConfigApplier config_applier = {},
-                         std::shared_ptr<ConfigApplyStatus> apply_status = {});
+                         std::shared_ptr<ConfigApplyStatus> apply_status = {},
+                         ConsoleDroppedProvider console_dropped = {});
 
         /// batch37s: live-token variant used by the entry point so a settings
         /// save can rotate/clear the credential and restart the listener
@@ -420,7 +565,8 @@ namespace vgww {
                          AutostartSetter autostart_setter = {},
                          AuditLog audit_log = {},
                          ConfigApplier config_applier = {},
-                         std::shared_ptr<ConfigApplyStatus> apply_status = {});
+                         std::shared_ptr<ConfigApplyStatus> apply_status = {},
+                         ConsoleDroppedProvider console_dropped = {});
 
         /// Extracts a string field from a flat JSON body. Handles the common
         /// escapes (\" \\ \n); returns false when the key is missing.

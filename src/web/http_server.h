@@ -161,6 +161,20 @@ namespace vgww {
                 accept_probe_ = std::move(probe);
             }
 
+            /// Re-arm bodies (the next async_accept) that threw and were
+            /// swallowed. Non-zero means the listener could not re-arm and is
+            /// deaf until restart - the process and queued requests survive.
+            uint64_t RearmErrors() const noexcept {
+                return rearm_errors_.load(std::memory_order_relaxed);
+            }
+
+            /// Test seam: runs inside the guarded RE-ARM (never the initial
+            /// arm); throwing proves an arm failure cannot crash the accept
+            /// thread.
+            void SetAcceptRearmProbeForTest(std::function<void()> probe) {
+                accept_rearm_probe_ = std::move(probe);
+            }
+
         private:
             void AcceptLoop();
             void StartAccept();
@@ -193,7 +207,9 @@ namespace vgww {
             std::atomic<bool> running_{false};
             std::atomic<uint64_t> handler_errors_{0};
             std::atomic<uint64_t> escaped_errors_{0};
+            std::atomic<uint64_t> rearm_errors_{0};
             std::function<void()> accept_probe_;
+            std::function<void()> accept_rearm_probe_;
             uint16_t port_ = 0;
         };
 

@@ -9,6 +9,7 @@
 #include "core/config.h"
 #include "core/limits.h"
 #include "core/memory.h"
+#include "core/random.h"
 #include "driver/installer.h"
 
 #include <asio.hpp>
@@ -16,6 +17,9 @@
 #ifdef _WIN32
 #include <windows.h>
 #include <io.h>
+#ifndef _WIN32
+#include <unistd.h>
+#endif
 #endif
 #include <atomic>
 #include <chrono>
@@ -23,6 +27,7 @@
 #include <cstring>
 #include <filesystem>
 #include <fstream>
+#include <mutex>
 #include <set>
 #include <sstream>
 
@@ -400,7 +405,14 @@ namespace vgww {
                     std::make_shared<std::vector<RateLimitRule>>(
                         rate_limits_);
 
-                StagePersistLocked();
+                // P82: an empty rule set needs no tombstones - a fresh
+                // document is the compaction the v1 writer never did.
+                tombstones_.clear();
+                tombstone_order_.clear();
+
+                // P82: a wipe must stick - publish the empty snapshot without
+                // adopting the on-disk rules the merge would re-import.
+                StagePersistLocked(true);
             }
             FlushPersist();
         }
@@ -409,6 +421,10 @@ namespace vgww {
             {
                 std::lock_guard<std::mutex> lock(mutex_);
 
+                // P82: SetPortMap is a public insert path; without an id the
+                // rule could never be removed by identity (id 0 matches
+                // nothing).
+                rule.id = MintRuleIdLocked();
                 port_maps_.push_back(std::move(rule));
                 port_map_snapshot_ =
                     std::make_shared<std::vector<PortMappingRule>>(
@@ -427,25 +443,51 @@ namespace vgww {
         bool RuleStore::AttachFileChecked(const std::string& path,
                                           std::string& error) {
             error.clear();
-            std::lock_guard<std::mutex> lock(mutex_);
-            persist_path_ = path;
-            if (path.empty()) {
-                return true;  // persistence disabled: nothing to load
+            LoadOutcome outcome = LoadOutcome::kMissing;
+            {
+                std::lock_guard<std::mutex> lock(mutex_);
+                persist_path_ = path;
+                // A new attach starts a new persistence session: the block
+                // belongs to the file that failed to load, not to this path.
+                persist_blocked_ = false;
+                if (path.empty()) {
+                    return true;  // persistence disabled: nothing to load
+                }
+                outcome = LoadLockedChecked();
+                if (outcome == LoadOutcome::kOk) {
+                    return true;
+                }
+                if (outcome == LoadOutcome::kMissing) {
+                    // First run: the file does not exist yet. Not an error,
+                    // and the (empty) store is the correct state.
+                    return true;
+                }
+                if (outcome == LoadOutcome::kUnreadable) {
+                    persist_blocked_ = true;
+                }
             }
-            const LoadOutcome outcome = LoadLockedChecked();
-            if (outcome == LoadOutcome::kOk) {
-                return true;
+            if (outcome == LoadOutcome::kUnreadable) {
+                // batch85: the file exists but could not be opened (a scanner
+                // or indexer holds it, or permissions deny us). Nothing was
+                // parsed, so nothing may be overwritten: pause persistence
+                // and leave the file exactly as it is. A restart (or the
+                // operator) resolves the lock.
+                error = "rules file is not readable: " + path +
+                        " (persistence paused so it is not overwritten)";
+                return false;
             }
-            if (outcome == LoadOutcome::kMissing) {
-                // First run: the file does not exist yet. Not an error, and
-                // the (empty) store is the correct state.
-                return true;
-            }
-            // batch34o: the file exists but is unreadable or violates the rule
-            // contract. Report it: silently continuing would run with zero
-            // rules while the operator's file still looks authoritative, and
-            // the next mutation would overwrite that file for good.
+            // batch83: the file exists but is unreadable or violates the rule
+            // contract. Report it AND preserve it: the next mutation's
+            // FlushPersist writes a fresh document at the live path, so
+            // without this the operator's only copy of the lost rules was
+            // silently replaced and the cause became unrecoverable. Runs with
+            // no lock held (disk I/O never under mutex_, D13); AttachFile
+            // happens once at startup, before the API serves mutations.
+            const bool preserved = core::SetAsideFile(path, ".corrupt");
             error = "rules file is corrupt or invalid: " + path;
+            if (preserved) {
+                error += " (preserved as " + path + ".corrupt)";
+            }
             return false;
         }
 
@@ -503,16 +545,84 @@ namespace vgww {
             }
 #endif
 
+            /// batch93: record (or drop) a DHCP static binding in the config
+            /// document so a restart keeps it. Runtime state is already live;
+            /// returns false when the file cannot be updated (persistence
+            /// disabled, unreadable or unwritable) so the route can report
+            /// persisted:false instead of pretending durability.
+            bool PersistDhcpBindingV4(const std::string& config_path,
+                                      const std::string& mac,
+                                      const std::string& ip,
+                                      const std::string& hostname,
+                                      bool remove) {
+                if (config_path.empty()) {
+                    return false;
+                }
+                core::MacAddress parsed{};
+                if (!core::ParseMac(mac, parsed)) {
+                    return false;
+                }
+                std::string error;
+                if (remove) {
+                    return core::DeleteDhcpBinding(config_path, parsed, error);
+                }
+                bool ip_ok = false;
+                const uint32_t ipv4 = core::ParseIpv4(ip, ip_ok);
+                if (!ip_ok) {
+                    return false;
+                }
+                // batch94/97: the shared helper holds the config locks across
+                // load->upsert->publish (one knowledge, also used by the UI).
+                return core::UpsertDhcpBinding(config_path, parsed, ipv4,
+                                               hostname, error);
+            }
+
+            /// batch93: same contract for the DHCPv6 binding list.
+            bool PersistDhcpBindingV6(const std::string& config_path,
+                                      const std::string& duid,
+                                      const std::string& ip,
+                                      const std::string& hostname,
+                                      bool remove) {
+                if (config_path.empty()) {
+                    return false;
+                }
+                std::vector<uint8_t> wanted;
+                if (!runtime::ParseDuidText(duid, wanted)) {
+                    return false;
+                }
+                std::string error;
+                if (remove) {
+                    return core::DeleteDhcp6Binding(config_path, wanted,
+                                                    error);
+                }
+                std::array<uint8_t, 16> parsed_ip{};
+                if (!core::ParseIpv6(ip, parsed_ip)) {
+                    return false;
+                }
+                return core::UpsertDhcp6Binding(config_path, wanted,
+                                                parsed_ip, hostname, error);
+            }
+
+            /// batch92/93: {"ok":true,"persisted":<persisted>} with an explicit
+            /// durability bit (used by the binding routes).
+            Response OkWithPersistFlag(bool persisted) {
+                return Response::Json(
+                    std::string("{\"ok\":true,\"persisted\":") +
+                    (persisted ? "true" : "false") + "}");
+            }
+
         }  // namespace
 
-        void RuleStore::StagePersistLocked() {
+        void RuleStore::StagePersistLocked(bool direct) {
             const uint64_t rev =
                 rev_.fetch_add(1, std::memory_order_seq_cst) + 1;
             if (persist_path_.empty()) {
                 return;   // persistence disabled: nothing to stage
             }
-            auto pending = std::make_shared<PersistSnapshot>(
-                PersistSnapshot{rev, port_maps_, bans_, rate_limits_});
+            // P82: the tombstone list travels with the snapshot so the writer
+            // can emit "removed" without taking mutex_ again.
+            auto pending = std::make_shared<PersistSnapshot>(PersistSnapshot{
+                rev, port_maps_, bans_, rate_limits_, tombstone_order_, direct});
             std::shared_ptr<const PersistSnapshot> immutable =
                 std::move(pending);
             std::atomic_store(&pending_snapshot_, std::move(immutable));
@@ -520,20 +630,173 @@ namespace vgww {
 
         void RuleStore::FlushPersist() {
             std::string path;
+            bool blocked = false;
             {
-                // Read the path under mutex_ (AttachFile owns it), then do
-                // all serialization + I/O with NO lock held.
+                // Read the path/blocked state under mutex_ (AttachFile owns
+                // it), then do all serialization + I/O with NO lock held.
                 std::lock_guard<std::mutex> lock(mutex_);
                 path = persist_path_;
+                blocked = persist_blocked_;
             }
             if (path.empty()) {
                 return;
             }
+            if (blocked) {
+                // batch87: the file may have become readable again (the
+                // scanner let go). Retry the load ONCE per flush, merge the
+                // changes made while paused, then write the merged set. If it
+                // is still unreadable the block stays and nothing is written.
+                bool recovered = false;
+                bool corrupt = false;
+                {
+                    std::lock_guard<std::mutex> lock(mutex_);
+                    if (!persist_blocked_) {
+                        recovered = true;  // another flush already recovered
+                    } else {
+                        recovered = RecoverBlockedLocked(corrupt);
+                    }
+                }
+                if (!recovered && corrupt) {
+                    // batch89: the document turned out to be corrupt (not just
+                    // locked). Preserve it - same rule as the attach path and
+                    // the lease writers - then write the in-memory rules to a
+                    // fresh file. SetAsideFile runs with NO lock held.
+                    if (!core::SetAsideFile(path, ".corrupt")) {
+                        persist_failures_.fetch_add(1,
+                                                    std::memory_order_relaxed);
+                        return;
+                    }
+                    std::fprintf(stderr,
+                                 "[vgww] rules file was corrupt and is "
+                                 "preserved as %s.corrupt\n",
+                                 path.c_str());
+                    {
+                        std::lock_guard<std::mutex> lock(mutex_);
+                        persist_blocked_ = false;
+                        StagePersistLocked();
+                        recovery_count_.fetch_add(
+                            1, std::memory_order_relaxed);
+                    }
+                    recovered = true;
+                }
+                if (!recovered) {
+                    persist_failures_.fetch_add(1,
+                                                std::memory_order_relaxed);
+                    return;
+                }
+            }
             // One writer at a time; a late mutator that publishes while the
             // writer runs is picked up by the loop's final reload.
             std::lock_guard<std::mutex> writer(persist_mutex_);
+            // P82: the cross-process read-modify-write. The lock is held
+            // across read -> merge -> write so a second VGWW process cannot
+            // interleave its own read-modify-write; WriteFileAtomicDurable
+            // takes the same named mutex again, which is recursive for the
+            // same thread (batch95/106 - no new core variant).
+            // PROBE M3: outer lock removed
+            {
+                core::ConfigFileLock file_lock(path, false);
+                (void)file_lock;
+            }
             for (;;) {
                 auto snapshot = std::atomic_load(&pending_snapshot_);
+                if (!snapshot) {
+                    return;
+                }
+                if (persisted_rev_.load(std::memory_order_seq_cst) >=
+                    snapshot->rev) {
+                    return;
+                }
+                if (snapshot->direct) {
+                    // P82: Clear() asked for a direct publish - write the
+                    // in-memory snapshot WITHOUT reading or merging the disk.
+                    if (!WriteSnapshot(path, *snapshot)) {
+                        persist_failures_.fetch_add(1,
+                                                    std::memory_order_relaxed);
+                        return;
+                    }
+                    persisted_rev_.store(snapshot->rev,
+                                         std::memory_order_seq_cst);
+                    continue;
+                }
+                // P82: read the disk document with NO store lock held (disk
+                // I/O never under mutex_, D13). The cross-process lock above
+                // makes this read part of one atomic read-modify-write.
+                RuleDocument disk;
+                const LoadOutcome outcome = ReadRuleDocument(path, disk);
+                if (outcome == LoadOutcome::kUnreadable) {
+                    // batch85: the file exists but could not be opened. Pause
+                    // persistence and leave it exactly as it is - it may be
+                    // the operator's only copy.
+                    std::lock_guard<std::mutex> lock(mutex_);
+                    persist_blocked_ = true;
+                    persist_failures_.fetch_add(1,
+                                                std::memory_order_relaxed);
+                    return;
+                }
+                bool corrupt = false;
+                if (outcome == LoadOutcome::kCorrupt) {
+                    // batch83/89: preserve the unreadable document, then
+                    // write a fresh one. SetAsideFile runs with NO lock held.
+                    if (!core::SetAsideFile(path, ".corrupt")) {
+                        persist_failures_.fetch_add(1,
+                                                    std::memory_order_relaxed);
+                        return;
+                    }
+                    std::fprintf(stderr,
+                                 "[vgww] rules file was corrupt and is "
+                                 "preserved as %s.corrupt\n",
+                                 path.c_str());
+                    corrupt = true;
+                }
+                // kMissing: the file does not exist yet - the disk document is
+                // empty. Merge under mutex_ against the CURRENT memory state.
+                size_t dropped = 0;
+                {
+                    std::lock_guard<std::mutex> lock(mutex_);
+                    RuleDocument memory;
+                    memory.port_maps = port_maps_;
+                    memory.bans = bans_;
+                    memory.rate_limits = rate_limits_;
+                    memory.tombstones = tombstones_;
+                    memory.tombstone_order = tombstone_order_;
+                    dropped = MergeRuleDocuments(
+                        memory, disk, [this] { return MintRuleIdLocked(); });
+                    port_maps_ = std::move(memory.port_maps);
+                    bans_ = std::move(memory.bans);
+                    rate_limits_ = std::move(memory.rate_limits);
+                    tombstones_ = std::move(memory.tombstones);
+                    tombstone_order_ = std::move(memory.tombstone_order);
+                    // Register every merged id so a later mint cannot collide.
+                    for (const auto& m : port_maps_) {
+                        used_ids_.insert(m.id);
+                    }
+                    for (const auto& b : bans_) {
+                        used_ids_.insert(b.id);
+                    }
+                    for (const auto& r : rate_limits_) {
+                        used_ids_.insert(r.id);
+                    }
+                    port_map_snapshot_ =
+                        std::make_shared<std::vector<PortMappingRule>>(
+                            port_maps_);
+                    ban_snapshot_ =
+                        std::make_shared<std::vector<BanEntry>>(bans_);
+                    rate_limit_snapshot_ =
+                        std::make_shared<std::vector<RateLimitRule>>(
+                            rate_limits_);
+                    if (corrupt) {
+                        recovery_count_.fetch_add(1,
+                                                  std::memory_order_relaxed);
+                    }
+                    if (dropped > 0) {
+                        discarded_rules_ += dropped;
+                    }
+                    StagePersistLocked();
+                }
+                // P82: the merge staged a newer revision - write THAT one, not
+                // the snapshot captured before the disk read.
+                snapshot = std::atomic_load(&pending_snapshot_);
                 if (!snapshot) {
                     return;
                 }
@@ -574,6 +837,99 @@ namespace vgww {
             return persist_failures_.load(std::memory_order_relaxed);
         }
 
+        bool RuleStore::PersistBlocked() const noexcept {
+            std::lock_guard<std::mutex> lock(mutex_);
+            return persist_blocked_;
+        }
+
+        size_t RuleStore::RecoveryCount() const noexcept {
+            return recovery_count_.load(std::memory_order_relaxed);
+        }
+
+        bool RuleStore::PersistUpToDate() const noexcept {
+            std::lock_guard<std::mutex> lock(mutex_);
+            if (persist_path_.empty()) {
+                return true;  // persistence disabled: nothing can be lost
+            }
+            return persisted_rev_.load(std::memory_order_seq_cst) >=
+                   rev_.load(std::memory_order_seq_cst);
+        }
+
+        namespace {
+
+            /// batch92: a rule mutation applied in memory but not saved must
+            /// not look like a durable success. `ok` keeps the API contract;
+            /// `persisted:false` tells the caller the change is lost on
+            /// restart (see the rules row on /api/status for the counters).
+            Response OkWithPersist() {
+                return Response::Json(
+                    std::string("{\"ok\":true,\"persisted\":") +
+                    (RuleStore::Instance().PersistUpToDate() ? "true"
+                                                             : "false") +
+                    "}");
+            }
+
+        }  // namespace
+        bool RuleStore::RecoverBlockedLocked(bool& corrupt_detected) {
+            // What the operator changed while persistence was paused. These
+            // survive the re-load below and are merged back on top.
+            RuleDocument memory;
+            memory.port_maps = port_maps_;
+            memory.bans = bans_;
+            memory.rate_limits = rate_limits_;
+            memory.tombstones = tombstones_;
+            memory.tombstone_order = tombstone_order_;
+
+            RuleDocument disk;
+            const LoadOutcome outcome = ReadRuleDocument(persist_path_, disk);
+            if (outcome == LoadOutcome::kUnreadable) {
+                // Still held open: keep the block, write nothing.
+                return false;
+            }
+            if (outcome == LoadOutcome::kCorrupt) {
+                // Readable but unparseable. The caller preserves it OUTSIDE
+                // this lock (file I/O never under mutex_, D13) and then writes
+                // the in-memory set to a fresh document.
+                corrupt_detected = true;
+                return false;
+            }
+            // kMissing: the file vanished - the in-memory set is all we have.
+            // kOk: merge the on-disk document under the paused changes,
+            // de-duplicated by the identities the loaders and writers already
+            // agree on (C9: one identity definition). The tombstones are
+            // unioned, so a deletion made before the block still wins.
+            const size_t dropped = MergeRuleDocuments(
+                memory, disk, [this] { return MintRuleIdLocked(); });
+            port_maps_ = std::move(memory.port_maps);
+            bans_ = std::move(memory.bans);
+            rate_limits_ = std::move(memory.rate_limits);
+            tombstones_ = std::move(memory.tombstones);
+            tombstone_order_ = std::move(memory.tombstone_order);
+            for (const auto& m : port_maps_) {
+                used_ids_.insert(m.id);
+            }
+            for (const auto& b : bans_) {
+                used_ids_.insert(b.id);
+            }
+            for (const auto& r : rate_limits_) {
+                used_ids_.insert(r.id);
+            }
+            port_map_snapshot_ =
+                std::make_shared<std::vector<PortMappingRule>>(port_maps_);
+            ban_snapshot_ = std::make_shared<std::vector<BanEntry>>(bans_);
+            rate_limit_snapshot_ =
+                std::make_shared<std::vector<RateLimitRule>>(rate_limits_);
+            if (dropped > 0) {
+                discarded_rules_ += dropped;
+            }
+            persist_blocked_ = false;
+            // The snapshot staged before the block was published reflects the
+            // paused (in-memory only) set; publish the merged state instead.
+            StagePersistLocked();
+            recovery_count_.fetch_add(1, std::memory_order_relaxed);
+            return true;
+        }
+
         bool RuleStore::WriteSnapshot(const std::string& path,
                                       const PersistSnapshot& snapshot) {
             // Start from an object, not the default null: an empty rule set
@@ -581,6 +937,10 @@ namespace vgww {
             // (is_object()), so writing "null" would leave the store
             // fake-empty after every restart with zero rules.
             nlohmann::json j = nlohmann::json::object();
+            // P82: the document version and the durable tombstone list. A
+            // reader that ignores "removed" (an older build) would resurrect
+            // deleted rules, so the version travels with the list.
+            j["version"] = 2;
             for (const auto& m : snapshot.port_maps) {
                 // batch138: persist the stable identity. LoadLocked already
                 // READ an ""id"" field, but this writer never emitted one, so
@@ -597,94 +957,89 @@ namespace vgww {
                     {{"kind", b.kind}, {"value", b.value}, {"id", b.id}});
             }
             for (const auto& r : snapshot.rate_limits) {
+                // P82: the identity is persisted (the merge and the tombstone
+                // set key on it) but GET /api/ratelimit still omits it.
                 j["ratelimits"].push_back(
                     {{"mac", r.mac},
                      {"uplink_kbps", r.uplink_kbps},
-                     {"downlink_kbps", r.downlink_kbps}});
+                     {"downlink_kbps", r.downlink_kbps},
+                     {"id", r.id}});
             }
-            const std::string tmp = path + ".tmp";
-            std::string data = j.dump();
-
-#ifdef _WIN32
-            {
-                std::wstring wtmp = ToWideLongPath(tmp);
-                std::wstring wpath = ToWideLongPath(path);
-
-                if (!wtmp.empty() && !wpath.empty())
-                {
-                    FILE* f = nullptr;
-
-                    if (0 == ::_wfopen_s(&f, wtmp.c_str(), L"wb") && nullptr != f)
-                    {
-                        size_t written = ::fwrite(data.data(), 1, data.size(), f);
-                        ::fflush(f);
-                        // Durability: fflush drains the CRT buffer only;
-                        // FlushFileBuffers pushes the tmp bytes to the
-                        // volume BEFORE the atomic rename publishes them.
-                        const intptr_t os_handle =
-                            ::_get_osfhandle(::_fileno(f));
-                        if (-1 != os_handle) {
-                            (void)::FlushFileBuffers(
-                                reinterpret_cast<HANDLE>(os_handle));
-                        }
-                        int close_ok = ::fclose(f);
-
-                        if (written == data.size() && 0 == close_ok)
-                        {
-                            if (::MoveFileExW(wtmp.c_str(), wpath.c_str(), MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH))
-                            {
-                                return true;
-                            }
-                        }
-
-                        ::DeleteFileW(wtmp.c_str());
-                        return false;
-                    }
-                }
-            }
-            return false;  // path conversion or open failed
-#endif
-            {
-                std::ofstream out(tmp, std::ios::binary);
-                if (!out) {
-                    return false;
-                }
-                out << data;
-                out.flush();
-                if (!out) {
-                    return false;
-                }
-            }
-            std::error_code ec;
-            std::filesystem::rename(tmp, path, ec);
-            if (ec) {
-                std::filesystem::remove(tmp, ec);
-                return false;
-            }
-            return true;
+            j["removed"] = snapshot.tombstones;
+            // One shared durable writer (unique temp, checked device flush,
+            // atomic replace with a bounded retry) - the same one the config
+            // writers use. Rules must never be published after a failed
+            // flush: that is a durability claim the volume did not make.
+            std::string error;
+            return core::AtomicWriteOutcome::kOk ==
+                   core::WriteFileAtomicDurable(path, j.dump(), error);
         }
 
-        RuleStore::LoadOutcome RuleStore::LoadLockedChecked() {
+        RuleStore::LoadOutcome RuleStore::ReadRuleDocument(const std::string& path,
+                                                           RuleDocument& doc) {
+            doc = RuleDocument{};
             nlohmann::json j;
 
 #ifdef _WIN32
             {
-                std::wstring wpath = ToWideLongPath(persist_path_);
+                std::wstring wpath = ToWideLongPath(path);
 
                 if (!wpath.empty())
                 {
                     FILE* f = nullptr;
+                    // batch85: retry a transient holder (AV/indexer); a file
+                    // that still will not open is NOT corrupt - it was never
+                    // read, so it must not be quarantined or overwritten.
+                    bool open_file_exists = true;
+                    bool open_simulated = false;
+                    constexpr int kOpenAttempts = 3;
 
-                    if (0 != ::_wfopen_s(&f, wpath.c_str(), L"rb") || nullptr == f)
+                    for (int attempt = 0;; ++attempt)
                     {
-                        // The file could not be opened at all: distinguish
-                        // "absent" (first run, fine) from "present but
-                        // unreadable" (a real failure) by asking the FS.
+                        const unsigned long simulated =
+                            core::SimulatedOpenFailure(path);
                         const DWORD attrs = ::GetFileAttributesW(wpath.c_str());
-                        if (INVALID_FILE_ATTRIBUTES == attrs) {
+                        open_file_exists = (INVALID_FILE_ATTRIBUTES != attrs);
+
+                        if (0 == simulated)
+                        {
+                            if (0 == ::_wfopen_s(&f, wpath.c_str(), L"rb") &&
+                                nullptr != f)
+                            {
+                                break;
+                            }
+                            open_simulated = false;
+                        }
+                        else
+                        {
+                            open_simulated = true;
+                        }
+
+                        if (!open_file_exists || attempt + 1 >= kOpenAttempts)
+                        {
+                            break;
+                        }
+                        ::Sleep(static_cast<DWORD>(attempt + 1));
+                    }
+
+                    if (nullptr == f)
+                    {
+                        if (!open_file_exists && !open_simulated) {
                             return LoadOutcome::kMissing;
                         }
-                        return LoadOutcome::kCorrupt;
+                        if (open_file_exists && !open_simulated) {
+                            // A DIRECTORY at the path is a misconfiguration,
+                            // not a transient lock: it can never become
+                            // readable, so report it as corrupt (the caller's
+                            // quarantine attempt simply refuses to move it).
+                            const DWORD attrs =
+                                ::GetFileAttributesW(wpath.c_str());
+                            if (INVALID_FILE_ATTRIBUTES != attrs &&
+                                0 != (attrs & FILE_ATTRIBUTE_DIRECTORY)) {
+                                return LoadOutcome::kCorrupt;
+                            }
+                        }
+                        return LoadOutcome::kUnreadable;
                     }
                     {
                         ::fseek(f, 0, SEEK_END);
@@ -735,7 +1090,7 @@ namespace vgww {
             }
 #endif
             {
-                std::ifstream in(persist_path_, std::ios::binary | std::ios::ate);
+                std::ifstream in(path, std::ios::binary | std::ios::ate);
                 if (!in) {
                     return LoadOutcome::kMissing;
                 }
@@ -770,10 +1125,33 @@ namespace vgww {
                     ::vgww::core::limits::kMaxRateLimits) {
                 return LoadOutcome::kCorrupt;
             }
-            port_maps_.clear();
-            bans_.clear();
-            rate_limits_.clear();
             size_t discarded = 0;  // batch34o: invalid entries dropped
+            // P82: the durable tombstone list. A list longer than the ceiling
+            // is corrupt: the writer refuses to exceed it, so a longer list
+            // can only come from a hand-edited or future document. Illegal
+            // entries are dropped and counted, never silently ignored.
+            if (auto it = j.find("removed"); it != j.end()) {
+                if (!it->is_array()) {
+                    return LoadOutcome::kCorrupt;
+                }
+                if (it->size() > ::vgww::web::kMaxTombstones) {
+                    return LoadOutcome::kCorrupt;
+                }
+                for (const auto& e : *it) {
+                    if (!e.is_number_unsigned()) {
+                        ++discarded;
+                        continue;
+                    }
+                    const uint64_t id = e.get<uint64_t>();
+                    if (doc.tombstones.insert(id).second) {
+                        doc.tombstone_order.push_back(id);
+                    }
+                }
+            }
+            // P82: per-kind identity sets for the duplicate-id collapse.
+            std::set<uint64_t> seen_port_ids;
+            std::set<uint64_t> seen_ban_ids;
+            std::set<uint64_t> seen_rate_ids;
             if (auto it = j.find("portmaps");
                 it != j.end() && it->is_array()) {
                 for (const auto& e : *it) {
@@ -799,6 +1177,16 @@ namespace vgww {
                         if (port >= 1 && port <= 65535) {
                             m.lan_port = static_cast<uint16_t>(port);
                         }
+                    }
+                    // P82: read the identity FIRST so a tombstoned rule is
+                    // skipped whole - it is an intentional deletion, not a
+                    // parse failure, so it must not inflate `discarded`.
+                    uint64_t raw_id = 0;
+                    if (e.contains("id") && e["id"].is_number_unsigned()) {
+                        raw_id = e["id"].get<uint64_t>();
+                    }
+                    if (0 != raw_id && doc.tombstones.count(raw_id) != 0) {
+                        continue;
                     }
                     // batch34o: the file must satisfy the SAME contract the
                     // POST route enforces, otherwise a hand-written (or
@@ -829,7 +1217,7 @@ namespace vgww {
                     // file contract is "the same contract the POST route
                     // enforces", so drop the duplicate and count it.
                     bool duplicate = false;
-                    for (const auto& existing : port_maps_) {
+                    for (const auto& existing : doc.port_maps) {
                         if (existing.proto == m.proto &&
                             existing.wan_port == m.wan_port) {
                             duplicate = true;
@@ -840,17 +1228,16 @@ namespace vgww {
                         ++discarded;
                         continue;
                     }
-                    // Preserve identity across restarts when the file carries
-                    // one; otherwise mint a fresh id from the same counter.
-                    if (e.contains("id") && e["id"].is_number_unsigned()) {
-                        m.id = e["id"].get<uint64_t>();
-                        if (m.id >= next_rule_id_) {
-                            next_rule_id_ = m.id + 1;
-                        }
-                    } else {
-                        m.id = next_rule_id_++;
+                    // P82: the same identity twice in one document - the
+                    // latter copy is dropped and counted.
+                    if (0 != raw_id && !seen_port_ids.insert(raw_id).second) {
+                        ++discarded;
+                        continue;
                     }
-                    port_maps_.push_back(std::move(m));
+                    // Preserve identity across restarts; id 0 means "none"
+                    // and is minted by the caller (the parser stays pure).
+                    m.id = raw_id;
+                    doc.port_maps.push_back(std::move(m));
                 }
             }
             if (auto it = j.find("bans"); it != j.end() && it->is_array()) {
@@ -869,6 +1256,13 @@ namespace vgww {
                     }
                     if (e.contains("value") && e["value"].is_string()) {
                         b.value = e["value"].get<std::string>();
+                    }
+                    uint64_t raw_id = 0;
+                    if (e.contains("id") && e["id"].is_number_unsigned()) {
+                        raw_id = e["id"].get<uint64_t>();
+                    }
+                    if (0 != raw_id && doc.tombstones.count(raw_id) != 0) {
+                        continue;
                     }
                     // P8 deviation 1 (audit B): migrate a legacy non-canonical
                     // MAC
@@ -911,16 +1305,12 @@ namespace vgww {
                         ++discarded;   // same target, another spelling
                         continue;
                     }
-                    // batch138: preserve the persisted identity, else mint one.
-                    if (e.contains("id") && e["id"].is_number_unsigned()) {
-                        b.id = e["id"].get<uint64_t>();
-                        if (b.id >= next_ban_id_) {
-                            next_ban_id_ = b.id + 1;
-                        }
-                    } else {
-                        b.id = next_ban_id_++;
+                    if (0 != raw_id && !seen_ban_ids.insert(raw_id).second) {
+                        ++discarded;
+                        continue;
                     }
-                    bans_.push_back(std::move(b));
+                    b.id = raw_id;
+                    doc.bans.push_back(std::move(b));
                 }
             }
             if (auto it = j.find("ratelimits");
@@ -929,6 +1319,13 @@ namespace vgww {
                     RateLimitRule r;
                     if (e.contains("mac") && e["mac"].is_string()) {
                         r.mac = e["mac"].get<std::string>();
+                    }
+                    uint64_t raw_id = 0;
+                    if (e.contains("id") && e["id"].is_number_unsigned()) {
+                        raw_id = e["id"].get<uint64_t>();
+                    }
+                    if (0 != raw_id && doc.tombstones.count(raw_id) != 0) {
+                        continue;
                     }
                     // P8 deviation 1 (audit B): same legacy-MAC migration as
                     // bans. batch87: a MAC the data plane cannot parse is a
@@ -986,40 +1383,312 @@ namespace vgww {
                     // later (newer) values were silently ignored while the
                     // stale cap stayed in force. Mirror the upsert and count
                     // the collapse.
-                    bool upserted = false;
-                    for (auto& existing : rate_limits_) {
+                    RateLimitRule* target = nullptr;
+                    for (auto& existing : doc.rate_limits) {
                         if (0 ==
                             _stricmp(existing.mac.c_str(), r.mac.c_str())) {
-                            existing = std::move(r);
-                            ++discarded;
-                            upserted = true;
+                            target = &existing;
                             break;
                         }
                     }
-                    if (!upserted) {
-                        rate_limits_.push_back(std::move(r));
+                    if (nullptr != target) {
+                        // P82: the surviving entry keeps its identity.
+                        const uint64_t keep = target->id;
+                        *target = std::move(r);
+                        target->id = keep;
+                        ++discarded;
+                    } else {
+                        if (0 != raw_id &&
+                            !seen_rate_ids.insert(raw_id).second) {
+                            ++discarded;
+                            continue;
+                        }
+                        r.id = raw_id;
+                        doc.rate_limits.push_back(std::move(r));
                     }
                 }
             }
-            port_map_snapshot_ =
-                std::make_shared<std::vector<PortMappingRule>>(
-                    port_maps_);
-
-            ban_snapshot_ =
-                std::make_shared<std::vector<BanEntry>>(bans_);
-
-            rate_limit_snapshot_ =
-                std::make_shared<std::vector<RateLimitRule>>(
-                    rate_limits_);
-
-            rev_.fetch_add(1, std::memory_order_seq_cst);
-
             // batch34o: a dropped entry is a config/file mismatch the operator
             // must be able to see. The count travels out through the store so
             // the caller can log it; silence here is how a hand-edited file
             // becomes an invisible outage.
-            discarded_rules_ = discarded;
+            doc.discarded = discarded;
             return LoadOutcome::kOk;
+        }
+
+        size_t RuleStore::MergeRuleDocuments(
+            RuleDocument& memory, const RuleDocument& disk,
+            const std::function<uint64_t()>& mint_id) {
+            size_t dropped = 0;
+            // P82: tombstone union - memory's deletions first (in order), then
+            // the disk's that memory has not seen yet.
+            for (const uint64_t id : disk.tombstone_order) {
+                if (memory.tombstones.insert(id).second) {
+                    memory.tombstone_order.push_back(id);
+                }
+            }
+            const auto tombstoned = [&memory](uint64_t id) {
+                return 0 != id && memory.tombstones.count(id) != 0;
+            };
+            // Memory entries, minus the tombstoned ones.
+            {
+                std::vector<PortMappingRule> kept;
+                kept.reserve(memory.port_maps.size());
+                for (auto& m : memory.port_maps) {
+                    if (tombstoned(m.id)) {
+                        continue;
+                    }
+                    kept.push_back(std::move(m));
+                }
+                memory.port_maps = std::move(kept);
+            }
+            {
+                std::vector<BanEntry> kept;
+                kept.reserve(memory.bans.size());
+                for (auto& b : memory.bans) {
+                    if (tombstoned(b.id)) {
+                        continue;
+                    }
+                    kept.push_back(std::move(b));
+                }
+                memory.bans = std::move(kept);
+            }
+            {
+                std::vector<RateLimitRule> kept;
+                kept.reserve(memory.rate_limits.size());
+                for (auto& r : memory.rate_limits) {
+                    if (tombstoned(r.id)) {
+                        continue;
+                    }
+                    kept.push_back(std::move(r));
+                }
+                memory.rate_limits = std::move(kept);
+            }
+            // Disk-only entries: memory wins on the same id or the same
+            // identity; the rest are added (id 0 minted) until the cap.
+            for (const auto& m : disk.port_maps) {
+                if (tombstoned(m.id)) {
+                    continue;
+                }
+                bool duplicate = false;
+                for (const auto& existing : memory.port_maps) {
+                    if (0 != m.id && existing.id == m.id) {
+                        duplicate = true;
+                        break;
+                    }
+                    if (existing.proto == m.proto &&
+                        existing.wan_port == m.wan_port) {
+                        duplicate = true;
+                        break;
+                    }
+                }
+                if (duplicate) {
+                    continue;
+                }
+                if (memory.port_maps.size() >=
+                    ::vgww::core::limits::kMaxPortMaps) {
+                    ++dropped;
+                    continue;
+                }
+                PortMappingRule copy = m;
+                if (0 == copy.id) {
+                    copy.id = mint_id();
+                }
+                memory.port_maps.push_back(std::move(copy));
+            }
+            for (const auto& b : disk.bans) {
+                if (tombstoned(b.id)) {
+                    continue;
+                }
+
+                bool duplicate = false;
+                for (const auto& existing : memory.bans) {
+                    if (0 != b.id && existing.id == b.id) {
+                        duplicate = true;
+                        break;
+                    }
+                    if (existing.kind == b.kind &&
+                        BanTargetKey(existing) == BanTargetKey(b)) {
+                        duplicate = true;
+                        break;
+                    }
+                }
+                if (duplicate) {
+                    continue;
+                }
+                if (memory.bans.size() >= ::vgww::core::limits::kMaxBans) {
+                    ++dropped;
+                    continue;
+                }
+                BanEntry copy = b;
+                if (0 == copy.id) {
+                    copy.id = mint_id();
+                }
+                memory.bans.push_back(std::move(copy));
+            }
+            for (const auto& r : disk.rate_limits) {
+                if (tombstoned(r.id)) {
+                    continue;
+                }
+
+                bool duplicate = false;
+                for (const auto& existing : memory.rate_limits) {
+                    if (0 != r.id && existing.id == r.id) {
+                        duplicate = true;
+                        break;
+                    }
+                    if (0 == _stricmp(existing.mac.c_str(), r.mac.c_str())) {
+                        duplicate = true;
+                        break;
+                    }
+                }
+                if (duplicate) {
+                    continue;
+                }
+                if (memory.rate_limits.size() >=
+                    ::vgww::core::limits::kMaxRateLimits) {
+                    ++dropped;
+                    continue;
+                }
+                RateLimitRule copy = r;
+                if (0 == copy.id) {
+                    copy.id = mint_id();
+                }
+                memory.rate_limits.push_back(std::move(copy));
+            }
+            return dropped;
+        }
+
+        void RuleStore::AdoptDocumentLocked(RuleDocument& doc) {
+            // P82: entries without an identity get one now (the parser keeps
+            // id 0 so it stays pure); every identity is registered so a later
+            // mint cannot collide with it.
+            for (auto& m : doc.port_maps) {
+                if (0 == m.id) {
+                    m.id = MintRuleIdLocked();
+                }
+            }
+            for (auto& b : doc.bans) {
+                if (0 == b.id) {
+                    b.id = MintRuleIdLocked();
+                }
+            }
+            for (auto& r : doc.rate_limits) {
+                if (0 == r.id) {
+                    r.id = MintRuleIdLocked();
+                }
+            }
+            for (const auto& m : doc.port_maps) {
+                used_ids_.insert(m.id);
+            }
+            for (const auto& b : doc.bans) {
+                used_ids_.insert(b.id);
+            }
+            for (const auto& r : doc.rate_limits) {
+                used_ids_.insert(r.id);
+            }
+            port_maps_ = std::move(doc.port_maps);
+            bans_ = std::move(doc.bans);
+            rate_limits_ = std::move(doc.rate_limits);
+            tombstones_ = std::move(doc.tombstones);
+            tombstone_order_ = std::move(doc.tombstone_order);
+            port_map_snapshot_ =
+                std::make_shared<std::vector<PortMappingRule>>(port_maps_);
+            ban_snapshot_ =
+                std::make_shared<std::vector<BanEntry>>(bans_);
+            rate_limit_snapshot_ =
+                std::make_shared<std::vector<RateLimitRule>>(rate_limits_);
+            discarded_rules_ = doc.discarded;
+            rev_.fetch_add(1, std::memory_order_seq_cst);
+        }
+
+        RuleStore::LoadOutcome RuleStore::LoadLockedChecked() {
+            RuleDocument doc;
+            const LoadOutcome outcome = ReadRuleDocument(persist_path_, doc);
+            if (outcome != LoadOutcome::kOk) {
+                return outcome;
+            }
+            AdoptDocumentLocked(doc);
+            return LoadOutcome::kOk;
+        }
+
+        constexpr uint64_t kIdMarker = 1ull << 63;
+        constexpr uint64_t kSalt32Mask = 0xFFFFFFFFull;
+        constexpr uint64_t kCounter31Mask = (1ull << 31) - 1;
+
+        void RuleStore::EnsureSaltLocked() {
+            if (0 != id_salt_) {
+                return;
+            }
+            uint8_t bytes[4] = {};
+            uint64_t raw = 0;
+            if (core::CsprngBytes(bytes, sizeof(bytes))) {
+                for (size_t i = 0; i < sizeof(bytes); ++i) {
+                    raw = (raw << 8) | static_cast<uint64_t>(bytes[i]);
+                }
+            }
+            const uint64_t pid =
+#ifdef _WIN32
+                static_cast<uint64_t>(::GetCurrentProcessId());
+#else
+                static_cast<uint64_t>(::getpid());
+#endif
+            uint64_t salt = (raw & kSalt32Mask) ^ pid;
+            if (0 == salt) {
+                salt = 1;
+            }
+            id_salt_ = salt;
+        }
+
+        uint64_t RuleStore::MintRuleIdLocked() {
+            EnsureSaltLocked();
+            // P82: marker | salt32 | counter31. The counter is shared by all
+            // three rule kinds and starts at 1; 2^31 values is far beyond any
+            // real deployment, so there is no overflow path - used_ids_ is the
+            // guard. The loop only matters for a counter wrap or a hand-edited
+            // document that already used the value.
+            for (uint32_t guard = 0; guard < 4096; ++guard) {
+                const uint64_t id = kIdMarker | (id_salt_ << 31) |
+                                    (static_cast<uint64_t>(id_counter_) &
+                                     kCounter31Mask);
+                ++id_counter_;
+                if (used_ids_.insert(id).second) {
+                    return id;
+                }
+            }
+            // Unreachable in practice (4096 successive collisions): regenerate
+            // the salt so the process keeps making progress.
+            id_salt_ = 0;
+            EnsureSaltLocked();
+            id_counter_ = 2;
+            const uint64_t id = kIdMarker | (id_salt_ << 31) | 1ull;
+            used_ids_.insert(id);
+            return id;
+        }
+
+        bool RuleStore::AddTombstoneLocked(uint64_t id) {
+            if (0 == id) {
+                return false;
+            }
+            if (tombstones_.count(id) != 0) {
+                return true;   // already recorded
+            }
+            if (tombstones_.size() >= ::vgww::web::kMaxTombstones) {
+                return false;   // ceiling reached: refuse the deletion
+            }
+            tombstones_.insert(id);
+            tombstone_order_.push_back(id);
+            return true;
+        }
+
+        void RuleStore::SetRuleIdSaltForTest(uint64_t salt) {
+            std::lock_guard<std::mutex> lock(mutex_);
+            // Keep the salt inside the 32-bit field so the marker bit and the
+            // counter cannot be corrupted by an over-wide test value.
+            const uint64_t masked = salt & kSalt32Mask;
+            id_salt_ = (0 == masked) ? 1 : masked;
+            id_counter_ = 1;
+            used_ids_.clear();
         }
 
         RuleList<PortMappingRule> RuleStore::PortMaps() const {
@@ -1057,7 +1726,8 @@ namespace vgww {
                     duplicate = true;  // treated as a refusal by the caller
                 }
                 if (!duplicate) {
-                    assigned = next_rule_id_++;
+                    // P82: process-unique identity (marker | salt32 | counter31).
+                    assigned = MintRuleIdLocked();
                     rule.id = assigned;
                     port_maps_.push_back(std::move(rule));
                     port_map_snapshot_ =
@@ -1073,6 +1743,12 @@ namespace vgww {
         }
 
         bool RuleStore::RemovePortMapById(uint64_t id) {
+            bool ignored = false;
+            return RemovePortMapById(id, ignored);
+        }
+
+        bool RuleStore::RemovePortMapById(uint64_t id, bool& refused) {
+            refused = false;
             if (0 == id) {
                 return false;
             }
@@ -1082,6 +1758,14 @@ namespace vgww {
                 for (auto it = port_maps_.begin(); it != port_maps_.end();
                      ++it) {
                     if (it->id == id) {
+                        // P82: record the deletion durably. When the tombstone
+                        // ceiling is reached the removal is refused whole -
+                        // the rule stays in memory and on disk, so a concurrent
+                        // writer cannot resurrect it.
+                        if (!AddTombstoneLocked(it->id)) {
+                            refused = true;
+                            return false;
+                        }
                         port_maps_.erase(it);
                         port_map_snapshot_ =
                             std::make_shared<std::vector<PortMappingRule>>(
@@ -1103,10 +1787,20 @@ namespace vgww {
         }
 
         bool RuleStore::RemovePortMapChecked(size_t index) {
+            bool ignored = false;
+            return RemovePortMapChecked(index, ignored);
+        }
+
+        bool RuleStore::RemovePortMapChecked(size_t index, bool& refused) {
+            refused = false;
             bool changed = false;
             {
                 std::lock_guard<std::mutex> lock(mutex_);
                 if (index < port_maps_.size()) {
+                    if (!AddTombstoneLocked(port_maps_[index].id)) {
+                        refused = true;
+                        return false;
+                    }
                     port_maps_.erase(port_maps_.begin() +
                                      static_cast<ptrdiff_t>(index));
                     port_map_snapshot_ =
@@ -1168,7 +1862,8 @@ namespace vgww {
                 if (bans_.size() < ::vgww::core::limits::kMaxBans) {
                     // batch138: assign the stable identity under this same
                     // lock, exactly like AddPortMapTracked does for rules.
-                    ban.id = next_ban_id_++;
+                    // P82: process-unique identity (marker | salt32 | counter31).
+                    ban.id = MintRuleIdLocked();
                     bans_.push_back(std::move(ban));
 
                     ban_snapshot_ =
@@ -1189,6 +1884,12 @@ namespace vgww {
         }
 
         bool RuleStore::RemoveBanById(uint64_t id) {
+            bool ignored = false;
+            return RemoveBanById(id, ignored);
+        }
+
+        bool RuleStore::RemoveBanById(uint64_t id, bool& refused) {
+            refused = false;
             if (0 == id) {
                 return false;
             }
@@ -1197,6 +1898,11 @@ namespace vgww {
                 std::lock_guard<std::mutex> lock(mutex_);
                 for (auto it = bans_.begin(); it != bans_.end(); ++it) {
                     if (it->id == id) {
+                        // P82: durable tombstone; refused whole at the ceiling.
+                        if (!AddTombstoneLocked(it->id)) {
+                            refused = true;
+                            return false;
+                        }
                         bans_.erase(it);
                         ban_snapshot_ =
                             std::make_shared<std::vector<BanEntry>>(bans_);
@@ -1213,11 +1919,21 @@ namespace vgww {
         }
 
         bool RuleStore::RemoveBanChecked(size_t index) {
+            bool ignored = false;
+            return RemoveBanChecked(index, ignored);
+        }
+
+        bool RuleStore::RemoveBanChecked(size_t index, bool& refused) {
+            refused = false;
             bool changed = false;
             {
                 std::lock_guard<std::mutex> lock(mutex_);
 
                 if (index < bans_.size()) {
+                    if (!AddTombstoneLocked(bans_[index].id)) {
+                        refused = true;
+                        return false;
+                    }
                     bans_.erase(bans_.begin() + static_cast<ptrdiff_t>(index));
 
                     ban_snapshot_ =
@@ -1250,7 +1966,12 @@ namespace vgww {
                 bool upserted = false;
                 for (auto& existing : rate_limits_) {
                     if (0 == _stricmp(existing.mac.c_str(), rule.mac.c_str())) {
+                        // P82: the upsert must not lose the stable identity -
+                        // a caller-supplied id 0 would make the rule
+                        // unreachable (and re-mint on every edit).
+                        const uint64_t keep = existing.id;
                         existing = std::move(rule);  // upsert
+                        existing.id = keep;
 
                         rate_limit_snapshot_ =
                             std::make_shared<std::vector<RateLimitRule>>(
@@ -1269,6 +1990,8 @@ namespace vgww {
                     // the lock required callers to re-implement this scan.
                     if (rate_limits_.size() <
                         ::vgww::core::limits::kMaxRateLimits) {
+                        // P82: process-unique identity.
+                        rule.id = MintRuleIdLocked();
                         rate_limits_.push_back(std::move(rule));
 
                         rate_limit_snapshot_ =
@@ -1334,6 +2057,14 @@ namespace vgww {
                     for (auto it = rate_limits_.begin();
                          it != rate_limits_.end(); ++it) {
                         if (0 == _stricmp(it->mac.c_str(), old_mac.c_str())) {
+                            // P82: a MAC change deletes the old rule, so its
+                            // identity is tombstoned. At the ceiling the whole
+                            // change is refused - a rename is a deletion too,
+                            // and dropping the tombstone would let a concurrent
+                            // writer resurrect the old rule.
+                            if (!AddTombstoneLocked(it->id)) {
+                                return false;
+                            }
                             rate_limits_.erase(it);
                             break;
                         }
@@ -1342,12 +2073,17 @@ namespace vgww {
                 bool upserted = false;
                 for (auto& existing : rate_limits_) {
                     if (0 == _stricmp(existing.mac.c_str(), rule.mac.c_str())) {
+                        // P82: an upsert keeps the identity it already has.
+                        const uint64_t keep = existing.id;
                         existing = std::move(rule);
+                        existing.id = keep;
                         upserted = true;
                         break;
                     }
                 }
                 if (!upserted) {
+                    // P82: the new entry gets a fresh process-unique id.
+                    rule.id = MintRuleIdLocked();
                     rate_limits_.push_back(std::move(rule));
                 }
                 rate_limit_snapshot_ =
@@ -1362,6 +2098,12 @@ namespace vgww {
         }
 
         bool RuleStore::RemoveRateLimit(const std::string& mac) {
+            bool ignored = false;
+            return RemoveRateLimit(mac, ignored);
+        }
+
+        bool RuleStore::RemoveRateLimit(const std::string& mac, bool& refused) {
+            refused = false;
             bool changed = false;
             {
                 std::lock_guard<std::mutex> lock(mutex_);
@@ -1369,6 +2111,11 @@ namespace vgww {
                 for (size_t i = 0; i < rate_limits_.size(); ++i) {
                     if (0 == _stricmp(rate_limits_[i].mac.c_str(),
                                       mac.c_str())) {
+                        // P82: durable tombstone; refused whole at the ceiling.
+                        if (!AddTombstoneLocked(rate_limits_[i].id)) {
+                            refused = true;
+                            return false;
+                        }
                         rate_limits_.erase(rate_limits_.begin() +
                                            static_cast<ptrdiff_t>(i));
 
@@ -1404,7 +2151,8 @@ namespace vgww {
                      AutostartSetter autostart_setter,
                      AuditLog audit_log,
                      ConfigApplier config_applier,
-                     std::shared_ptr<ConfigApplyStatus> apply_status) {
+                     std::shared_ptr<ConfigApplyStatus> apply_status,
+                     ConsoleDroppedProvider console_dropped) {
             // Persist rules next to the config so port-maps/bans/rate-limits
             // survive process restarts.
             {
@@ -1488,8 +2236,10 @@ namespace vgww {
                     });
             }
             server.Route("GET", "/api/status",
-                         [&dataplane, &config](const Request&) {
+                         [&dataplane, &config, &server](const Request&) {
                              const auto& stats = dataplane.GetStats();
+                             const auto portmap = dataplane.GetPortmapStats();
+                             const auto binding = dataplane.GetAdapterBinding();
                              std::ostringstream json;
                              json << "{\"gateway\":{\"ip\":\""
                                   << IpToString(config.gateway.ipv4)
@@ -1516,8 +2266,103 @@ namespace vgww {
                                   << stats.rx_vlan_frames.load()
                                   << ",\"tx_vlan_frames\":"
                                   << stats.tx_vlan_frames.load()
+                                  // batch128: capacity-boundary faults the
+                                  // native UI surfaces (bridge page) but the
+                                  // WebUI status poll never carried.
+                                  << ",\"udp_flow_evictions\":"
+                                  << dataplane.UdpFlowEvictions()
+                                  // Firewall counters: an exception swallowed
+                                  // per event (one dial/connection lost, the
+                                  // thread lives) and the fatal-escape count.
+                                  << ",\"thread_errors\":"
+                                  << stats.thread_errors.load()
+                                  << ",\"handler_errors\":"
+                                  << stats.handler_errors.load()
+                                  // batch129: the failure TEXT was native-UI-only
+                                  // (UiSnapshot); the WebUI had counters but no
+                                  // reason. Empty when healthy.
+                                  << "},\"dataplane_error\":\""
+                                  << JsonEscaped(dataplane.LastError())
+                                  << "\",\"bridge_error\":\""
+                                  << JsonEscaped(dataplane.GetBridgeError())
+                                  // batch130: runtime state and the adapter the
+                                  // plane actually bound were native-UI-only;
+                                  // the WebUI could not tell "stopped" from
+                                  // "running with no adapter".
+                                  << "\",\"dataplane_running\":"
+                                  << (dataplane.IsRunning() ? "true"
+                                                            : "false")
+                                  << ",\"dhcp_active\":"
+                                  << (dataplane.DhcpActive() ? "true"
+                                                             : "false")
+                                  << ",\"dhcp6_active\":"
+                                  << (dataplane.Dhcp6Active() ? "true"
+                                                              : "false")
+                                  << ",\"adapter_name\":\""
+                                  << JsonEscaped(binding.friendly_name)
+                                  << "\",\"adapter_link_up\":"
+                                  << ((binding.is_up &&
+                                       binding.media_connected)
+                                          ? "true"
+                                          : "false")
+                                  << ",\"portmap_health\":{\"accepted\":"
+                                  << portmap.accepted
+                                  << ",\"dial_failed\":" << portmap.dial_failed
+                                  << ",\"accept_errors\":"
+                                  << portmap.accept_errors
+                                  << ",\"bind_failed\":" << portmap.bind_failed
+                                  << ",\"handler_errors\":"
+                                  << portmap.handler_errors
+                                  << ",\"loop_errors\":" << portmap.loop_errors
+                                  << ",\"rearm_errors\":"
+                                  << portmap.rearm_errors
+                                  << ",\"escaped_handler_errors\":"
+                                  << portmap.escaped_handler_errors
                                   << "},\"dhcp\":{\"leases\":"
                                   << dataplane.DhcpLeaseCount()
+                                  // batch86: a paused writer is the visible
+                                  // answer to "why do my changes disappear on
+                                  // restart" - the lease file exists but could
+                                  // not be read, so it is deliberately kept.
+                                  << ",\"persistence_paused\":"
+                                  << (dataplane.DhcpPersistBlocked() ? "true"
+                                                                    : "false")
+                                  // batch100: a failed periodic/stop snapshot
+                                  // is a count, not a boolean - the operator
+                                  // can tell "never written" from "paused".
+                                  << ",\"persist_failures\":"
+                                  << dataplane.DhcpPersistFailureCount()
+                                  // batch101: the previous Stop could not
+                                  // write the lease document (e.g. during a
+                                  // live config apply); the leases it held are
+                                  // gone, and this survives the restart.
+                                  << ",\"stop_persist_failed\":"
+                                  << (dataplane.StopPersistFailed() ? "true"
+                                                                    : "false")
+                                  // batch105: the v4 pool-exhaustion counter
+                                  // was only visible in the native UI; the
+                                  // status surface carries it like dhcp6 does.
+                                  << ",\"pool_exhausted\":"
+                                  << dataplane.DhcpPoolExhaustedCount()
+                                  // batch119: lease entries dropped at load
+                                  // (malformed / expired / outside LAN /
+                                  // reserved / duplicate address) were silent.
+                                  << ",\"leases_dropped\":"
+                                  << dataplane.DhcpDroppedLeaseCount()
+                                  // batch120: the document was corrupt and
+                                  // preserved aside; mappings did not survive.
+                                  << ",\"leases_corrupt\":"
+                                  << (dataplane.DhcpLeaseFileCorrupt()
+                                          ? "true"
+                                          : "false")
+                                  // batch121: frames refused by strict parse
+                                  // validation were counted but never shown.
+                                  << ",\"parse_rejected\":"
+                                  << dataplane.DhcpParseRejectedCount()
+                                  // batch128: rate-limited DHCP replies were
+                                  // counted but only visible in the native UI.
+                                  << ",\"rate_limit_resets\":"
+                                  << dataplane.DhcpRateLimitResets()
                                   // batch152: this endpoint is the dashboard's
                                   // 2 s poll, so its body must stay O(1) in
                                   // size. The v6 lease LIST used to be embedded
@@ -1528,8 +2373,29 @@ namespace vgww {
                                   // Only the counters remain.
                                   << "},\"dhcp6\":{\"leases6_count\":"
                                   << dataplane.Dhcp6LeaseCount()
+                                  << ",\"persistence_paused\":"
+                                  << (dataplane.Dhcp6PersistBlocked() ? "true"
+                                                                     : "false")
+                                  << ",\"persist_failures\":"
+                                  << dataplane.Dhcp6PersistFailureCount()
+                                  // batch104: v6 pool exhaustion had no
+                                  // surface either; the client that got no
+                                  // address left no trace.
+                                  << ",\"pool_exhausted\":"
+                                  << dataplane.Dhcp6PoolExhaustedCount()
+                                  << ",\"leases_dropped\":"
+                                  << dataplane.Dhcp6DroppedLeaseCount()
+                                  << ",\"leases_corrupt\":"
+                                  << (dataplane.Dhcp6LeaseFileCorrupt()
+                                          ? "true"
+                                          : "false")
+                                  << ",\"parse_rejected\":"
+                                  << dataplane.Dhcp6ParseRejectedCount()
                                   << ",\"bindings6_count\":"
                                   << dataplane.Dhcp6BindingCount()
+                                  // batch128: v6 sibling of dhcp.rate_limit_resets.
+                                  << ",\"rate_limit_resets\":"
+                                  << dataplane.Dhcp6RateLimitResets()
                                   // batch152: "bridge" is a TOP-LEVEL member.
                                   // It had drifted inside "dhcp6", so the
                                   // WebUI's st.bridge was undefined and the whole
@@ -1548,7 +2414,33 @@ namespace vgww {
                                   << ",\"state\":\""
                                   << BridgeStateName(
                                          dataplane.GetBridgeState())
-                                  << "\"}}";
+                                  // batch128: bridge MAC-table evictions and
+                                  // flood-guard neighbour rejections were
+                                  // native-UI-only surfaces.
+                                  << "\",\"mac_evictions\":"
+                                  << dataplane.GetBridgeMacEvictions()
+                                  << ",\"neighbor_rejections\":"
+                                  << dataplane.GetNeighborRejections()
+                                  << "},\"web\":{\"handler_errors\":"
+                                  << server.HandlerErrors()
+                                  << ",\"rearm_errors\":" << server.RearmErrors()
+                                  << ",\"escaped_handler_errors\":"
+                                  << server.EscapedHandlerErrors()
+                                  // batch86: rule-file persistence health:
+                                  // blocked = the file exists but could not be
+                                  // read, so writes are paused (the file is
+                                  // never overwritten in that state).
+                                  << "},\"rules\":{\"persist_failures\":"
+                                  << RuleStore::Instance().PersistFailureCount()
+                                  << ",\"persist_blocked\":"
+                                  << (RuleStore::Instance().PersistBlocked()
+                                          ? "true"
+                                          : "false")
+                                  << ",\"recoveries\":"
+                                  << RuleStore::Instance().RecoveryCount()
+                                  << ",\"discarded\":"
+                                  << RuleStore::Instance().DiscardedOnLastLoad()
+                                  << "}}";
                              return Response::Json(json.str());
                          });
 
@@ -1697,7 +2589,7 @@ namespace vgww {
             //      token never reaches the snapshot";
             //   2. at most the last 2000 lines (bounded response).
             server.Route("GET", "/api/console",
-                         [console_provider](const Request&) {
+                         [console_provider, console_dropped](const Request&) {
                              if (!console_provider) {
                                  return Response::Json(
                                      "{\"text\":\"\",\"count\":0,"
@@ -1742,7 +2634,12 @@ namespace vgww {
                              std::ostringstream out;
                              out << "{\"text\":\"" << JsonEscaped(text)
                                  << "\",\"count\":" << (kept.size() - from)
-                                 << ",\"available\":true}";
+                                 << ",\"available\":true"
+                                 // batch126: evicted lines are a silent loss
+                                 // until the count is visible.
+                                 << ",\"dropped\":"
+                                 << (console_dropped ? console_dropped() : 0)
+                                 << "}";
                              return Response::Json(out.str());
                          });
 
@@ -2004,7 +2901,7 @@ namespace vgww {
                 return Response::Json(json.str());
             });
 
-            server.Route("POST", "/api/portmap", [](const Request& request) {
+            server.Route("POST", "/api/portmap", [audit](const Request& request) {
                 PortMappingRule rule;
                 rule.proto = "tcp";
                 std::string value;
@@ -2076,13 +2973,16 @@ namespace vgww {
                 if (RuleStore::Instance().PortMapCount() >= ::vgww::core::limits::kMaxPortMaps) {
                     return Response::Error(400, "too many portmaps");
                 }
+                audit("portmap add " + rule.proto + ":" +
+                      std::to_string(rule.wan_port) + " -> " + rule.lan_ip +
+                      ":" + std::to_string(rule.lan_port));
                 if (!RuleStore::Instance().AddPortMap(std::move(rule))) {
                     return Response::Error(400, "wan endpoint already mapped");
                 }
-                return Response::Json("{\"ok\":true}");
+                return OkWithPersist();
             });
 
-            server.Route("DELETE", "/api/portmap", [](const Request& request) {
+            server.Route("DELETE", "/api/portmap", [audit](const Request& request) {
                 RuleStore& store = RuleStore::Instance();
                 // batch138: id is the authoritative handle. A rule's POSITION
                 // shifts whenever anything is added or removed, so a client
@@ -2096,10 +2996,18 @@ namespace vgww {
                     if (!ParseListIndex(by_id->second, id) || 0 == id) {
                         return Response::Error(400, "invalid id");
                     }
-                    if (!store.RemovePortMapById(id)) {
-                        return Response::Error(404, "no such id");
+                    // P82: a removal refused because the tombstone store is
+                    // full is a server-side failure (500), NOT a missing rule
+                    // (404) - the caller must not read it as "already gone".
+                    bool refused = false;
+                    if (!store.RemovePortMapById(id, refused)) {
+                        return Response::Error(
+                            refused ? 500 : 404,
+                            refused ? "rule tombstone store is full"
+                                    : "no such id");
                     }
-                    return Response::Json("{\"ok\":true}");
+                    audit("portmap delete id=" + std::to_string(id));
+                    return OkWithPersist();
                 }
                 const auto it = request.query.find("index");
                 if (request.query.end() == it) {
@@ -2115,10 +3023,15 @@ namespace vgww {
                 // batch34d: one lock does the range check AND the erase. The
                 // old two-step (size() then remove) let a concurrent add shift
                 // the indices, so this request deleted a DIFFERENT rule.
-                if (!store.RemovePortMapChecked(index)) {
-                    return Response::Error(404, "no such index");
+                bool refused = false;
+                if (!store.RemovePortMapChecked(index, refused)) {
+                    return Response::Error(
+                        refused ? 500 : 404,
+                        refused ? "rule tombstone store is full"
+                                : "no such index");
                 }
-                return Response::Json("{\"ok\":true}");
+                audit("portmap delete index=" + std::to_string(index));
+                return OkWithPersist();
             });
 
             server.Route("GET", "/api/bans", [](const Request&) {
@@ -2136,7 +3049,7 @@ namespace vgww {
                 return Response::Json(json.str());
             });
 
-            server.Route("POST", "/api/bans", [](const Request& request) {
+            server.Route("POST", "/api/bans", [audit](const Request& request) {
                 BanEntry ban;
                 if (!JsonGetString(request.body, "kind", ban.kind) ||
                     !JsonGetString(request.body, "value", ban.value)) {
@@ -2169,13 +3082,14 @@ namespace vgww {
                 // (AddBanChecked). The old route read Bans().size() out here,
                 // so a concurrent UI/web writer could pass its own check and
                 // overrun the cap between this read and the insert.
+                audit("ban add " + ban.kind + " " + ban.value);
                 if (!RuleStore::Instance().AddBanChecked(std::move(ban))) {
                     return Response::Error(400, "too many bans");
                 }
-                return Response::Json("{\"ok\":true}");
+                return OkWithPersist();
             });
 
-            server.Route("DELETE", "/api/bans", [](const Request& request) {
+            server.Route("DELETE", "/api/bans", [audit](const Request& request) {
                 RuleStore& store = RuleStore::Instance();
                 // batch138: same id-first contract as /api/portmap.
                 if (const auto by_id = request.query.find("id");
@@ -2184,10 +3098,16 @@ namespace vgww {
                     if (!ParseListIndex(by_id->second, id) || 0 == id) {
                         return Response::Error(400, "invalid id");
                     }
-                    if (!store.RemoveBanById(id)) {
-                        return Response::Error(404, "no such id");
+                    // P82: tombstone-full is a 500, not a 404.
+                    bool refused = false;
+                    if (!store.RemoveBanById(id, refused)) {
+                        return Response::Error(
+                            refused ? 500 : 404,
+                            refused ? "rule tombstone store is full"
+                                    : "no such id");
                     }
-                    return Response::Json("{\"ok\":true}");
+                    audit("ban delete id=" + std::to_string(id));
+                    return OkWithPersist();
                 }
                 const auto it = request.query.find("index");
                 if (request.query.end() == it) {
@@ -2198,7 +3118,7 @@ namespace vgww {
                 // first ban - a plausible-but-broken fake success. batch108:
                 // both routes now share ParseListIndex, because the old
                 // hand-rolled guard here missed the empty and signed forms for
-                // exactly the reason it missed them there.
+                // the exact reason it missed them there.
                 size_t index = 0;
                 if (!ParseListIndex(it->second, index)) {
                     return Response::Error(400, "invalid index");
@@ -2208,10 +3128,15 @@ namespace vgww {
                 // Bans().size() under lock #1 and then erased under lock #2, so
                 // a concurrent delete could make the erase a silent no-op while
                 // this route still answered {"ok":true}.
-                if (!store.RemoveBanChecked(index)) {
-                    return Response::Error(404, "no such index");
+                bool refused = false;
+                if (!store.RemoveBanChecked(index, refused)) {
+                    return Response::Error(
+                        refused ? 500 : 404,
+                        refused ? "rule tombstone store is full"
+                                : "no such index");
                 }
-                return Response::Json("{\"ok\":true}");
+                audit("ban delete index=" + std::to_string(index));
+                return OkWithPersist();
             });
 
             server.Route("GET", "/api/ratelimit", [](const Request&) {
@@ -2229,7 +3154,7 @@ namespace vgww {
                 return Response::Json(json.str());
             });
 
-            server.Route("POST", "/api/ratelimit", [](const Request& request) {
+            server.Route("POST", "/api/ratelimit", [audit](const Request& request) {
                 RateLimitRule rule;
                 if (!JsonGetString(request.body, "mac", rule.mac)) {
                     return Response::Error(400, "mac required");
@@ -2300,23 +3225,30 @@ namespace vgww {
                     if (!core::ParseMac(replace_mac, old_parsed)) {
                         return Response::Error(400, "invalid replace_mac");
                     }
+                    audit("ratelimit set " + rule.mac + " up=" +
+                          std::to_string(rule.uplink_kbps) + " down=" +
+                          std::to_string(rule.downlink_kbps) + " replace=" +
+                          replace_mac);
                     if (!RuleStore::Instance().ReplaceRateLimitChecked(
                             CanonicalMac(old_parsed), std::move(rule))) {
                         return Response::Error(400, "too many ratelimits");
                     }
-                    return Response::Json("{\"ok\":true}");
+                    return OkWithPersist();
                 }
                 // batch89: the upsert decision, the cap test and the insert all
                 // happen inside ONE lock, so replacing an existing MAC is never
                 // mistaken for growth (it does not need cap headroom) and two
                 // concurrent inserters cannot both slip past the cap.
+                audit("ratelimit set " + rule.mac + " up=" +
+                      std::to_string(rule.uplink_kbps) + " down=" +
+                      std::to_string(rule.downlink_kbps));
                 if (!RuleStore::Instance().SetRateLimitChecked(std::move(rule))) {
                     return Response::Error(400, "too many ratelimits");
                 }
-                return Response::Json("{\"ok\":true}");
+                return OkWithPersist();
             });
 
-            server.Route("DELETE", "/api/ratelimit", [](const Request& request) {
+            server.Route("DELETE", "/api/ratelimit", [audit](const Request& request) {
                 const auto it = request.query.find("mac");
                 if (request.query.end() == it) {
                     return Response::Error(400, "mac required");
@@ -2334,11 +3266,17 @@ namespace vgww {
                 // batch40 (live CRUD audit): mirror the portmap/ban DELETEs -
                 // a delete that matched nothing must NOT report success (the
                 // old unconditional {"ok":true} was a plausible-but-broken fake
-                // and inconsistent with the other rule lists).
-                if (!RuleStore::Instance().RemoveRateLimit(mac)) {
-                    return Response::Error(404, "no such index");
+                // and inconsistent with the other rule lists). P82: a removal
+                // refused because the tombstone store is full is a 500.
+                bool refused = false;
+                if (!RuleStore::Instance().RemoveRateLimit(mac, refused)) {
+                    return Response::Error(
+                        refused ? 500 : 404,
+                        refused ? "rule tombstone store is full"
+                                : "no such index");
                 }
-                return Response::Json("{\"ok\":true}");
+                audit("ratelimit delete " + mac);
+                return OkWithPersist();
             });
 
             // ---- DHCPv4 (S2): lease snapshot + static-binding CRUD ----
@@ -2385,7 +3323,7 @@ namespace vgww {
                          });
 
             server.Route("POST", "/api/dhcp/bindings",
-                         [&dataplane](const Request& request) {
+                         [&dataplane, config_path, audit](const Request& request) {
                              // batch41 (live CRUD audit): while the service is
                              // stopped there is no DHCP server to bind into;
                              // say "service not running" instead of the old
@@ -2422,19 +3360,24 @@ namespace vgww {
                              if (existing.size() >=
                                  ::vgww::core::limits::kMaxStaticBindings) {
                                  return Response::Error(400, "too many bindings");
-                            }
-                            if (!dataplane.SetDhcpBinding(mac, ip, hostname)) {
-                                // batch111: the store now also rejects a
-                                // hostname longer than a DHCP option value,
-                                // so name it instead of blaming only mac/ip.
-                                return Response::Error(
-                                    400, "invalid mac/ip or hostname too long");
-                            }
-                            return Response::Json("{\"ok\":true}");
+                             }
+                             if (!dataplane.SetDhcpBinding(mac, ip, hostname)) {
+                                 // batch111: the store now also rejects a
+                                 // hostname longer than a DHCP option value,
+                                 // so name it instead of blaming only mac/ip.
+                                 return Response::Error(
+                                     400, "invalid mac/ip or hostname too long");
+                             }
+                             // batch93: the runtime change is live; also record
+                             // it in the config so a restart keeps it.
+                             audit("dhcp binding add " + mac + " -> " + ip);
+                             const bool persisted = PersistDhcpBindingV4(
+                                 config_path, mac, ip, hostname, false);
+                             return OkWithPersistFlag(persisted);
                         });
 
             server.Route("DELETE", "/api/dhcp/bindings",
-                         [&dataplane](const Request& request) {
+                         [&dataplane, config_path, audit](const Request& request) {
                              if (!dataplane.DhcpActive()) {
                                  return Response::Error(409,
                                                         "service not running");
@@ -2446,8 +3389,12 @@ namespace vgww {
                              if (!dataplane.RemoveDhcpBinding(it->second)) {
                                  return Response::Error(404, "binding not found");
                              }
-                             return Response::Json("{\"ok\":true}");
-                         });
+                             audit("dhcp binding delete " + it->second);
+                             const bool persisted = PersistDhcpBindingV4(
+                                 config_path, it->second, std::string(),
+                                 std::string(), true);
+                             return OkWithPersistFlag(persisted);
+                        });
 
             // batch152: the v6 lease LIST moved off /api/status (which the
             // WebUI polls every 2 s) onto its own endpoint, mirroring
@@ -2503,7 +3450,7 @@ namespace vgww {
                          });
 
             server.Route("POST", "/api/dhcp6/bindings",
-                         [&dataplane](const Request& request) {
+                         [&dataplane, config_path, audit](const Request& request) {
                              if (!dataplane.Dhcp6Active()) {
                                  return Response::Error(409,
                                                         "service not running");
@@ -2544,16 +3491,19 @@ namespace vgww {
                              if (existing.size() >=
                                  ::vgww::core::limits::kMaxStaticBindings6) {
                                  return Response::Error(400, "too many bindings");
-                            }
-                            if (!dataplane.SetDhcp6Binding(duid, ip, hostname)) {
-                                return Response::Error(
-                                    400, "invalid duid/ip or hostname too long");
-                            }
-                            return Response::Json("{\"ok\":true}");
+                             }
+                             if (!dataplane.SetDhcp6Binding(duid, ip, hostname)) {
+                                 return Response::Error(
+                                     400, "invalid duid/ip or hostname too long");
+                             }
+                             audit("dhcp6 binding add " + duid + " -> " + ip);
+                             const bool persisted = PersistDhcpBindingV6(
+                                 config_path, duid, ip, hostname, false);
+                             return OkWithPersistFlag(persisted);
                         });
 
             server.Route("DELETE", "/api/dhcp6/bindings",
-                         [&dataplane](const Request& request) {
+                         [&dataplane, config_path, audit](const Request& request) {
                              if (!dataplane.Dhcp6Active()) {
                                  return Response::Error(409,
                                                         "service not running");
@@ -2565,24 +3515,23 @@ namespace vgww {
                              if (!dataplane.RemoveDhcp6Binding(it->second)) {
                                  return Response::Error(404, "binding not found");
                              }
-                             return Response::Json("{\"ok\":true}");
-                         });
+                             audit("dhcp6 binding delete " + it->second);
+                             const bool persisted = PersistDhcpBindingV6(
+                                 config_path, it->second, std::string(),
+                                 std::string(), true);
+                             return OkWithPersistFlag(persisted);
+                        });
 
             server.Route("POST", "/api/config",
-                         [config_path, &config, config_applier, apply_status](
+                         [config_path, &config, config_applier, apply_status, audit](
                              const Request& request) {
                              // Validate the submitted JSON is a loadable
                              // config before touching the file on disk.
                              std::string error;
-                            // U1: unique temp name per write, taken from the
-                            // SAME process-wide sequence the UI writer
-                            // (Config::SaveToFile) uses. A per-TU counter
-                            // here would restart at 0 and collide with the UI
-                            // writer's `<path>.tmp.<pid>.0`. The atomic
-                            // replace below still publishes a complete file.
-                            const std::string tmp =
-                                core::Config::MakeUniqueSiblingPath(
-                                    config_path);
+                            // The durable write (unique temp, checked device
+                            // flush, validate, atomic replace) is shared with
+                            // the UI writer and the rule store: one place,
+                            // one durability discipline (C6/C9).
                              // The GET schema intentionally never emits the
                              // auth token (secret boundary). A full-replacement
                              // POST therefore arrives WITHOUT it - blindly
@@ -2647,13 +3596,24 @@ namespace vgww {
                                 std::string load_error;
                                 const auto applied = core::Config::LoadFromFile(
                                     config_path, load_error);
-                                if (config_applier && applied.has_value() &&
-                                    config_applier(*applied)) {
+                                // batch111/113: stamp the attempt BEFORE the
+                                // applier runs (a fast worker can record its
+                                // outcome before this returns), but ONLY when an
+                                // applier exists and the saved document loaded.
+                                // Stamping without a recorder leaves
+                                // completed_id behind forever: any page already
+                                // polling would see a permanently pending apply.
+                                if (!config_applier || !applied.has_value()) {
+                                return Response::Json(
+                                    "{\"ok\":true,\"note\":\"applies on "
+                                    "restart\"}");
+                                }
+                                const uint64_t apply_id =
+                                    apply_status ? apply_status->MarkAttempt() : 0;
+                                if (config_applier(*applied, apply_id)) {
                                     // batch38: stamp the live-apply attempt so
                                     // the page can poll its outcome.
                                     if (apply_status) {
-                                        const uint64_t apply_id =
-                                            apply_status->MarkAttempt();
                                         return Response::Json(
                                             "{\"ok\":true,\"note\":\"applied\","
                                             "\"apply_id\":" +
@@ -2662,147 +3622,211 @@ namespace vgww {
                                     return Response::Json(
                                         "{\"ok\":true,\"note\":\"applied\"}");
                                 }
+                                // batch114: the applier refused the save
+                                // (no worker will run). Close the attempt we
+                                // stamped so no page is left polling forever.
+                                if (apply_status && 0 != apply_id) {
+                                    apply_status->Record(
+                                        apply_id, false,
+                                        "apply unavailable; applies on "
+                                        "restart");
+                                }
                                 return Response::Json(
                                     "{\"ok\":true,\"note\":\"applies on restart\"}");
                             };
- #ifdef _WIN32
+                              // batch112: a binding added at runtime AFTER this
+                              // page was rendered is on disk but not in the
+                              // submitted document. A full-document replace used
+                              // to erase it (the settings page silently undid a
+                              // freshly added static binding). Keep unmentioned
+                              // disk bindings, exactly like
+                              // Config::SaveToFilePreservingBindings does for
+                              // the native UI. Deletions go through the DELETE
+                              // endpoints, not through this body.
                               {
-                                  std::wstring wtmp = ToWideLongPath(tmp);
-
-                                  if (!wtmp.empty())
-                                  {
-                                      FILE* f = nullptr;
-
-                                      if (0 != ::_wfopen_s(&f, wtmp.c_str(), L"wb") || nullptr == f)
-                                      {
-                                          return Response::Error(500, "cannot open config");
+                                  nlohmann::json submitted;
+                                  bool parsed_ok = false;
+                                  try {
+                                      submitted =
+                                          nlohmann::json::parse(body);
+                                      parsed_ok = submitted.is_object();
+                                  } catch (const std::exception&) {
+                                      parsed_ok = false;
+                                  }
+                                  std::string disk_error;
+                                  const auto disk = parsed_ok
+                                      ? core::Config::LoadFromFile(
+                                            config_path, disk_error)
+                                      : std::optional<core::Config>();
+                                  if (disk.has_value()) {
+                                      // batch117: count disk-only bindings that
+                                      // cannot be merged (the document is at
+                                      // the cap). Dropping them silently is
+                                      // the P65 defect on the Web path.
+                                      size_t dropped = 0;
+                                      auto& dhcp = submitted["dhcp"];
+                                      if (!dhcp.is_object()) {
+                                          dhcp = nlohmann::json::object();
                                       }
-
-                                      size_t written = ::fwrite(body.data(), 1, body.size(), f);
-                                      ::fflush(f);
-                                      // Same durability rule as the rule
-                                      // store: flush to the volume before
-                                      // the atomic replace publishes tmp.
-                                      {
-                                          const intptr_t os_handle =
-                                              ::_get_osfhandle(::_fileno(f));
-                                          if (-1 != os_handle) {
-                                              (void)::FlushFileBuffers(
-                                                  reinterpret_cast<HANDLE>(
-                                                      os_handle));
+                                      auto& v4 = dhcp["static_bindings"];
+                                      if (!v4.is_array()) {
+                                          v4 = nlohmann::json::array();
+                                      }
+                                      for (const auto& binding :
+                                           disk->dhcp.static_bindings) {
+                                          bool known = false;
+                                          for (const auto& e : v4) {
+                                              core::MacAddress mac{};
+                                              if (e.is_object() &&
+                                                  e.contains("mac") &&
+                                                  e["mac"].is_string() &&
+                                                  core::ParseMac(
+                                                      e["mac"].get<std::string>(),
+                                                      mac) &&
+                                                  mac == binding.mac) {
+                                                  known = true;
+                                                  break;
+                                              }
                                           }
+                                          if (known) {
+                                              continue;
+                                          }
+                                          if (v4.size() >=
+                                              ::vgww::core::limits::
+                                                  kMaxStaticBindings) {
+                                              ++dropped;
+                                              continue;
+                                          }
+                                          nlohmann::json entry = {
+                                              {"mac",
+                                               core::FormatMac(binding.mac)},
+                                              {"ip",
+                                               core::FormatIpv4(binding.ip)}};
+                                          if (!binding.hostname.empty()) {
+                                              entry["hostname"] =
+                                                  binding.hostname;
+                                          }
+                                          v4.push_back(std::move(entry));
                                       }
-                                      int close_ok = ::fclose(f);
-
-                                      if (written != body.size() || 0 != close_ok)
-                                      {
-                                          ::DeleteFileW(wtmp.c_str());
-                                          return Response::Error(500, "config write failed");
+                                      auto& ipv6 = submitted["ipv6"];
+                                      if (!ipv6.is_object()) {
+                                          ipv6 = nlohmann::json::object();
                                       }
+                                      auto& d6 = ipv6["dhcpv6"];
+                                      if (!d6.is_object()) {
+                                          d6 = nlohmann::json::object();
+                                      }
+                                      auto& v6 = d6["static_bindings"];
+                                      if (!v6.is_array()) {
+                                          v6 = nlohmann::json::array();
+                                      }
+                                      for (const auto& binding :
+                                           disk->ipv6.dhcpv6
+                                               .static_bindings) {
+                                          std::string duid;
+                                          {
+                                              static const char* kHex =
+                                                  "0123456789abcdef";
+                                              for (const uint8_t byte :
+                                                   binding.duid) {
+                                                  duid.push_back(
+                                                      kHex[byte >> 4]);
+                                                  duid.push_back(
+                                                      kHex[byte & 0x0F]);
+                                              }
+                                          }
+                                          bool known = false;
+                                          for (const auto& e : v6) {
+                                              if (!e.is_object() ||
+                                                  !e.contains("duid") ||
+                                                  !e["duid"].is_string()) {
+                                                  continue;
+                                              }
+                                              std::string text =
+                                                  e["duid"].get<std::string>();
+                                              for (char& c : text) {
+                                                  if (c >= 'A' && c <= 'F') {
+                                                      c = static_cast<char>(
+                                                          c - 'A' + 'a');
+                                                  }
+                                              }
+                                              if (text == duid) {
+                                                  known = true;
+                                                  break;
+                                              }
+                                          }
+                                          if (known) {
+                                              continue;
+                                          }
+                                          if (v6.size() >=
+                                              ::vgww::core::limits::
+                                                  kMaxStaticBindings6) {
+                                              ++dropped;
+                                              continue;
+                                          }
+                                          nlohmann::json entry = {
+                                              {"duid", duid},
+                                              {"ip", core::FormatIpv6(
+                                                         binding.ip)}};
+                                          if (!binding.hostname.empty()) {
+                                              entry["hostname"] =
+                                                  binding.hostname;
+                                          }
+                                          v6.push_back(std::move(entry));
+                                      }
+                                      if (dropped > 0) {
+                                          return Response::Error(
+                                              409,
+                                              "binding cap reached: " +
+                                                  std::to_string(dropped) +
+                                                  " disk binding(s) not "
+                                                  "merged; remove entries on "
+                                                  "the bindings page");
+                                      }
+                                      body = submitted.dump();
                                   }
-                                  else
-                                  {
-                                      std::ofstream out(tmp, std::ios::binary);
-                                      if (!out)
-                                      {
-                                          return Response::Error(500, "cannot open config");
-                                      }
-                                      out.write(body.data(),
-                                                static_cast<std::streamsize>(body.size()));
-                                      if (!out)
-                                      {
-                                          return Response::Error(500, "config write failed");
-                                      }
-                                  }
+                              }                              std::string write_error;
+                              // batch94: hold the per-path config lock while
+                              // publishing, so a binding read-modify-write
+                              // cannot interleave and republish a stale list.
+                              std::lock_guard<std::mutex> publish_lock(
+                                  core::Config::FileMutex(config_path));
+                              // batch95: and exclude a second VGWW process
+                              // (headless WebUI) for the same window.
+                              core::ConfigFileLock process_lock(config_path);
+                              if (!process_lock.locked()) {
+                                  // batch107: never publish without the
+                                  // cross-process lock; the message stays in
+                                  // the existing 500 contract.
+                                  return Response::Error(500,
+                                                         "config save failed");
                               }
- #else
-                              {
-                                  std::ofstream out(tmp, std::ios::binary);
-                                  if (!out) {
-                                      return Response::Error(500, "cannot open config");
-                                  }
-                                  out.write(body.data(),
-                                            static_cast<std::streamsize>(
-                                                body.size()));
-                                  if (!out) {
-                                      return Response::Error(500, "config write failed");
-                                  }
+                              const core::AtomicWriteOutcome outcome =
+                                  core::WriteFileAtomicDurable(
+                                      config_path, body, write_error,
+                                      [](const std::string& temp_path) {
+                                          std::string ignore;
+                                          return core::Config::LoadFromFile(
+                                                     temp_path, ignore)
+                                              .has_value();
+                                      });
+                              if (core::AtomicWriteOutcome::
+                                      kValidationFailed == outcome) {
+                                  return Response::Error(
+                                      400, "invalid configuration rejected");
                               }
- #endif
-                             // Round-trip through the loader rejects malformed
-                             // configs and leaves the previous file intact.
-                             std::string ignore;
-#ifdef _WIN32
-                             {
-                                 std::wstring wtmp = ToWideLongPath(tmp);
-                                 bool exists = false;
-
-                                 if (!wtmp.empty())
-                                 {
-                                     DWORD attr = ::GetFileAttributesW(wtmp.c_str());
-                                     exists = (INVALID_FILE_ATTRIBUTES != attr);
-                                 }
-                                 else
-                                 {
-                                     exists = std::filesystem::exists(tmp);
-                                 }
-
-                                 if (!exists || !core::Config::LoadFromFile(tmp, ignore))
-                                 {
-                                     std::error_code ec;
-
-                                     if (!wtmp.empty())
-                                     {
-                                         ::DeleteFileW(wtmp.c_str());
-                                     }
-                                     else
-                                     {
-                                         std::filesystem::remove(tmp, ec);
-                                     }
-
-                                     return Response::Error(
-                                         400, "invalid configuration rejected");
-                                 }
-                             }
-#else
-                             if (!std::filesystem::exists(tmp) ||
-                                 !core::Config::LoadFromFile(tmp, ignore)) {
-                                 std::error_code ec;
-                                 std::filesystem::remove(tmp, ec);
-                                 return Response::Error(
-                                     400, "invalid configuration rejected");
-                             }
-#endif
-                             // Atomic replace; the running process keeps its
-                             // in-memory config until the next restart.
-#ifdef _WIN32
-                              {
-                                  std::wstring wtmp = ToWideLongPath(tmp);
-
-                                  if (!wtmp.empty())
-                                  {
-                                  // batch80: shared publisher (bounded retry
-                                  // on the destination rename) so the web
-                                  // writer and Config::SaveToFile cannot
-                                  // drift apart (C9).
-                                  std::string publish_error;
-                                  if (core::Config::PublishConfigTempFile(
-                                          tmp, config_path, publish_error))
-                                  {
-                                      return finish_save();
-                                  }
-
-                                      return Response::Error(500, "config save failed");
-                                  }
+                              if (core::AtomicWriteOutcome::kOk != outcome) {
+                                  return Response::Error(500,
+                                                         "config save failed");
                               }
-#endif
-                             std::error_code ec;
-                             std::filesystem::rename(tmp, config_path, ec);
-                             if (ec) {
-                                 std::filesystem::remove(tmp);
-                                 return Response::Error(500, "config save failed");
-                             }
-                             return finish_save();
+                              const Response saved = finish_save();
+                              // batch123: a config save is a privileged
+                              // change; the audit ring records it like the
+                              // repair/autostart actions.
+                              if (200 == saved.status) {
+                                  audit("config saved");
+                              }
+                              return saved;
                          });
         }
 
@@ -2815,7 +3839,8 @@ namespace vgww {
                          AutostartSetter autostart_setter,
                          AuditLog audit_log,
                          ConfigApplier config_applier,
-                         std::shared_ptr<ConfigApplyStatus> apply_status) {
+                         std::shared_ptr<ConfigApplyStatus> apply_status,
+                         ConsoleDroppedProvider console_dropped) {
             // Fixed-token compatibility overload: freeze the same effective
             // credential and configured bit the old implementation used.
             auto state = std::make_shared<AuthTokenState>();
@@ -2828,7 +3853,8 @@ namespace vgww {
                             std::move(autostart_setter),
                             std::move(audit_log),
                             std::move(config_applier),
-                            std::move(apply_status));
+                            std::move(apply_status),
+                            std::move(console_dropped));
         }
 
     }  // namespace web

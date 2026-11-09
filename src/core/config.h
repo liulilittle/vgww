@@ -15,6 +15,8 @@
 #include <array>
 #include <atomic>
 #include <cstdint>
+#include <functional>
+#include <mutex>
 #include <optional>
 #include <string>
 #include <vector>
@@ -142,6 +144,65 @@ namespace vgww {
         /// enables them (per-service wiring happens in later S2 tasks).
         enum class Mode { kBypass, kMain };
 
+        /// Outcome of WriteFileAtomicDurable.
+        enum class AtomicWriteOutcome : uint8_t {
+            kOk = 0,
+            kIoError = 1,         ///< open/write/flush/publish failed
+            kValidationFailed = 2  ///< the validator rejected the temp file
+        };
+
+        /// Writes `data` to `path` atomically AND durably: a process-unique
+        /// sibling temp -> write -> flush to the device -> [optional
+        /// validation of the temp] -> atomic replace (bounded retry when the
+        /// destination is transiently busy). A failed DEVICE FLUSH is a
+        /// failure: publishing anyway would report durability the volume never
+        /// provided, which is exactly how a "saved" set of rules/leases
+        /// vanishes after a power cut. On failure the destination is left
+        /// untouched and the temp file is removed.
+        AtomicWriteOutcome WriteFileAtomicDurable(
+            const std::string& path, const std::string& data,
+            std::string& error,
+            const std::function<bool(const std::string& temp_path)>&
+                validator = std::function<bool(const std::string&)>());
+
+        /// Test seam: replaces the device-flush step used by
+        /// WriteFileAtomicDurable. `handle` is the OS file handle as an
+        /// integer; returning false simulates a flush failure. Pass an empty
+        /// function to restore the real FlushFileBuffers.
+        void SetFileFlushHookForTest(std::function<bool(std::intptr_t)> hook);
+
+        /// Moves `path` aside to `path + suffix`, replacing any previous
+        /// aside copy (one bounded file, never a growing pile). Used to
+        /// preserve a file a loader found unreadable so the next snapshot
+        /// write cannot silently destroy the only evidence of the loss.
+        /// Returns false when the source is missing or the rename fails.
+        bool SetAsideFile(const std::string& path, const std::string& suffix);
+
+        /// Test seam: simulates a failure to OPEN a persistent file for
+        /// reading (`path` is the file the caller is about to open). Returning
+        /// 0 lets the real open happen; a non-zero Win32 error code (e.g.
+        /// ERROR_SHARING_VIOLATION == 32) simulates that attempt failing with
+        /// that error. Shared by the config, rules and lease loaders so one
+        /// seam can hold any of them un-openable.
+            void SetConfigOpenFailureHookForTest(
+                std::function<unsigned long(const std::string& path)> hook);
+
+        /// P82 test seam: when set, ConfigFileLock takes a DIFFERENT mutex than
+        /// the real one for the same path. Only a caller that takes the lock
+        /// EXPLICITLY (outside the atomic writer) is then blocked - the
+        /// internal write path keeps the real lock and never waits. Restores
+        /// the real name when cleared.
+        void SetConfigLockNameOverrideForTest(
+            const std::function<std::string(const std::string& path)>&
+                override);
+
+        /// Returns the simulated open failure for `path` (0 = open normally).
+        unsigned long SimulatedOpenFailure(const std::string& path);
+
+        /// batch107 test seam: overrides ConfigFileLock's blocking wait
+        /// (production default 30 s). Zero or negative restores the default.
+        void SetConfigLockWaitForTest(std::chrono::milliseconds wait);
+
         struct Config {
             std::string adapter;           ///< adapter friendly name or GUID
             /// batch19 R4-P4: persisted native UI language code (BCP-47-ish,
@@ -191,6 +252,33 @@ namespace vgww {
             /// is left untouched and the tmp file is deleted.
             bool SaveToFile(const std::string& path, std::string& error) const;
 
+            /// batch96: like SaveToFile(), but the DHCP static-binding lists
+            /// belong to their runtime routes, so a settings save taken from a
+            /// snapshot that predates a binding POST must not delete the
+            /// bindings that reached disk in the meantime. Re-reads the
+            /// document under the write locks and appends every binding this
+            /// snapshot lacks; identity is the MAC (v4) / DUID (v6), and this
+            /// snapshot wins when both sides carry the same one. A missing or
+            /// unreadable document degrades to a plain save.
+            bool SaveToFilePreservingBindings(const std::string& path,
+                                              std::string& error) const;
+
+            /// batch94: serialized read-modify-write of the document at
+            /// `path`. Concurrent in-process writers of the same path (a
+            /// binding route's load/upsert/save and a whole-document POST
+            /// /api/config publish) take the same per-path lock, so neither
+            /// can overwrite the other's just-published change with the
+            /// stale snapshot it loaded earlier. Returns false when the file
+            /// cannot be read or written; `mutate` runs while the lock is
+            /// held, so it must be short and must not touch the same path.
+            static bool UpdateFile(const std::string& path,
+                                   const std::function<void(Config&)>& mutate,
+                                   std::string& error);
+
+            /// batch94: the per-path lock UpdateFile() holds. Whole-document
+            /// publishers (POST /api/config) take it around their final
+            /// atomic publish so a read-modify-write cannot interleave.
+            static std::mutex& FileMutex(const std::string& path);
             /// Returns a process-unique sibling temp path for the atomic
             /// replace of `path`: `<path>.tmp.<pid>.<seq>`. The sequence is a
             /// SINGLE process-wide atomic defined once in config.cpp, so the
@@ -222,6 +310,52 @@ namespace vgww {
                                               std::string& error);
         };
 
+        /// batch95: process-exclusive lock for one config document, layered
+        /// UNDER the in-process FileMutex (always taken in that order). Two
+        /// VGWW processes can share one config path - a --headless WebUI run
+        /// deliberately bypasses the single-instance gate - and their
+        /// load->mutate->publish windows would otherwise overwrite each other
+        /// across processes, which an in-process mutex cannot see. Windows: a
+        /// named kernel mutex in the Local namespace (per login session; two
+        /// sessions are not mutually excluded).
+        class ConfigFileLock {
+        public:
+            /// `blocking=false` returns immediately with locked()==false when
+            /// another owner holds the lock (used by tests and callers that
+            /// prefer to report instead of wait). Blocking waits up to 30 s,
+            /// then reports locked()==false rather than hanging a worker.
+            explicit ConfigFileLock(const std::string& path,
+                                    bool blocking = true);
+            ~ConfigFileLock();
+            ConfigFileLock(const ConfigFileLock&) = delete;
+            ConfigFileLock& operator=(const ConfigFileLock&) = delete;
+            bool locked() const { return locked_; }
+
+        private:
+            void* handle_ = nullptr;
+            bool locked_ = false;
+        };
+
+        /// batch97: shared static-binding persistence for the HTTP routes
+        /// (web_api) and the native UI commands (controller) - one knowledge,
+        /// one place. Each is a locked read-modify-write of the config
+        /// document: an empty path (no document configured), an unreadable or
+        /// an unwritable file returns false with `error`. Upsert matches on
+        /// the identity key (MAC / DUID); delete of an absent key succeeds.
+        bool UpsertDhcpBinding(const std::string& path, const MacAddress& mac,
+                               uint32_t ip, const std::string& hostname,
+                               std::string& error);
+        bool DeleteDhcpBinding(const std::string& path, const MacAddress& mac,
+                               std::string& error);
+        bool UpsertDhcp6Binding(const std::string& path,
+                                const std::vector<uint8_t>& duid,
+                                const std::array<uint8_t, 16>& ip,
+                                const std::string& hostname,
+                                std::string& error);
+        bool DeleteDhcp6Binding(const std::string& path,
+                                const std::vector<uint8_t>& duid,
+                                std::string& error);
+
         /// Validates semantic constraints that span parsed fields (gateway
         /// shape, DHCP pool, ULA, perf/bridge ranges) plus the value ranges
         /// the JSON parser bounds at load time. Public since S4 Task 5: the
@@ -247,6 +381,12 @@ namespace vgww {
 
         /// Formats an IPv4 (network byte order) as dotted quad.
         std::string FormatIpv4(uint32_t ip) noexcept;
+
+        /// Parses a literal IPv6 address (no "/prefix") into 16 wire-order
+        /// bytes. Returns false on malformed input; "::" compression and
+        /// mixed-case hex are accepted (same parser the config loader uses).
+        bool ParseIpv6(const std::string& text,
+                       std::array<uint8_t, 16>& out);
 
         /// Formats a 16-byte IPv6 address (network order) as eight lowercase
         /// hex groups "xxxx:xxxx:...:xxxx"; no "::" compression. Promoted

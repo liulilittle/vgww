@@ -13,6 +13,7 @@
 
 #include <atomic>
 #include <cstdint>
+#include <utility>
 
 namespace vgww {
     namespace core {
@@ -31,6 +32,24 @@ namespace vgww {
             } catch (...) {
                 errors.fetch_add(1, std::memory_order_relaxed);
                 return false;
+            }
+        }
+
+        /// Runs the body of a DETACHED thread. A throw there calls
+        /// std::terminate (the thread is its own entry point), so the
+        /// exception is swallowed and reported through `on_failure` instead -
+        /// e.g. publishing a failure result an operator can see. `on_failure`
+        /// is firewalled too (a report path must not kill the process either).
+        template <typename Body, typename OnFailure>
+        void RunDetachedBodyGuarded(std::atomic<uint64_t>& errors,
+                                    Body&& body,
+                                    OnFailure&& on_failure) noexcept {
+            try {
+                body();
+            } catch (...) {
+                errors.fetch_add(1, std::memory_order_relaxed);
+                InvokeHandlerGuarded(errors,
+                                     std::forward<OnFailure>(on_failure));
             }
         }
 

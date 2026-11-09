@@ -2,6 +2,8 @@
 // test_web.cpp - Embedded HTTP server: routing, static files, API surface.
 // ============================================================================
 #include "core/limits.h"
+#include "proto/dhcp.h"
+#include "proto/dhcp6.h"
 #include "web/http_server.h"
 #include "web/web_api.h"
 
@@ -14,6 +16,7 @@
 
 #include <asio.hpp>
 
+#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <cstdio>
@@ -25,6 +28,13 @@
 #include <string>
 #include <thread>
 #include <vector>
+
+#ifdef _WIN32
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#include <windows.h>
+#endif
 
 namespace {
 
@@ -210,7 +220,7 @@ namespace {
                    : atoi(text.c_str() + space + 1);
     }
 
-    /// Blocking HTTP DELETE returning status + body.
+    /// Blocking HTTP DELETE returning status + body (no credentials).
     int HttpDelete(const std::string& path, uint16_t port, std::string& body) {
         asio::io_context io;
         asio::ip::tcp::socket socket(io);
@@ -221,6 +231,39 @@ namespace {
         if (err) return -1;
         const std::string request =
             "DELETE " + path + " HTTP/1.1\r\nHost: t\r\nConnection: close\r\n\r\n";
+        asio::write(socket, asio::buffer(request), err);
+        if (err) return -1;
+        std::ostringstream raw;
+        char buf[4096];
+        for (;;) {
+            const size_t n = socket.read_some(asio::buffer(buf), err);
+            if (err) break;
+            raw.write(buf, static_cast<std::streamsize>(n));
+        }
+        const std::string text = raw.str();
+        const size_t space = text.find(' ');
+        const size_t body_at = text.find("\r\n\r\n");
+        if (std::string::npos != body_at) {
+            body = text.substr(body_at + 4);
+        }
+        return (std::string::npos == space)
+                   ? -1
+                   : atoi(text.c_str() + space + 1);
+    }
+
+    /// Blocking HTTP DELETE with the auth token (write-gated endpoints).
+    int HttpDeleteWithToken(const std::string& path, uint16_t port,
+                            const std::string& token, std::string& body) {
+        asio::io_context io;
+        asio::ip::tcp::socket socket(io);
+        std::error_code err;
+        socket.connect(asio::ip::tcp::endpoint(asio::ip::make_address("127.0.0.1"),
+                                               port),
+                       err);
+        if (err) return -1;
+        const std::string request =
+            "DELETE " + path + " HTTP/1.1\r\nHost: t\r\nX-Auth-Token: " +
+            token + "\r\nConnection: close\r\n\r\n";
         asio::write(socket, asio::buffer(request), err);
         if (err) return -1;
         std::ostringstream raw;
@@ -948,7 +991,7 @@ static void TestB37tWebConfigAppliesLive() {
     Config applied_cfg;
     vgww::web::RegisterApi(
         api, dp, cfg, path, "boot-secret", {}, {}, {}, {},
-        [&](const Config& c) {
+        [&](const Config& c, uint64_t) {
             applied = true;
             applied_cfg = c;
             return true;
@@ -971,6 +1014,764 @@ static void TestB37tWebConfigAppliesLive() {
     api.Stop();
     std::remove(path);
     std::remove(rules.c_str());
+}
+
+// batch114: an applier that refuses the save (returns false) must still close
+// the attempt it was handed - otherwise the id is stamped with no completion
+// and any page polling an older id waits forever.
+static void TestB114RefusedApplyClosesTheAttempt() {
+    using namespace vgww::core;
+    const char* path = "b114-refused-apply.json";
+    const std::string rules = std::string(path) + ".rules.json";
+    std::remove(path);
+    std::remove(rules.c_str());
+    Config cfg;
+    cfg.web.port = 18105;
+    bool ok = false;
+    cfg.gateway.ipv4 = ParseIpv4("192.168.0.40", ok);
+    cfg.gateway.mask = ParseIpv4("255.255.255.0", ok);
+    MacAddress mac{};
+    ParseMac("30:fc:68:88:b4:a9", mac);
+    cfg.gateway.mac = mac;
+    std::string err;
+    CHECK(cfg.SaveToFile(path, err));
+    vgww::runtime::Dataplane dp(cfg);
+    HttpServer api;
+    auto status = std::make_shared<vgww::web::ConfigApplyStatus>();
+    bool refused = false;
+    vgww::web::RegisterApi(
+        api, dp, cfg, path, "boot-secret", {}, {}, {}, {},
+        [&](const Config&, uint64_t) {
+            refused = true;
+            return false;  // applier declines the save
+        },
+        status);
+    constexpr uint16_t kPort = 18105;
+    std::string start_err;
+    CHECK(api.Start("127.0.0.1", kPort, start_err));
+    const std::string body =
+        "{\"adapter\":\"x\",\"gateway\":{\"ipv4\":\"192.168.0.40\","
+        "\"mask\":\"255.255.255.0\",\"mac\":\"30:fc:68:88:b4:a9\"},"
+        "\"ipv6\":{\"enabled\":false,\"ula_prefix\":\"fdaa:0:0::\","
+        "\"prefix_len\":64,\"ra_lifetime_s\":300},"
+        "\"web\":{\"port\":18105,\"token\":\"\"},"
+        "\"perf\":{\"workers\":4,\"max_conns\":4096}}";
+    std::string resp;
+    CHECK(HttpPost(kPort, "/api/config", "boot-secret", body, resp) == 200);
+    CHECK(refused);
+    CHECK(resp.find("\"note\":\"applies on restart\"") != std::string::npos);
+
+    const auto snap = status->Get();
+    CHECK(snap.attempt_id == 1);
+    CHECK(snap.completed_id == 1);
+    CHECK(!snap.ok);
+    CHECK(!snap.error.empty());
+
+    api.Stop();
+    std::remove(path);
+    std::remove(rules.c_str());
+}
+
+// batch113: with no applier the save cannot be applied, so it must not stamp
+// an attempt id that nobody will ever complete - a page holding an older id
+// would otherwise poll forever ("pending" that never resolves).
+static void TestB113NoApplierDoesNotStampAttempt() {
+    using namespace vgww::core;
+    const char* path = "b113-no-applier.json";
+    const std::string rules = std::string(path) + ".rules.json";
+    std::remove(path);
+    std::remove(rules.c_str());
+    Config cfg;
+    cfg.web.port = 18104;
+    bool ok = false;
+    cfg.gateway.ipv4 = ParseIpv4("192.168.0.40", ok);
+    cfg.gateway.mask = ParseIpv4("255.255.255.0", ok);
+    MacAddress mac{};
+    ParseMac("30:fc:68:88:b4:a9", mac);
+    cfg.gateway.mac = mac;
+    std::string err;
+    CHECK(cfg.SaveToFile(path, err));
+    vgww::runtime::Dataplane dp(cfg);
+    HttpServer api;
+    auto status = std::make_shared<vgww::web::ConfigApplyStatus>();
+    vgww::web::RegisterApi(api, dp, cfg, path, "boot-secret",
+                            {}, {}, {}, {}, {}, status);  // no applier
+    constexpr uint16_t kPort = 18104;
+    std::string start_err;
+    CHECK(api.Start("127.0.0.1", kPort, start_err));
+    const std::string body =
+        "{\"adapter\":\"x\",\"gateway\":{\"ipv4\":\"192.168.0.40\","
+        "\"mask\":\"255.255.255.0\",\"mac\":\"30:fc:68:88:b4:a9\"},"
+        "\"ipv6\":{\"enabled\":false,\"ula_prefix\":\"fdaa:0:0::\","
+        "\"prefix_len\":64,\"ra_lifetime_s\":300},"
+        "\"web\":{\"port\":18104,\"token\":\"\"},"
+        "\"perf\":{\"workers\":4,\"max_conns\":4096}}";
+    std::string resp;
+    CHECK(HttpPost(kPort, "/api/config", "boot-secret", body, resp) == 200);
+    CHECK(resp.find("\"note\":\"applies on restart\"") != std::string::npos);
+    CHECK(resp.find("\"apply_id\"") == std::string::npos);
+
+    std::string status_body;
+    CHECK(HttpGet("/api/config/apply-status", kPort, status_body) == 200);
+    CHECK(status_body.find("\"attempt_id\":0") != std::string::npos);
+    CHECK(status_body.find("\"completed_id\":0") != std::string::npos);
+
+    api.Stop();
+    std::remove(path);
+    std::remove(rules.c_str());
+}
+
+// batch127: contract test for the health surfaces the WebUI/native UI read.
+// Every key the surfaces rely on must exist with the expected JSON type, so a
+// later refactor cannot silently delete or retype one.
+static void TestB127StatusContractKeys() {
+    using namespace vgww::core;
+    const char* path = "b127-contract.json";
+    const std::string rules = std::string(path) + ".rules.json";
+    std::remove(path);
+    std::remove(rules.c_str());
+    Config cfg;
+    cfg.web.port = 18114;
+    bool ok = false;
+    cfg.gateway.ipv4 = ParseIpv4("192.168.0.40", ok);
+    cfg.gateway.mask = ParseIpv4("255.255.255.0", ok);
+    MacAddress mac{};
+    ParseMac("30:fc:68:88:b4:a9", mac);
+    cfg.gateway.mac = mac;
+    std::string err;
+    CHECK(cfg.SaveToFile(path, err));
+    vgww::runtime::Dataplane dp(cfg);
+    HttpServer api;
+    vgww::web::RegisterApi(
+        api, dp, cfg, path, "boot-secret",
+        [] { return std::string("hello"); }, {}, {}, {}, {}, {},
+        [] { return uint64_t{3}; });
+    constexpr uint16_t kPort = 18114;
+    std::string start_err;
+    CHECK(api.Start("127.0.0.1", kPort, start_err));
+
+    std::string body;
+    CHECK(HttpGet("/api/status", kPort, body) == 200);
+    const auto st = nlohmann::json::parse(body);
+    const auto require = [&st](const std::string& dot) {
+        const size_t slash = dot.find('.');
+        const auto& parent = st.at(dot.substr(0, slash));
+        return parent.contains(dot.substr(slash + 1));
+    };
+    CHECK(require("gateway.ip"));
+    CHECK(require("stats.rx_frames"));
+    CHECK(require("portmap_health.accepted"));
+    for (const char* key :
+         {"leases", "persistence_paused", "persist_failures",
+          "stop_persist_failed", "pool_exhausted", "leases_dropped",
+          "leases_corrupt", "parse_rejected"}) {
+        CHECK(require(std::string("dhcp.") + key));
+    }
+    for (const char* key :
+         {"leases6_count", "persistence_paused", "persist_failures",
+          "pool_exhausted", "leases_dropped", "leases_corrupt",
+          "parse_rejected", "bindings6_count"}) {
+        CHECK(require(std::string("dhcp6.") + key));
+    }
+    CHECK(require("stats.udp_flow_evictions"));
+    CHECK(require("bridge.mac_evictions"));
+    CHECK(require("bridge.neighbor_rejections"));
+    CHECK(require("dhcp.rate_limit_resets"));
+    CHECK(require("dhcp6.rate_limit_resets"));
+    CHECK(st.contains("dataplane_error"));
+    CHECK(st.contains("bridge_error"));
+    CHECK(st.contains("dataplane_running"));
+    CHECK(st.contains("dhcp_active"));
+    CHECK(st.contains("dhcp6_active"));
+    CHECK(st.contains("adapter_name"));
+    CHECK(st.contains("adapter_link_up"));
+    CHECK(require("bridge.enabled"));
+    CHECK(require("web.handler_errors"));
+    for (const char* key :
+         {"persist_failures", "persist_blocked", "recoveries",
+          "discarded"}) {
+        CHECK(require(std::string("rules.") + key));
+    }
+
+    std::string console_body;
+    CHECK(HttpGet("/api/console", kPort, console_body) == 200);
+    const auto cn = nlohmann::json::parse(console_body);
+    CHECK(cn.contains("text") && cn.contains("count") &&
+          cn.contains("available") && cn.contains("dropped"));
+    CHECK(cn["dropped"].get<uint64_t>() == 3);
+
+    api.Stop();
+    std::remove(path);
+    std::remove(rules.c_str());
+}
+
+// batch126 (Web surface): the console ring's eviction count must be visible.
+static void TestB126WebConsoleReportsDropped() {
+    using namespace vgww::core;
+    const char* path = "b126-console.json";
+    const std::string rules = std::string(path) + ".rules.json";
+    std::remove(path);
+    std::remove(rules.c_str());
+    Config cfg;
+    cfg.web.port = 18113;
+    bool ok = false;
+    cfg.gateway.ipv4 = ParseIpv4("192.168.0.40", ok);
+    cfg.gateway.mask = ParseIpv4("255.255.255.0", ok);
+    MacAddress mac{};
+    ParseMac("30:fc:68:88:b4:a9", mac);
+    cfg.gateway.mac = mac;
+    std::string err;
+    CHECK(cfg.SaveToFile(path, err));
+    vgww::runtime::Dataplane dp(cfg);
+    HttpServer api;
+    vgww::web::RegisterApi(
+        api, dp, cfg, path, "boot-secret",
+        [] { return std::string(); }, {}, {}, {}, {}, {},
+        [] { return uint64_t{7}; });
+    constexpr uint16_t kPort = 18113;
+    std::string start_err;
+    CHECK(api.Start("127.0.0.1", kPort, start_err));
+    std::string body;
+    CHECK(HttpGet("/api/console", kPort, body) == 200);
+    const auto json = nlohmann::json::parse(body);
+    CHECK(json["dropped"].get<uint64_t>() == 7);
+    api.Stop();
+    std::remove(path);
+    std::remove(rules.c_str());
+}
+
+// batch123: privileged rule/binding/config changes must land in the audit
+// ring (only repair-driver and autostart were recorded before).
+static void TestB123PrivilegedChangesAreAudited() {
+    using namespace vgww::core;
+    const char* path = "b123-audit.json";
+    const std::string rules = std::string(path) + ".rules.json";
+    std::remove(path);
+    std::remove(rules.c_str());
+    Config cfg;
+    cfg.web.port = 18112;
+    bool ok = false;
+    cfg.gateway.ipv4 = ParseIpv4("192.168.0.40", ok);
+    cfg.gateway.mask = ParseIpv4("255.255.255.0", ok);
+    MacAddress mac{};
+    ParseMac("30:fc:68:88:b4:a9", mac);
+    cfg.gateway.mac = mac;
+    std::string err;
+    CHECK(cfg.SaveToFile(path, err));
+    vgww::runtime::Dataplane dp(cfg);
+    HttpServer api;
+    std::vector<std::string> audit_lines;
+    vgww::web::RegisterApi(
+        api, dp, cfg, path, "boot-secret", {}, {}, {},
+        [&audit_lines](const std::string& line) {
+            audit_lines.push_back(line);
+        });
+    constexpr uint16_t kPort = 18112;
+    std::string start_err;
+    CHECK(api.Start("127.0.0.1", kPort, start_err));
+    std::string resp;
+
+    CHECK(HttpPost(kPort, "/api/portmap", "boot-secret",
+                   "{\"proto\":\"tcp\",\"wan_port\":19001,"
+                   "\"lan_ip\":\"192.168.0.10\",\"lan_port\":8080}",
+                   resp) == 200);
+    CHECK(HttpPost(kPort, "/api/bans", "boot-secret",
+                   "{\"kind\":\"mac\",\"value\":\"aa:bb:cc:dd:ee:ff\"}",
+                   resp) == 200);
+    std::string bans_body;
+    CHECK(HttpGet("/api/bans", kPort, bans_body) == 200);
+    const auto bans_json = nlohmann::json::parse(bans_body);
+    uint64_t ban_id = 0;
+    for (const auto& entry : bans_json) {
+        if (entry.value("value", "") == "AA:BB:CC:DD:EE:FF") {
+            ban_id = entry["id"].get<uint64_t>();
+        }
+    }
+    CHECK(0 != ban_id);
+    CHECK(HttpPost(kPort, "/api/ratelimit", "boot-secret",
+                   "{\"mac\":\"aa:bb:cc:dd:ee:01\",\"uplink_kbps\":1000}",
+                   resp) == 200);
+    CHECK(HttpPost(kPort, "/api/config", "boot-secret", cfg.ToJsonString(),
+                   resp) == 200);
+    CHECK(HttpDeleteWithToken("/api/bans?id=" + std::to_string(ban_id),
+                              kPort, "boot-secret", resp) == 200);
+    CHECK(HttpDeleteWithToken("/api/portmap?index=0", kPort, "boot-secret",
+                              resp) == 200);
+    CHECK(HttpDeleteWithToken("/api/ratelimit?mac=aa:bb:cc:dd:ee:01", kPort,
+                              "boot-secret", resp) == 200);
+
+    api.Stop();
+
+    const auto contains = [&audit_lines](const std::string& needle) {
+        for (const auto& line : audit_lines) {
+            if (line.find(needle) != std::string::npos) {
+                return true;
+            }
+        }
+        return false;
+    };
+    CHECK(contains("portmap add"));
+    CHECK(contains("ban add"));
+    CHECK(contains("ratelimit set"));
+    CHECK(contains("config saved"));
+    CHECK(contains("ban delete"));
+    CHECK(contains("portmap delete"));
+    CHECK(contains("ratelimit delete"));
+
+    std::remove(path);
+    std::remove(rules.c_str());
+}
+
+// batch122 (Web surface): DHCPv6 parse refusals must be visible too.
+static void TestB122WebStatusReportsParseRejects6() {
+    using namespace vgww::core;
+    const char* path = "b122-status.json";
+    const std::string rules = std::string(path) + ".rules.json";
+    std::remove(path);
+    std::remove(rules.c_str());
+    Config cfg;
+    cfg.web.port = 18111;
+    bool ok = false;
+    cfg.gateway.ipv4 = ParseIpv4("192.168.0.40", ok);
+    cfg.gateway.mask = ParseIpv4("255.255.255.0", ok);
+    MacAddress mac{};
+    ParseMac("30:fc:68:88:b4:a9", mac);
+    cfg.gateway.mac = mac;
+    std::string err;
+    CHECK(cfg.SaveToFile(path, err));
+    vgww::runtime::Dataplane dp(cfg);
+    HttpServer api;
+    vgww::web::RegisterApi(api, dp, cfg, path, "boot-secret");
+    constexpr uint16_t kPort = 18111;
+    std::string start_err;
+    CHECK(api.Start("127.0.0.1", kPort, start_err));
+    vgww::proto::Dhcp6View view{};
+    std::vector<uint8_t> garbage(32, 0);
+    const uint64_t before = vgww::proto::ParseRejected6Count();
+    CHECK(!vgww::proto::ParseDhcp6Frame(garbage.data(), garbage.size(),
+                                         view));
+    CHECK(before + 1 == vgww::proto::ParseRejected6Count());
+    std::string body;
+    CHECK(HttpGet("/api/status", kPort, body) == 200);
+    const auto json = nlohmann::json::parse(body);
+    const uint64_t reported =
+        json["dhcp6"]["parse_rejected"].get<uint64_t>();
+    CHECK(reported == before + 1);
+    api.Stop();
+    std::remove(path);
+    std::remove(rules.c_str());
+}
+
+// batch121 (Web surface): strict-parse refusals must be visible on
+// /api/status, not only in memory.
+static void TestB121WebStatusReportsParseRejects() {
+    using namespace vgww::core;
+    const char* path = "b121-status.json";
+    const std::string rules = std::string(path) + ".rules.json";
+    std::remove(path);
+    std::remove(rules.c_str());
+    Config cfg;
+    cfg.web.port = 18110;
+    bool ok = false;
+    cfg.gateway.ipv4 = ParseIpv4("192.168.0.40", ok);
+    cfg.gateway.mask = ParseIpv4("255.255.255.0", ok);
+    MacAddress mac{};
+    ParseMac("30:fc:68:88:b4:a9", mac);
+    cfg.gateway.mac = mac;
+    std::string err;
+    CHECK(cfg.SaveToFile(path, err));
+    vgww::runtime::Dataplane dp(cfg);
+    HttpServer api;
+    vgww::web::RegisterApi(api, dp, cfg, path, "boot-secret");
+    constexpr uint16_t kPort = 18110;
+    std::string start_err;
+    CHECK(api.Start("127.0.0.1", kPort, start_err));
+    // A malformed frame bumps the global parse-reject counter.
+    vgww::proto::DhcpView view{};
+    std::vector<uint8_t> garbage(32, 0);
+    const uint64_t before = vgww::proto::ParseRejectedCount();
+    CHECK(!vgww::proto::ParseDhcpFrame(garbage.data(), garbage.size(), view));
+    CHECK(before + 1 == vgww::proto::ParseRejectedCount());
+    std::string body;
+    CHECK(HttpGet("/api/status", kPort, body) == 200);
+    const auto json = nlohmann::json::parse(body);
+    const uint64_t reported =
+        json["dhcp"]["parse_rejected"].get<uint64_t>();
+    CHECK(reported == before + 1);
+    api.Stop();
+    std::remove(path);
+    std::remove(rules.c_str());
+}
+
+// batch120 (Web surface): a corrupt lease document must be visible on
+// /api/status, not only in stderr.
+static void TestB120WebStatusReportsCorruptLeases() {
+    using namespace vgww::core;
+    const char* path = "b120-status.json";
+    const std::string lease_path = "b120_leases.json";
+    const std::string rules = std::string(path) + ".rules.json";
+    std::remove(path);
+    std::remove(lease_path.c_str());
+    std::remove(rules.c_str());
+    Config cfg;
+    cfg.web.port = 18109;
+    cfg.mode = Mode::kMain;
+    bool ok = false;
+    cfg.gateway.ipv4 = ParseIpv4("192.168.0.40", ok);
+    cfg.gateway.mask = ParseIpv4("255.255.255.0", ok);
+    MacAddress mac{};
+    ParseMac("30:fc:68:88:b4:a9", mac);
+    cfg.gateway.mac = mac;
+    cfg.dhcp.enabled = true;
+    cfg.dhcp.pool_start = ParseIpv4("192.168.0.100", ok);
+    cfg.dhcp.pool_end = ParseIpv4("192.168.0.110", ok);
+    cfg.dhcp.lease_seconds = 3600;
+    std::string err;
+    CHECK(cfg.SaveToFile(path, err));
+    {
+        std::ofstream out(lease_path);
+        out << "this is not json";
+    }
+    vgww::runtime::Dataplane dp(cfg, lease_path);
+    dp.SetDriverClient(std::make_unique<WebFakeDriver>());
+    std::string dp_err;
+    CHECK(dp.Start(dp_err));
+    HttpServer api;
+    vgww::web::RegisterApi(api, dp, cfg, path, "boot-secret");
+    constexpr uint16_t kPort = 18109;
+    std::string start_err;
+    CHECK(api.Start("127.0.0.1", kPort, start_err));
+    std::string body;
+    CHECK(HttpGet("/api/status", kPort, body) == 200);
+    CHECK(body.find("\"leases_corrupt\":true") != std::string::npos);
+    api.Stop();
+    std::string stop_err;
+    dp.Stop(stop_err);
+    std::remove(path);
+    std::remove(lease_path.c_str());
+    std::remove(rules.c_str());
+    std::remove((lease_path + ".corrupt").c_str());
+}
+
+// batch119 (Web surface): lease entries dropped at load must be visible on
+// /api/status, not only in stderr.
+static void TestB119WebStatusReportsDroppedLeases() {
+    using namespace vgww::core;
+    const char* path = "b119-status.json";
+    const std::string lease_path = "b119_leases.json";
+    const std::string rules = std::string(path) + ".rules.json";
+    std::remove(path);
+    std::remove(lease_path.c_str());
+    std::remove(rules.c_str());
+    Config cfg;
+    cfg.web.port = 18108;
+    cfg.mode = Mode::kMain;
+    bool ok = false;
+    cfg.gateway.ipv4 = ParseIpv4("192.168.0.40", ok);
+    cfg.gateway.mask = ParseIpv4("255.255.255.0", ok);
+    MacAddress mac{};
+    ParseMac("30:fc:68:88:b4:a9", mac);
+    cfg.gateway.mac = mac;
+    cfg.dhcp.enabled = true;
+    cfg.dhcp.pool_start = ParseIpv4("192.168.0.100", ok);
+    cfg.dhcp.pool_end = ParseIpv4("192.168.0.110", ok);
+    cfg.dhcp.lease_seconds = 3600;
+    std::string err;
+    CHECK(cfg.SaveToFile(path, err));
+    {
+        std::ofstream out(lease_path);
+        out << "{\"version\":1,\"leases\":["
+               "{\"mac\":\"not-a-mac\",\"ip\":\"192.168.0.100\","
+               "\"hostname\":\"bad\",\"expires_in_s\":3600},"
+               "{\"mac\":\"AA:BB:CC:DD:EE:01\",\"ip\":\"192.168.0.101\","
+               "\"hostname\":\"good\",\"expires_in_s\":3600}]}";
+    }
+    vgww::runtime::Dataplane dp(cfg, lease_path);
+    dp.SetDriverClient(std::make_unique<WebFakeDriver>());
+    std::string dp_err;
+    CHECK(dp.Start(dp_err));
+    HttpServer api;
+    vgww::web::RegisterApi(api, dp, cfg, path, "boot-secret");
+    constexpr uint16_t kPort = 18108;
+    std::string start_err;
+    CHECK(api.Start("127.0.0.1", kPort, start_err));
+    std::string body;
+    CHECK(HttpGet("/api/status", kPort, body) == 200);
+    CHECK(body.find("\"leases_dropped\":1") != std::string::npos);
+    api.Stop();
+    std::string stop_err;
+    dp.Stop(stop_err);
+    std::remove(path);
+    std::remove(lease_path.c_str());
+    std::remove(rules.c_str());
+}
+
+// batch118 (Web surface): the startup discard count must be visible on
+// /api/status, not only in stderr.
+static void TestB118WebStatusReportsDiscarded() {
+    using namespace vgww::core;
+    const char* path = "b118-status.json";
+    const std::string rules = std::string(path) + ".rules.json";
+    std::remove(path);
+    std::remove(rules.c_str());
+    Config cfg;
+    cfg.web.port = 18107;
+    bool ok = false;
+    cfg.gateway.ipv4 = ParseIpv4("192.168.0.40", ok);
+    cfg.gateway.mask = ParseIpv4("255.255.255.0", ok);
+    MacAddress mac{};
+    ParseMac("30:fc:68:88:b4:a9", mac);
+    cfg.gateway.mac = mac;
+    std::string err;
+    CHECK(cfg.SaveToFile(path, err));
+    {
+        std::ofstream out(rules);
+        out << "{\"portmaps\":[{\"proto\":\"udp\",\"wan_port\":9999,"
+               "\"lan_ip\":\"192.168.0.10\",\"lan_port\":9999}]}";
+    }
+    vgww::runtime::Dataplane dp(cfg);
+    HttpServer api;
+    vgww::web::RegisterApi(api, dp, cfg, path, "boot-secret");
+    constexpr uint16_t kPort = 18107;
+    std::string start_err;
+    CHECK(api.Start("127.0.0.1", kPort, start_err));
+    std::string body;
+    CHECK(HttpGet("/api/status", kPort, body) == 200);
+    CHECK(body.find("\"discarded\":1") != std::string::npos);
+    api.Stop();
+    std::remove(path);
+    std::remove(rules.c_str());
+}
+
+// batch117: the Web settings save has the same merge rule as the native UI -
+// a document at the binding cap must not silently erase a disk-only binding.
+static void TestB117WebConfigSaveRefusesToDropDiskBindings() {
+    using namespace vgww::core;
+    const char* path = "b117-cap.json";
+    const std::string rules = std::string(path) + ".rules.json";
+    std::remove(path);
+    std::remove(rules.c_str());
+    const auto read_back = [](const std::string& p) {
+        std::ifstream in(p, std::ios::binary);
+        return std::string(std::istreambuf_iterator<char>(in),
+                           std::istreambuf_iterator<char>());
+    };
+    bool ok = false;
+    Config cfg;
+    cfg.adapter = "Ethernet";
+    cfg.mode = Mode::kMain;
+    cfg.web.port = 18106;
+    cfg.gateway.ipv4 = ParseIpv4("192.168.0.1", ok);
+    cfg.gateway.mask = ParseIpv4("255.255.0.0", ok);
+    MacAddress mac{};
+    ParseMac("30:fc:68:88:b4:a9", mac);
+    cfg.gateway.mac = mac;
+    cfg.dhcp.enabled = true;
+    cfg.dhcp.pool_start = ParseIpv4("192.168.10.1", ok);
+    cfg.dhcp.pool_end = ParseIpv4("192.168.14.254", ok);
+    char mac_text[32];
+    for (size_t i = 0; i < limits::kMaxStaticBindings; ++i) {
+        StaticBinding b;
+        std::snprintf(mac_text, sizeof(mac_text), "02:%02x:%02x:00:00:01",
+                      static_cast<unsigned>(i >> 8),
+                      static_cast<unsigned>(i & 0xFF));
+        CHECK(ParseMac(mac_text, b.mac));
+        b.ip = ParseIpv4("192.168." +
+                             std::to_string(10u + i / 254u) + "." +
+                             std::to_string(1u + i % 254u),
+                         ok);
+        CHECK(ok);
+        b.hostname = "h" + std::to_string(i);
+        cfg.dhcp.static_bindings.push_back(b);
+    }
+    std::string err;
+    CHECK(cfg.SaveToFile(path, err));
+    vgww::runtime::Dataplane dp(cfg);
+    HttpServer api;
+    vgww::web::RegisterApi(api, dp, cfg, path, "boot-secret");
+    constexpr uint16_t kPort = 18106;
+    std::string start_err;
+    CHECK(api.Start("127.0.0.1", kPort, start_err));
+
+    // Cap churn on disk: delete one, add another.
+    CHECK(Config::UpdateFile(
+        path,
+        [&](Config& c) {
+            c.dhcp.static_bindings.erase(c.dhcp.static_bindings.begin());
+            StaticBinding extra;
+            ParseMac("02:00:00:00:ff:ff", extra.mac);
+            extra.ip = ParseIpv4("192.168.15.9", ok);
+            extra.hostname = "churned-in";
+            c.dhcp.static_bindings.push_back(std::move(extra));
+        },
+        err));
+    const std::string after_churn = read_back(path);
+    CHECK(after_churn.find("churned-in") != std::string::npos);
+
+    // The page posts the stale (full) document; the save must be refused.
+    const std::string body = cfg.ToJsonString();
+    std::string resp;
+    CHECK(HttpPost(kPort, "/api/config", "boot-secret", body, resp) == 409);
+    CHECK(read_back(path) == after_churn);
+
+    const auto disk = Config::LoadFromFile(path, err);
+    CHECK(disk.has_value());
+    if (disk) {
+        bool churned = false;
+        for (const auto& b : disk->dhcp.static_bindings) {
+            if (b.hostname == "churned-in") {
+                churned = true;
+            }
+        }
+        CHECK(churned);
+    }
+
+    api.Stop();
+    std::remove(path);
+    std::remove(rules.c_str());
+}
+
+// batch112: a static binding added at runtime (after the settings page was
+// rendered) lives on disk but not in the GET /api/config body the page posts
+// back. The full-document replace used to erase it: the operator's binding
+// survived until restart, then vanished. Disk bindings the body never names
+// must be preserved, like SaveToFilePreservingBindings does for the native UI.
+static void TestB112WebConfigSaveKeepsRuntimeBindings() {
+    using namespace vgww::core;
+    const char* path = "b112-keep-bindings.json";
+    const std::string rules = std::string(path) + ".rules.json";
+    std::remove(path);
+    std::remove(rules.c_str());
+    Config cfg;
+    cfg.web.port = 18103;
+    bool ok = false;
+    cfg.gateway.ipv4 = ParseIpv4("192.168.0.40", ok);
+    cfg.gateway.mask = ParseIpv4("255.255.255.0", ok);
+    MacAddress mac{};
+    ParseMac("30:fc:68:88:b4:a9", mac);
+    cfg.gateway.mac = mac;
+    // A stateful DHCPv6 service so the v6 binding round-trip is validated too.
+    cfg.ipv6.enabled = true;
+    cfg.ipv6.ula_prefix = std::array<uint8_t, 16>{0xFD, 0xAA, 0, 0, 0, 0, 0,
+                                                  0,    0,    0, 0, 0, 0,
+                                                  0,    0,    0};
+    cfg.ipv6.prefix_len = 64;
+    cfg.ipv6.ra_lifetime_s = 900;
+    cfg.ipv6.dhcpv6.enabled = true;
+    const auto v6 = [](uint8_t hi, uint8_t lo) {
+        std::array<uint8_t, 16> a{};
+        a[0] = 0xFD;
+        a[1] = 0xAA;
+        a[14] = hi;
+        a[15] = lo;
+        return a;
+    };
+    cfg.ipv6.dhcpv6.pool_start = v6(0x10, 0x00);
+    cfg.ipv6.dhcpv6.pool_end = v6(0x1F, 0xFF);
+    cfg.ipv6.dhcpv6.lease_seconds = 1800;
+    std::string err;
+    CHECK(cfg.SaveToFile(path, err));
+    vgww::runtime::Dataplane dp(cfg);
+    HttpServer api;
+    vgww::web::RegisterApi(api, dp, cfg, path, "boot-secret");
+    constexpr uint16_t kPort = 18103;
+    std::string start_err;
+    CHECK(api.Start("127.0.0.1", kPort, start_err));
+
+    // A binding added after the settings page was rendered (the runtime route
+    // persists it straight to the config file).
+    std::string up_err;
+    MacAddress late_mac{};
+    CHECK(ParseMac("30:fc:68:88:b4:b0", late_mac));
+    CHECK(UpsertDhcpBinding(path, late_mac,
+                                  ParseIpv4("192.168.0.55", ok), "late", up_err));
+
+    // Same for a DHCPv6 binding added at runtime.
+    std::array<uint8_t, 16> late_ip{};
+    late_ip[0] = 0xFD;
+    late_ip[1] = 0xAA;
+    late_ip[14] = 0x50;
+    late_ip[15] = 0x00;  // fdaa::5000
+    CHECK(UpsertDhcp6Binding(
+        path, std::vector<uint8_t>{0x00, 0x03, 0x00, 0x01, 0xAA, 0xBB},
+        late_ip, "nas6", up_err));
+
+    // The page renders from the stale body and posts it back unchanged.
+    std::string body;
+    CHECK(HttpGet("/api/config", kPort, body) == 200);
+    CHECK(body.find("b4:b0") == std::string::npos);  // genuinely stale
+    CHECK(body.find("5000") == std::string::npos);
+
+    std::string resp;
+    CHECK(HttpPost(kPort, "/api/config", "boot-secret", body, resp) == 200);
+
+    // The runtime-added binding must still be on disk (and loadable).
+    std::string load_err;
+    const auto disk = Config::LoadFromFile(path, load_err);
+    CHECK(disk.has_value());
+    bool found = false;
+    if (disk) {
+        MacAddress wanted{};
+        ParseMac("30:fc:68:88:b4:b0", wanted);
+        for (const auto& b : disk->dhcp.static_bindings) {
+            if (b.mac == wanted) {
+                found = true;
+            }
+        }
+    }
+    CHECK(found);
+
+    bool found6 = false;
+    if (disk) {
+        const std::vector<uint8_t> wanted = {0x00, 0x03, 0x00, 0x01,
+                                             0xAA, 0xBB};
+        for (const auto& b : disk->ipv6.dhcpv6.static_bindings) {
+            if (b.duid == wanted) {
+                found6 = true;
+            }
+        }
+    }
+    CHECK(found6);
+
+    api.Stop();
+    std::remove(path);
+    std::remove(rules.c_str());
+}
+
+// batch111: two in-flight saves can finish in either order. A completion must
+// only be attributed to the attempt that produced it: a late result from an
+// older attempt must not overwrite a newer one (the page polls the newer id).
+static void TestB111ApplyStatusIgnoresStaleCompletion() {
+    auto status = std::make_shared<vgww::web::ConfigApplyStatus>();
+    const uint64_t first = status->MarkAttempt();
+    const uint64_t second = status->MarkAttempt();
+    CHECK(first == 1 && second == 2);
+
+    // The newer attempt finishes first and succeeds.
+    status->Record(second, true, "");
+    auto snap = status->Get();
+    CHECK(snap.attempt_id == second);
+    CHECK(snap.completed_id == second);
+    CHECK(snap.ok);
+    CHECK(snap.error.empty());
+
+    // The older attempt's late failure must be dropped.
+    status->Record(first, false, "bind failed: stale attempt");
+    snap = status->Get();
+    CHECK(snap.completed_id == second);
+    CHECK(snap.ok);
+    CHECK(snap.error.empty());
+
+    // A newer attempt is pending again once stamped.
+    const uint64_t third = status->MarkAttempt();
+    snap = status->Get();
+    CHECK(snap.attempt_id == third);
+    CHECK(snap.completed_id == second);  // page sees "pending"
+    status->Record(third, false, "adapter missing");
+    snap = status->Get();
+    CHECK(snap.completed_id == third);
+    CHECK(!snap.ok);
+    CHECK(snap.error == "adapter missing");
 }
 
 // batch38 (user: any leftover / UX feedback): POST /api/config returns an
@@ -999,7 +1800,7 @@ static void TestB38WebApplyStatus() {
     auto status = std::make_shared<vgww::web::ConfigApplyStatus>();
     vgww::web::RegisterApi(
         api, dp, cfg, path, "boot-secret", {}, {}, {}, {},
-        [&](const Config&) {
+        [&](const Config&, uint64_t) {
             applied = true;
             return true;
         },
@@ -1028,13 +1829,13 @@ static void TestB38WebApplyStatus() {
     CHECK(body.find("\"completed_id\":0") != std::string::npos);
 
     // A successful apply records ok=true with the matching completed id.
-    status->Record(true, "");
+    status->Record(1, true, "");
     CHECK(HttpGet("/api/config/apply-status", kPort, body) == 200);
     CHECK(body.find("\"completed_id\":1") != std::string::npos);
     CHECK(body.find("\"ok\":true") != std::string::npos);
 
     // A failed apply records the backend error verbatim.
-    status->Record(false, "bind failed: EACCES");
+    status->Record(1, false, "bind failed: EACCES");
     CHECK(HttpGet("/api/config/apply-status", kPort, body) == 200);
     CHECK(body.find("\"ok\":false") != std::string::npos);
     CHECK(body.find("bind failed: EACCES") != std::string::npos);
@@ -1520,6 +2321,762 @@ static void TestB34oCorruptRuleFileIsNotSilentEmpty() {
     RuleStore::Instance().Clear();
 }
 
+// batch83: a corrupt rules file must be preserved, not silently overwritten by
+// the next mutation's persist - otherwise the only copy of the lost rules is
+// gone and the operator cannot even inspect what was rejected.
+static void TestB83CorruptRulesFilePreserved() {
+    using namespace vgww::web;
+    const std::string path = "b83_rules_corrupt.json";
+    const std::string aside = path + ".corrupt";
+    std::remove(path.c_str());
+    std::remove(aside.c_str());
+    const std::string garbage = "{ this is not json ";
+    {
+        std::ofstream out(path, std::ios::binary);
+        out << garbage;
+    }
+    RuleStore::Instance().AttachFile("");
+    RuleStore::Instance().Clear();
+    std::string error;
+    CHECK(!RuleStore::Instance().AttachFileChecked(path, error));
+    CHECK(error.find(".corrupt") != std::string::npos);
+    {
+        std::ifstream kept(aside, std::ios::binary);
+        CHECK(kept.good());
+        CHECK(std::string((std::istreambuf_iterator<char>(kept)),
+                          std::istreambuf_iterator<char>()) == garbage);
+    }
+    {
+        std::ifstream gone(path, std::ios::binary);
+        CHECK(!gone.good());
+    }
+    // The live path is free: the next mutation persists a fresh document and
+    // must not clobber the preserved copy.
+    RuleStore::Instance().AttachFile(path);
+    PortMappingRule rule;
+    rule.proto = "tcp";
+    rule.wan_port = 18083;
+    rule.lan_ip = "192.168.0.60";
+    rule.lan_port = 80;
+    RuleStore::Instance().SetPortMap(rule);
+    {
+        std::ifstream kept(aside, std::ios::binary);
+        CHECK(kept.good());
+        CHECK(std::string((std::istreambuf_iterator<char>(kept)),
+                          std::istreambuf_iterator<char>()) == garbage);
+    }
+    {
+        std::ifstream fresh(path, std::ios::binary);
+        CHECK(fresh.good());
+        CHECK(std::string((std::istreambuf_iterator<char>(fresh)),
+                          std::istreambuf_iterator<char>())
+                  .find("\"portmaps\"") != std::string::npos);
+    }
+    RuleStore::Instance().AttachFile("");
+    RuleStore::Instance().Clear();
+    std::remove(path.c_str());
+    std::remove(aside.c_str());
+}
+
+// batch85: a rules file that exists but cannot be OPENED (a scanner holds it)
+// is not corrupt. It must not be quarantined, and persistence must not
+// overwrite it with the empty in-memory set - the document may be the
+// operator's only copy of their forwards.
+static void TestB85UnreadableRulesFileIsNotOverwritten() {
+    using namespace vgww::web;
+    const std::string path = "b85_rules_locked.json";
+    const std::string aside = path + ".corrupt";
+    std::remove(path.c_str());
+    std::remove(aside.c_str());
+    const std::string valid =
+        R"({"portmaps":[{"proto":"tcp","wan_port":9091,"lan_ip":"192.168.0.70","lan_port":80}]})";
+    {
+        std::ofstream out(path, std::ios::binary);
+        out << valid;
+    }
+
+    RuleStore::Instance().AttachFile("");
+    RuleStore::Instance().Clear();
+    vgww::core::SetConfigOpenFailureHookForTest(
+        [](const std::string&) -> unsigned long { return 32u; });
+    std::string error;
+    const bool loaded = RuleStore::Instance().AttachFileChecked(path, error);
+    CHECK(!loaded);
+    CHECK(error.find("not readable") != std::string::npos);
+    {
+        std::ifstream in(path, std::ios::binary);
+        CHECK(in.good());
+        CHECK(std::string((std::istreambuf_iterator<char>(in)),
+                          std::istreambuf_iterator<char>()) == valid);
+    }
+    {
+        std::ifstream quarantined(aside, std::ios::binary);
+        CHECK(!quarantined.good());
+    }
+
+    // A mutation while blocked must count the lost write and leave the file
+    // exactly as it was.
+    const size_t failures_before =
+        RuleStore::Instance().PersistFailureCount();
+    PortMappingRule rule;
+    rule.proto = "tcp";
+    rule.wan_port = 9092;
+    rule.lan_ip = "192.168.0.71";
+    rule.lan_port = 80;
+    RuleStore::Instance().SetPortMap(rule);
+    CHECK(RuleStore::Instance().PersistFailureCount() > failures_before);
+    vgww::core::SetConfigOpenFailureHookForTest(
+        std::function<unsigned long(const std::string&)>());
+    {
+        std::ifstream in(path, std::ios::binary);
+        CHECK(std::string((std::istreambuf_iterator<char>(in)),
+                          std::istreambuf_iterator<char>()) == valid);
+    }
+
+    // Attaching the path again (new session) resets the block, and a readable
+    // document loads normally.
+    RuleStore::Instance().AttachFile(path);
+    CHECK(RuleStore::Instance().PortMapCount() == 1);
+    RuleStore::Instance().AttachFile("");
+    RuleStore::Instance().Clear();
+    std::remove(path.c_str());
+}
+
+// batch87: the block must clear WITHOUT a restart once the file can be read
+// again - and the changes made while persistence was paused must survive the
+// merge (the on-disk document is authoritative for what it holds).
+static void TestB87BlockedRulesRecoverWithoutRestart() {
+    using namespace vgww::web;
+    const std::string path = "b87_rules_recover.json";
+    std::remove(path.c_str());
+    {
+        std::ofstream out(path, std::ios::binary);
+        out << R"({"portmaps":[{"proto":"tcp","wan_port":9101,"lan_ip":"192.168.0.72","lan_port":80}]})";
+    }
+
+    RuleStore::Instance().AttachFile("");
+    RuleStore::Instance().Clear();
+    vgww::core::SetConfigOpenFailureHookForTest(
+        [](const std::string&) -> unsigned long { return 32u; });
+    std::string error;
+    CHECK(!RuleStore::Instance().AttachFileChecked(path, error));
+    vgww::core::SetConfigOpenFailureHookForTest(
+        std::function<unsigned long(const std::string&)>());
+    CHECK(RuleStore::Instance().PersistBlocked());
+    CHECK(RuleStore::Instance().PortMapCount() == 0);
+
+    // The lock clears; a mutation must recover by reading the disk document
+    // and merging both sets.
+    PortMappingRule rule;
+    rule.proto = "tcp";
+    rule.wan_port = 9102;
+    rule.lan_ip = "192.168.0.73";
+    rule.lan_port = 80;
+    RuleStore::Instance().SetPortMap(rule);
+
+    CHECK(!RuleStore::Instance().PersistBlocked());
+    CHECK(RuleStore::Instance().PortMapCount() == 2);
+    {
+        std::ifstream in(path, std::ios::binary);
+        const std::string body((std::istreambuf_iterator<char>(in)),
+                               std::istreambuf_iterator<char>());
+        CHECK(body.find("9101") != std::string::npos);
+        CHECK(body.find("9102") != std::string::npos);
+    }
+    RuleStore::Instance().AttachFile("");
+    RuleStore::Instance().Clear();
+    std::remove(path.c_str());
+}
+
+// batch88: the recovery merge must cover EVERY persisted rule kind, not just
+// port forwards. Seed a ban + a rate limit on disk, make a paused change of
+// each kind while the file is unreadable, then let recovery run: all of them
+// must survive, deduplicated by the same identities the loaders use.
+static void TestB88BlockedRecoveryMergesEveryRuleKind() {
+    using namespace vgww::web;
+    const std::string path = "b88_rules_kinds.json";
+    std::remove(path.c_str());
+    {
+        std::ofstream out(path, std::ios::binary);
+        out << R"({"portmaps":[{"proto":"tcp","wan_port":9201,"lan_ip":"192.168.0.80","lan_port":80}],)"
+               R"("bans":[{"kind":"ip","value":"10.9.9.9"}],)"
+               R"("ratelimits":[{"mac":"AA:BB:CC:00:00:01","uplink_kbps":1000,"downlink_kbps":2000}]})";
+    }
+
+    RuleStore::Instance().AttachFile("");
+    RuleStore::Instance().Clear();
+    vgww::core::SetConfigOpenFailureHookForTest(
+        [](const std::string&) -> unsigned long { return 32u; });
+    std::string error;
+    CHECK(!RuleStore::Instance().AttachFileChecked(path, error));
+    CHECK(RuleStore::Instance().PersistBlocked());
+
+    // Changes made while persistence is paused (every flush fails).
+    PortMappingRule pm;
+    pm.proto = "tcp";
+    pm.wan_port = 9202;
+    pm.lan_ip = "192.168.0.81";
+    pm.lan_port = 80;
+    RuleStore::Instance().SetPortMap(pm);
+    BanEntry ban;
+    ban.kind = "ip";
+    ban.value = "10.9.9.10";
+    CHECK(RuleStore::Instance().AddBanChecked(ban));
+    RateLimitRule rl;
+    rl.mac = "AA:BB:CC:00:00:02";
+    rl.uplink_kbps = 3000;
+    rl.downlink_kbps = 4000;
+    CHECK(RuleStore::Instance().SetRateLimitChecked(rl));
+    CHECK(RuleStore::Instance().PersistBlocked());  // still paused
+
+    // The lock clears; one more mutation recovers and writes the union.
+    vgww::core::SetConfigOpenFailureHookForTest(
+        std::function<unsigned long(const std::string&)>());
+    RateLimitRule rl2;
+    rl2.mac = "AA:BB:CC:00:00:03";
+    rl2.uplink_kbps = 5000;
+    rl2.downlink_kbps = 6000;
+    CHECK(RuleStore::Instance().SetRateLimitChecked(rl2));
+
+    CHECK(!RuleStore::Instance().PersistBlocked());
+    CHECK(RuleStore::Instance().PortMapCount() == 2);
+    CHECK(RuleStore::Instance().BanCount() == 2);
+    CHECK(RuleStore::Instance().RateLimits().size() == 3);
+    {
+        std::ifstream in(path, std::ios::binary);
+        const std::string body((std::istreambuf_iterator<char>(in)),
+                               std::istreambuf_iterator<char>());
+        CHECK(body.find("9201") != std::string::npos);   // disk port forward
+        CHECK(body.find("9202") != std::string::npos);   // paused port forward
+        CHECK(body.find("10.9.9.9") != std::string::npos);   // disk ban
+        CHECK(body.find("10.9.9.10") != std::string::npos);  // paused ban
+        CHECK(body.find("AA:BB:CC:00:00:01") != std::string::npos);  // disk cap
+        CHECK(body.find("AA:BB:CC:00:00:02") != std::string::npos);  // paused cap
+        CHECK(body.find("AA:BB:CC:00:00:03") != std::string::npos);
+    }
+    RuleStore::Instance().AttachFile("");
+    RuleStore::Instance().Clear();
+    std::remove(path.c_str());
+}
+
+// batch89: if the document turns CORRUPT (not merely locked) while persistence
+// is paused, recovery must preserve it and continue with a fresh file - the
+// same rule the attach path and the lease writers use. Keeping the writer
+// blocked forever (until a restart) was inconsistent and left the evidence
+// unsaved.
+static void TestB89RecoveryQuarantinesCorruptFile() {
+    using namespace vgww::web;
+    const std::string path = "b89_rules_corrupt.json";
+    const std::string aside = path + ".corrupt";
+    std::remove(path.c_str());
+    std::remove(aside.c_str());
+    {
+        std::ofstream out(path, std::ios::binary);
+        out << R"({"portmaps":[]})";
+    }
+
+    RuleStore::Instance().AttachFile("");
+    RuleStore::Instance().Clear();
+    vgww::core::SetConfigOpenFailureHookForTest(
+        [](const std::string&) -> unsigned long { return 32u; });
+    std::string error;
+    CHECK(!RuleStore::Instance().AttachFileChecked(path, error));
+    vgww::core::SetConfigOpenFailureHookForTest(
+        std::function<unsigned long(const std::string&)>());
+    CHECK(RuleStore::Instance().PersistBlocked());
+
+    // The file is readable again ... but the content is now garbage.
+    const std::string garbage = "{ not json at all";
+    {
+        std::ofstream out(path, std::ios::binary | std::ios::trunc);
+        out << garbage;
+    }
+
+    PortMappingRule rule;
+    rule.proto = "tcp";
+    rule.wan_port = 9301;
+    rule.lan_ip = "192.168.0.90";
+    rule.lan_port = 80;
+    RuleStore::Instance().SetPortMap(rule);
+
+    CHECK(!RuleStore::Instance().PersistBlocked());
+    CHECK(RuleStore::Instance().PortMapCount() == 1);
+    {
+        std::ifstream kept(aside, std::ios::binary);
+        CHECK(kept.good());
+        CHECK(std::string((std::istreambuf_iterator<char>(kept)),
+                          std::istreambuf_iterator<char>()) == garbage);
+    }
+    {
+        std::ifstream fresh(path, std::ios::binary);
+        CHECK(fresh.good());
+        CHECK(std::string((std::istreambuf_iterator<char>(fresh)),
+                          std::istreambuf_iterator<char>())
+                  .find("9301") != std::string::npos);
+    }
+    RuleStore::Instance().AttachFile("");
+    RuleStore::Instance().Clear();
+    std::remove(path.c_str());
+    std::remove(aside.c_str());
+}
+
+// batch90: blocked recovery must be single-shot under concurrent mutations.
+// While the file is unreadable every flush fails; once it lets go, several
+// threads race into FlushPersist. Exactly one may recover (re-read + merge);
+// the rest must see the cleared block, and every persisted document must stay
+// parseable with no temp leftovers.
+static void TestB90ConcurrentBlockedRecovery() {
+    using namespace vgww::web;
+    const std::string path = "b90_rules_concurrent.json";
+    std::remove(path.c_str());
+    {
+        std::ofstream out(path, std::ios::binary);
+        out << R"({"portmaps":[{"proto":"tcp","wan_port":9400,"lan_ip":"192.168.0.100","lan_port":80}]})";
+    }
+
+    RuleStore::Instance().AttachFile("");
+    RuleStore::Instance().Clear();
+    vgww::core::SetConfigOpenFailureHookForTest(
+        [](const std::string&) -> unsigned long { return 32u; });
+    std::string error;
+    CHECK(!RuleStore::Instance().AttachFileChecked(path, error));
+    CHECK(RuleStore::Instance().PersistBlocked());
+
+    constexpr int kThreads = 4;
+    constexpr int kPausedPerThread = 5;
+    // Paused-phase mutations: every flush fails, the block must stay.
+    {
+        std::vector<std::thread> workers;
+        for (int t = 0; t < kThreads; ++t) {
+            workers.emplace_back([t] {
+                for (int i = 0; i < kPausedPerThread; ++i) {
+                    PortMappingRule r;
+                    r.proto = "tcp";
+                    r.wan_port = static_cast<uint16_t>(9410 + t * 10 + i);
+                    r.lan_ip = "192.168.0.110";
+                    r.lan_port = 80;
+                    (void)RuleStore::Instance().AddPortMap(r);
+                }
+            });
+        }
+        for (auto& w : workers) {
+            w.join();
+        }
+    }
+    CHECK(RuleStore::Instance().PersistBlocked());
+    CHECK(RuleStore::Instance().PortMapCount() ==
+          kThreads * kPausedPerThread);
+
+    // The lock clears: concurrent post-recovery mutations race on the flush.
+    const size_t recoveries_before = RuleStore::Instance().RecoveryCount();
+    vgww::core::SetConfigOpenFailureHookForTest(
+        std::function<unsigned long(const std::string&)>());
+    {
+        std::vector<std::thread> workers;
+        for (int t = 0; t < kThreads; ++t) {
+            workers.emplace_back([t] {
+                PortMappingRule r;
+                r.proto = "tcp";
+                r.wan_port = static_cast<uint16_t>(9500 + t);
+                r.lan_ip = "192.168.0.111";
+                r.lan_port = 80;
+                (void)RuleStore::Instance().AddPortMap(r);
+            });
+        }
+        for (auto& w : workers) {
+            w.join();
+        }
+    }
+
+    CHECK(!RuleStore::Instance().PersistBlocked());
+    // Exactly one thread may perform the recovery, however they interleave.
+    CHECK(RuleStore::Instance().RecoveryCount() == recoveries_before + 1);
+    const size_t expected =
+        1 + kThreads * kPausedPerThread + kThreads;  // disk + paused + live
+    CHECK(RuleStore::Instance().PortMapCount() == expected);
+    {
+        std::ifstream in(path, std::ios::binary);
+        const std::string body((std::istreambuf_iterator<char>(in)),
+                               std::istreambuf_iterator<char>());
+        const auto parsed = nlohmann::json::parse(body, nullptr, false);
+        CHECK(!parsed.is_discarded());
+        CHECK(parsed.is_object());
+        const auto pm = parsed.find("portmaps");
+        CHECK(pm != parsed.end() && pm->is_array());
+        CHECK(pm != parsed.end() && pm->is_array() && pm->size() == expected);
+        CHECK(body.find("9400") != std::string::npos);  // disk rule merged
+        CHECK(body.find("9500") != std::string::npos);  // live rule written
+    }
+    // No temp leftovers from the racing writers.
+    size_t leftovers = 0;
+    for (const auto& entry : std::filesystem::directory_iterator(".")) {
+        const std::string name = entry.path().filename().string();
+        if (0 == name.rfind(path + ".tmp.", 0)) {
+            ++leftovers;
+        }
+    }
+    CHECK(0 == leftovers);
+
+    RuleStore::Instance().AttachFile("");
+    RuleStore::Instance().Clear();
+    std::remove(path.c_str());
+}
+
+// batch92: a mutation that reached memory but NOT the disk must say so. The
+// route keeps answering 200 (the change is live) but reports persisted:false,
+// so a client cannot mistake it for a durable save.
+static void TestB92MutationReportsPersistFailure() {
+    using namespace vgww::core;
+    using namespace vgww::web;
+    const char* path = "b92_status.json";
+    const std::string rules = std::string(path) + ".rules.json";
+    std::remove(path);
+    std::error_code ec;
+    std::filesystem::remove_all(rules, ec);
+    // A DIRECTORY at the rules path makes every write fail permanently.
+    CHECK(std::filesystem::create_directory(rules, ec));
+
+    Config cfg;
+    cfg.web.port = 18326;
+    bool ok = false;
+    cfg.gateway.ipv4 = ParseIpv4("192.168.0.42", ok);
+    cfg.gateway.mask = ParseIpv4("255.255.255.0", ok);
+    MacAddress mac{};
+    ParseMac("30:fc:68:88:b4:ab", mac);
+    cfg.gateway.mac = mac;
+    std::string err;
+    CHECK(cfg.SaveToFile(path, err));
+
+    vgww::runtime::Dataplane dp(cfg);
+    HttpServer api;
+    vgww::web::RegisterApi(api, dp, cfg, path);
+    constexpr uint16_t kPort = 18326;
+    std::string start_err;
+    CHECK(api.Start("127.0.0.1", kPort, start_err));
+
+    std::string resp;
+    const std::string ban = R"({"kind":"ip","value":"10.7.7.7"})";
+    CHECK(200 == HttpPost(kPort, "/api/bans", "", ban, resp));
+    CHECK(resp.find("\"ok\":true") != std::string::npos);
+    CHECK(resp.find("\"persisted\":false") != std::string::npos);
+    // The ban IS live in memory: the change happened, only durability failed.
+    std::string body;
+    CHECK(200 == HttpGet("/api/bans", kPort, body));
+    CHECK(body.find("10.7.7.7") != std::string::npos);
+
+    // Remove the blocker: the next mutation retries the pending snapshot and
+    // reports a durable success.
+    std::filesystem::remove_all(rules, ec);
+    const std::string ban2 = R"({"kind":"ip","value":"10.7.7.8"})";
+    CHECK(200 == HttpPost(kPort, "/api/bans", "", ban2, resp));
+    CHECK(resp.find("\"persisted\":true") != std::string::npos);
+    CHECK(std::filesystem::exists(rules));
+
+    api.Stop();
+    std::remove(path);
+    std::filesystem::remove_all(rules, ec);
+}
+
+// batch93: a DHCP static binding added/removed over the API must survive a
+// restart: the route records it in the config document (durable writer) and
+// reports persisted:true; with no usable config path it reports persisted:false
+// while the runtime binding still applies.
+// batch100: a lease-document write failure must be visible on the status
+// surface (count), not only on stderr, and Stop() must report the dirty
+// teardown so the operator knows the mappings are gone.
+static void TestB101StatusExposesLeasePersistFailures() {
+    using namespace vgww::core;
+    const char* cfg_path = "b101_config.json";
+    const char* lease_path = "b101_leases.json";
+    std::remove(cfg_path);
+    std::remove(lease_path);
+    Config cfg;
+    cfg.adapter = "B101NIC";
+    cfg.mode = Mode::kMain;
+    cfg.dhcp.enabled = true;
+    bool ok = false;
+    cfg.gateway.ipv4 = ParseIpv4("192.168.45.1", ok);
+    cfg.gateway.mask = ParseIpv4("255.255.255.0", ok);
+    cfg.gateway.mac = {0x30, 0xFC, 0x68, 0x88, 0xB4, 0xB1};
+    cfg.dhcp.pool_start = ParseIpv4("192.168.45.100", ok);
+    cfg.dhcp.pool_end = ParseIpv4("192.168.45.200", ok);
+    cfg.perf.workers = 2;
+    cfg.perf.ring_capacity = 64;
+    cfg.perf.max_conns = 64;
+    std::string err;
+    CHECK(cfg.SaveToFile(cfg_path, err));
+
+    vgww::runtime::Dataplane dp(cfg, lease_path);
+    dp.SetDriverClient(std::make_unique<WebFakeDriver>());
+    CHECK(dp.Start(err));
+    dp.SetLeaseDumpIntervalForTest(std::chrono::milliseconds(50));
+
+    HttpServer api;
+    vgww::web::RegisterApi(api, dp, cfg, cfg_path, "b101-secret");
+    constexpr uint16_t kP = 18101;
+    CHECK(api.Start("127.0.0.1", kP, err));
+    {
+        // batch101: the status surface must carry the stop-durability verdict
+        // (false on a fresh run), not only the failure counter.
+        std::string initial;
+        CHECK(200 == HttpGet("/api/status", kP, initial));
+        CHECK(initial.find("\"stop_persist_failed\":false") !=
+              std::string::npos);
+        // batch104: the v6 pool-exhaustion counter is on the status surface.
+        CHECK(initial.find("\"pool_exhausted\":0") != std::string::npos);
+        // batch105: and so is the v4 sibling (v4 counter already existed and
+        // the native UI showed it, but the status surface omitted it).
+        const size_t dhcp6_at = initial.find("},\"dhcp6\":{");
+        CHECK(dhcp6_at != std::string::npos);
+        CHECK(initial.substr(0, dhcp6_at).find("\"pool_exhausted\":0") !=
+              std::string::npos);
+    }
+
+    // A DIRECTORY at the lease document makes every snapshot fail.
+    std::error_code ec;
+    std::filesystem::create_directory(lease_path, ec);
+    const auto deadline =
+        std::chrono::steady_clock::now() + std::chrono::seconds(3);
+    bool exposed = false;
+    std::string body;
+    while (std::chrono::steady_clock::now() < deadline && !exposed) {
+        body.clear();
+        if (200 == HttpGet("/api/status", kP, body)) {
+            const std::string key =
+                "\"persistence_paused\":false,\"persist_failures\":";
+            const size_t at = body.find(key);
+            if (std::string::npos != at) {
+                const size_t num = at + key.size();
+                exposed = num < body.size() && body[num] != '0';
+            }
+        }
+        if (!exposed) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(50));
+        }
+    }
+    CHECK(exposed);
+
+    api.Stop();
+    std::string stop_error;
+    CHECK(dp.Stop(stop_error));
+    // The directory is still in place, so the stop-time snapshot failed too.
+    CHECK(dp.StopPersistFailed());
+    std::filesystem::remove(lease_path, ec);
+    std::remove(cfg_path);
+    std::remove((std::string(cfg_path) + ".rules.json").c_str());
+    std::remove(lease_path);
+}
+
+// batch106: the rule document (and the lease documents) reach disk through
+// core::WriteFileAtomicDurable without any cross-process guard; a second VGWW
+// process could replace the whole file. Anchor: while another owner holds the
+// destination's lock, a rule mutation must block; it completes on release.
+static void TestB106RulesWriteUsesCrossProcessLock() {
+    using namespace vgww::web;
+    const std::string rules = "b106_rules.json.rules.json";
+    std::remove(rules.c_str());
+    RuleStore& store = RuleStore::Instance();
+    store.AttachFile(rules);
+    store.Clear();  // baseline publish (creates the document)
+    CHECK(store.PersistUpToDate());
+
+    std::atomic<bool> held{false};
+    std::atomic<bool> release{false};
+    std::thread holder([&] {
+        vgww::core::ConfigFileLock lock(rules);
+        held.store(true, std::memory_order_release);
+        while (!release.load(std::memory_order_acquire)) {
+            std::this_thread::yield();
+        }
+    });
+    while (!held.load(std::memory_order_acquire)) {
+        std::this_thread::yield();
+    }
+
+    std::atomic<bool> done{false};
+    std::thread writer([&] {
+        BanEntry ban;
+        ban.kind = "ip";
+        ban.value = "10.66.0.1";
+        (void)store.AddBanChecked(std::move(ban));
+        done.store(true, std::memory_order_release);
+    });
+    for (int i = 0; i < 40 && !done.load(std::memory_order_acquire); ++i) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(5));
+    }
+    CHECK(!done.load(std::memory_order_acquire));  // blocked by the lock
+    release.store(true, std::memory_order_release);
+    holder.join();
+    writer.join();
+    CHECK(done.load(std::memory_order_acquire));
+    CHECK(store.PersistUpToDate());
+
+    store.AttachFile("");
+    store.Clear();
+    std::remove(rules.c_str());
+}
+
+static void TestB93DhcpBindingPersistsToConfig() {
+    using namespace vgww::core;
+    const char* cfg_path = "b93_config.json";
+    const char* lease_path = "b93_leases.json";
+    std::remove(cfg_path);
+    std::remove(lease_path);
+    Config cfg;
+    cfg.adapter = "B93NIC";
+    cfg.mode = Mode::kMain;
+    cfg.dhcp.enabled = true;
+    bool ok = false;
+    cfg.gateway.ipv4 = ParseIpv4("192.168.41.1", ok);
+    cfg.gateway.mask = ParseIpv4("255.255.255.0", ok);
+    cfg.gateway.mac = {0x30, 0xFC, 0x68, 0x88, 0xB4, 0x93};
+    cfg.dhcp.pool_start = ParseIpv4("192.168.41.100", ok);
+    cfg.dhcp.pool_end = ParseIpv4("192.168.41.200", ok);
+    cfg.dhcp.lease_seconds = 3600;
+    // DHCPv6 service so the v6 binding route is reachable too (batch93 covers
+    // the same persistence contract for the DUID list).
+    cfg.ipv6.enabled = true;
+    cfg.ipv6.prefix_len = 64;
+    cfg.ipv6.ula_prefix = {0xFD, 0x00, 0x11, 0x22, 0x33, 0x44, 0x55,
+                           0x66, 0, 0, 0, 0, 0, 0, 0, 0};
+    cfg.ipv6.dhcpv6.enabled = true;
+    cfg.ipv6.dhcpv6.pool_start = {0xFD, 0x00, 0x11, 0x22, 0x33, 0x44,
+                                  0x55, 0x66, 0, 0, 0, 0, 0, 0, 0x10, 0x00};
+    cfg.ipv6.dhcpv6.pool_end = {0xFD, 0x00, 0x11, 0x22, 0x33, 0x44,
+                                0x55, 0x66, 0, 0, 0, 0, 0, 0, 0x1F, 0xFF};
+    cfg.perf.workers = 2;
+    cfg.perf.ring_capacity = 64;
+    cfg.perf.max_conns = 64;
+    std::string err;
+    CHECK(cfg.SaveToFile(cfg_path, err));
+
+    vgww::runtime::Dataplane dp(cfg, lease_path);
+    dp.SetDriverClient(std::make_unique<WebFakeDriver>());
+    std::string start_error;
+    CHECK(dp.Start(start_error));
+    CHECK(dp.DhcpActive());
+    CHECK(dp.Dhcp6Active());
+
+    HttpServer api;
+    vgww::web::RegisterApi(api, dp, cfg, cfg_path, "boot-secret");
+    constexpr uint16_t kP = 18098;
+    CHECK(api.Start("127.0.0.1", kP, err));
+
+    MacAddress want{};
+    CHECK(ParseMac("02:00:00:00:93:01", want));
+    std::string body;
+    CHECK(200 == HttpPost(
+                     kP, "/api/dhcp/bindings", "boot-secret",
+                     R"({"mac":"02:00:00:00:93:01","ip":"192.168.41.210","hostname":"printer"})",
+                     body));
+    CHECK(body.find("\"persisted\":true") != std::string::npos);
+    {
+        std::string load_err;
+        const auto disk = Config::LoadFromFile(cfg_path, load_err);
+        CHECK(disk.has_value());
+        bool found = false;
+        if (disk) {
+            for (const auto& b : disk->dhcp.static_bindings) {
+                if (b.mac == want) {
+                    found = true;
+                    CHECK(b.ip == ParseIpv4("192.168.41.210", ok));
+                    CHECK(b.hostname == "printer");
+                }
+            }
+        }
+        CHECK(found);
+    }
+
+    // DELETE persists the removal as well.
+    const std::string del =
+        "DELETE /api/dhcp/bindings?mac=02:00:00:00:93:01 HTTP/1.1\r\n"
+        "Host: t\r\nX-Auth-Token: boot-secret\r\nContent-Length: 0\r\n"
+        "Connection: close\r\n\r\n";
+    CHECK(200 == HttpRaw(kP, del, body));
+    CHECK(body.find("\"persisted\":true") != std::string::npos);
+    {
+        std::string load_err;
+        const auto disk = Config::LoadFromFile(cfg_path, load_err);
+        CHECK(disk.has_value());
+        bool found = false;
+        if (disk) {
+            for (const auto& b : disk->dhcp.static_bindings) {
+                if (b.mac == want) {
+                    found = true;
+                }
+            }
+        }
+        CHECK(!found);
+    }
+    // batch93 (v6): the DUID list follows the same persist/remove contract.
+    const std::string duid = "00:03:00:01:02:00:00:93:01";
+    CHECK(200 == HttpPost(
+                     kP, "/api/dhcp6/bindings", "boot-secret",
+                     R"({"duid":"00:03:00:01:02:00:00:93:01","ip":"fd00:1122:3344:5566::2100","hostname":"nas"})",
+                     body));
+    CHECK(body.find("\"persisted\":true") != std::string::npos);
+    {
+        std::vector<uint8_t> want_duid;
+        CHECK(vgww::runtime::ParseDuidText(duid, want_duid));
+        std::array<uint8_t, 16> want_ip{};
+        CHECK(ParseIpv6("fd00:1122:3344:5566::2100", want_ip));
+        std::string load_err;
+        const auto disk = Config::LoadFromFile(cfg_path, load_err);
+        CHECK(disk.has_value());
+        bool found = false;
+        if (disk) {
+            for (const auto& b : disk->ipv6.dhcpv6.static_bindings) {
+                if (b.duid == want_duid) {
+                    found = true;
+                    CHECK(b.ip == want_ip);
+                    CHECK(b.hostname == "nas");
+                }
+            }
+        }
+        CHECK(found);
+    }
+    const std::string del6 =
+        "DELETE /api/dhcp6/bindings?duid=00:03:00:01:02:00:00:93:01 HTTP/1.1\r\n"
+        "Host: t\r\nX-Auth-Token: boot-secret\r\nContent-Length: 0\r\n"
+        "Connection: close\r\n\r\n";
+    CHECK(200 == HttpRaw(kP, del6, body));
+    CHECK(body.find("\"persisted\":true") != std::string::npos);
+    {
+        std::vector<uint8_t> want_duid;
+        CHECK(vgww::runtime::ParseDuidText(duid, want_duid));
+        std::string load_err;
+        const auto disk = Config::LoadFromFile(cfg_path, load_err);
+        CHECK(disk.has_value());
+        bool found = false;
+        if (disk) {
+            for (const auto& b : disk->ipv6.dhcpv6.static_bindings) {
+                if (b.duid == want_duid) {
+                    found = true;
+                }
+            }
+        }
+        CHECK(!found);
+    }
+    api.Stop();
+
+    // Persistence disabled (empty config path): the runtime binding still
+    // applies, but the route says it is not durable.
+    HttpServer api2;
+    vgww::web::RegisterApi(api2, dp, cfg, "", "boot-secret");
+    constexpr uint16_t kP2 = 18097;
+    CHECK(api2.Start("127.0.0.1", kP2, err));
+    CHECK(200 == HttpPost(kP2, "/api/dhcp/bindings", "boot-secret",
+                          R"({"mac":"02:00:00:00:93:02","ip":"192.168.41.211"})",
+                          body));
+    CHECK(body.find("\"persisted\":false") != std::string::npos);
+    api2.Stop();
+
+    std::string stop_error;
+    dp.Stop(stop_error);
+    std::remove(cfg_path);
+    std::remove(lease_path);
+}
+
 // Rules read from the FILE must satisfy the same semantic contract the API
 // enforces on POST: proto is tcp, lan_ip is a dotted quad, both ports are
 // non-zero. A file written by hand (or by an older version) otherwise injects
@@ -1942,6 +3499,188 @@ static void TestAcceptHandlerThrowKeepsAccepting() {
     // reach run().
     CHECK(0 == srv.EscapedHandlerErrors());
     srv.Stop();
+}
+
+// The RE-ARM is the other half: it allocates the next accept operation, and
+// an allocation failure there used to escape the completion handler (the
+// AcceptLoop caught it, counted it as "escaped", and the accept thread died).
+// With the firewall the failure is counted as a RE-ARM error, the request
+// already queued is still served, and the thread survives.
+static void TestAcceptRearmThrowIsContained() {
+    using namespace vgww::web;
+    HttpServer srv;
+    srv.Route("GET", "/api/rearm-alive", [](const Request&) {
+        return Response::Text("alive", 200);
+    });
+    std::string err;
+    constexpr uint16_t kPort = 18319;
+    CHECK(srv.Start("127.0.0.1", kPort, err));
+
+    std::string body;
+    CHECK(200 == HttpGetWithin("/api/rearm-alive", kPort, body, 2000));
+    CHECK("alive" == body);
+
+    auto threw = std::make_shared<std::atomic<int>>(0);
+    srv.SetAcceptRearmProbeForTest([threw] {
+        if (0 == threw->fetch_add(1)) {
+            throw std::runtime_error("re-arm exploded");
+        }
+    });
+    const uint64_t before = srv.RearmErrors();
+    // This connection is accepted and queued BEFORE the re-arm runs, so it is
+    // served; the re-arm that follows throws and is swallowed.
+    CHECK(200 == HttpGetWithin("/api/rearm-alive", kPort, body, 2000));
+    CHECK("alive" == body);
+    for (int i = 0; i < 100 && srv.RearmErrors() == before; ++i) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    }
+    std::printf("b-rearm accept: rearm=%llu escaped=%llu\n",
+                static_cast<unsigned long long>(srv.RearmErrors()),
+                static_cast<unsigned long long>(srv.EscapedHandlerErrors()));
+    CHECK(srv.RearmErrors() == before + 1);
+    CHECK(1 == threw->load());
+    CHECK(0 == srv.EscapedHandlerErrors());
+    srv.SetAcceptRearmProbeForTest(nullptr);
+    srv.Stop();
+}
+
+// Firewall counters must be part of the operator-visible surface: a swallow
+// that is counted but never exposed is still a silent failure. /api/status
+// carries the data-plane counters, the port-map health counters and the web
+// accept counters; the values move when a failure is injected.
+static void TestBStatusExposesFirewallCounts() {
+    using namespace vgww::core;
+    using namespace vgww::web;
+    const char* path = "bfw-status.json";
+    const std::string rules = std::string(path) + ".rules.json";
+    std::remove(path);
+    std::remove(rules.c_str());
+
+    Config cfg;
+    cfg.web.port = 18323;
+    bool ok = false;
+    cfg.gateway.ipv4 = ParseIpv4("192.168.0.40", ok);
+    cfg.gateway.mask = ParseIpv4("255.255.255.0", ok);
+    MacAddress mac{};
+    ParseMac("30:fc:68:88:b4:a9", mac);
+    cfg.gateway.mac = mac;
+    std::string err;
+    CHECK(cfg.SaveToFile(path, err));
+
+    vgww::runtime::Dataplane dp(cfg);
+    HttpServer api;
+    vgww::web::RegisterApi(api, dp, cfg, path);
+    constexpr uint16_t kPort = 18323;
+    std::string start_err;
+    CHECK(api.Start("127.0.0.1", kPort, start_err));
+
+    std::string body;
+    CHECK(200 == HttpGet("/api/status", kPort, body));
+    CHECK(body.find("\"thread_errors\":") != std::string::npos);
+    CHECK(body.find("\"handler_errors\":") != std::string::npos);
+    CHECK(body.find("\"portmap_health\":{") != std::string::npos);
+    CHECK(body.find("\"loop_errors\":") != std::string::npos);
+    CHECK(body.find("\"rearm_errors\":") != std::string::npos);
+    CHECK(body.find("\"escaped_handler_errors\":") != std::string::npos);
+    CHECK(body.find("\"web\":{") != std::string::npos);
+
+    // Inject one accept-body throw, then read the SAME endpoint: the web
+    // counter must have moved there, not just in the test's own accessor.
+    auto armed = std::make_shared<std::atomic<int>>(0);
+    api.SetAcceptProbeForTest([armed] {
+        if (0 == armed->fetch_add(1)) {
+            throw std::runtime_error("accept body exploded");
+        }
+    });
+    CHECK(SendAndDiscard(kPort,
+                         "GET /api/status HTTP/1.1\r\nHost: t\r\n"
+                         "Connection: close\r\n\r\n"));
+    int status = -1;
+    for (int i = 0; i < 20; ++i) {
+        body.clear();
+        status = HttpGetWithin("/api/status", kPort, body, 1000);
+        if (200 == status && body.find("\"handler_errors\":1") !=
+                                 std::string::npos) {
+            break;
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(20));
+    }
+    std::printf("bfw status: status=%d web_handler_errors=%llu\n", status,
+                static_cast<unsigned long long>(api.HandlerErrors()));
+    CHECK(200 == status);
+    CHECK(body.find("\"web\":{\"handler_errors\":1,") != std::string::npos);
+    CHECK(api.HandlerErrors() == 1);
+
+    api.SetAcceptProbeForTest(nullptr);
+    api.Stop();
+    std::remove(path);
+    std::remove(rules.c_str());
+}
+
+// batch86: "why did my change not survive a restart" must have a visible
+// answer on the status surface: the rules writer can be PAUSED (file exists
+// but could not be read) and the DHCP lease writers can be paused for the
+// same reason. The keys are real state, not decoration - injecting a blocked
+// rules store flips the reported value.
+static void TestB86StatusExposesPersistenceHealth() {
+    using namespace vgww::core;
+    using namespace vgww::web;
+    const char* path = "b86-status.json";
+    const std::string rules_path = "b86-rules.json";
+    std::remove(path);
+    std::remove(rules_path.c_str());
+    {
+        // A valid rules document that the loader will (simulated) fail to
+        // open, exactly like a scanner holding it.
+        std::ofstream out(rules_path, std::ios::binary);
+        out << R"({"portmaps":[]})";
+    }
+
+    Config cfg;
+    cfg.web.port = 18324;
+    bool ok = false;
+    cfg.gateway.ipv4 = ParseIpv4("192.168.0.41", ok);
+    cfg.gateway.mask = ParseIpv4("255.255.255.0", ok);
+    MacAddress mac{};
+    ParseMac("30:fc:68:88:b4:aa", mac);
+    cfg.gateway.mac = mac;
+    std::string err;
+    CHECK(cfg.SaveToFile(path, err));
+
+    vgww::runtime::Dataplane dp(cfg);
+    HttpServer api;
+    vgww::web::RegisterApi(api, dp, cfg, path);
+    constexpr uint16_t kPort = 18324;
+    std::string start_err;
+    CHECK(api.Start("127.0.0.1", kPort, start_err));
+
+    std::string body;
+    CHECK(200 == HttpGet("/api/status", kPort, body));
+    CHECK(body.find("\"rules\":{") != std::string::npos);
+    CHECK(body.find("\"persist_blocked\":false") != std::string::npos);
+    CHECK(body.find("\"persist_failures\":") != std::string::npos);
+    CHECK(body.find("\"recoveries\":") != std::string::npos);
+    CHECK(body.find("\"persistence_paused\":false") != std::string::npos);
+
+    // Inject the real blocked state and read the SAME endpoint.
+    RuleStore::Instance().AttachFile("");
+    RuleStore::Instance().Clear();
+    vgww::core::SetConfigOpenFailureHookForTest(
+        [](const std::string&) -> unsigned long { return 32u; });
+    std::string attach_error;
+    CHECK(!RuleStore::Instance().AttachFileChecked(rules_path, attach_error));
+    vgww::core::SetConfigOpenFailureHookForTest(
+        std::function<unsigned long(const std::string&)>());
+    CHECK(RuleStore::Instance().PersistBlocked());
+    body.clear();
+    CHECK(200 == HttpGet("/api/status", kPort, body));
+    CHECK(body.find("\"persist_blocked\":true") != std::string::npos);
+
+    RuleStore::Instance().AttachFile("");
+    RuleStore::Instance().Clear();
+    api.Stop();
+    std::remove(path);
+    std::remove(rules_path.c_str());
 }
 
 // The token comparison must not depend on WHERE the first difference is: a
@@ -3425,7 +5164,1128 @@ static void TestB121WebApiEscapeKeepsControlCharacters() {
         store.Clear();
         std::remove(path.c_str());
     }
-int main() {
+
+// ============================================================================
+// P82: cross-process rules RMW - process-unique ids, durable tombstones and
+// the read-merge-write that keeps two VGWW processes from overwriting each
+// other's rules.
+// ============================================================================
+
+namespace {
+
+    // Deterministic minter for the pure-function tests: the same layout the
+    // store uses (marker | salt32 | counter31) with an explicit counter.
+    struct SeqMinter {
+        uint64_t salt = 0x0FEDCBA9ull;
+        uint32_t counter = 1;
+        uint64_t operator()() {
+            const uint64_t id = (1ull << 63) |
+                                (salt << 31) |
+                                (static_cast<uint64_t>(counter) &
+                                 ((1ull << 31) - 1));
+            ++counter;
+            return id;
+        }
+    };
+
+    std::string P82ReadText(const std::string& path) {
+        std::ifstream in(path, std::ios::binary);
+        return std::string((std::istreambuf_iterator<char>(in)),
+                           std::istreambuf_iterator<char>());
+    }
+
+    std::wstring P82Wide(const std::string& text) {
+        return std::wstring(text.begin(), text.end());
+    }
+
+}  // namespace
+
+// P82: the id layout (marker | salt32 | counter31), the shared counter across
+// the three rule kinds, and the cross-process uniqueness that a per-process
+// salt buys.
+static void TestP82RuleIdLayoutAndUniqueness() {
+    using namespace vgww::web;
+    auto& store = RuleStore::Instance();
+    store.AttachFile("");
+    store.Clear();
+
+    store.SetRuleIdSaltForTest(0x23456789ull);
+    const uint64_t salt = 0x23456789ull;
+    const uint64_t a = store.AddPortMapTracked(
+        MakeRule("tcp", 20001, "192.168.0.10", 80));
+    const uint64_t b = store.AddPortMapTracked(
+        MakeRule("tcp", 20002, "192.168.0.11", 80));
+    CHECK(0 != a && 0 != b);
+    CHECK(a != b);
+    CHECK((a >> 63) == 1ull);                       // marker
+    CHECK((b >> 63) == 1ull);
+    CHECK(((a >> 31) & 0xFFFFFFFFull) == salt);     // salt field
+    CHECK((a & ((1ull << 31) - 1)) == 1ull);        // counter from 1
+    CHECK((b & ((1ull << 31) - 1)) == 2ull);
+
+    // The counter is shared by all three kinds.
+    BanEntry ban;
+    ban.kind = "mac";
+    ban.value = "02:00:00:00:00:01";
+    CHECK(store.AddBanChecked(ban));
+    const uint64_t ban_id = store.Bans().back().id;
+    CHECK((ban_id & ((1ull << 31) - 1)) == 3ull);
+
+    RateLimitRule rl;
+    rl.mac = "02:00:00:00:00:02";
+    rl.uplink_kbps = 100;
+    rl.downlink_kbps = 0;
+    CHECK(store.SetRateLimitChecked(rl));
+    const uint64_t rate_id = store.RateLimits().back().id;
+    CHECK((rate_id & ((1ull << 31) - 1)) == 4ull);
+    CHECK((rate_id >> 63) == 1ull);
+
+    // A different salt must give a different id: two processes cannot mint
+    // the same identity.
+    store.SetRuleIdSaltForTest(0x9ABCDEF1ull);
+    const uint64_t c = store.AddPortMapTracked(
+        MakeRule("tcp", 20003, "192.168.0.12", 80));
+    CHECK(c != a);
+    CHECK(c != b);
+    CHECK(((c >> 31) & 0xFFFFFFFFull) == 0x9ABCDEF1ull);
+
+    // A zero salt is bumped to non-zero (the layout requires it).
+    store.SetRuleIdSaltForTest(0);
+    const uint64_t d = store.AddPortMapTracked(
+        MakeRule("tcp", 20004, "192.168.0.13", 80));
+    CHECK(0 != ((d >> 31) & 0xFFFFFFFFull));
+    CHECK((d >> 63) == 1ull);
+
+    store.AttachFile("");
+    store.Clear();
+}
+
+// P82: cross-process id uniqueness WITHOUT the test seam. Two fresh processes
+// mint from their own salt (CsprngBytes ^ pid), so their ids must differ. This
+// is the M6 anchor: a fixed salt would give both processes the same id.
+static void TestP82IdUniquenessWithoutTestSeam() {
+    using namespace vgww::web;
+    auto& store = RuleStore::Instance();
+    store.AttachFile("");
+    store.Clear();
+    // No SetRuleIdSaltForTest call: the real Csprng path runs.
+    const uint64_t a = store.AddPortMapTracked(
+        MakeRule("tcp", 20101, "192.168.0.200", 80));
+    CHECK(0 != a);
+    CHECK((a >> 63) == 1ull);
+    const uint64_t salt_a = (a >> 31) & 0xFFFFFFFFull;
+    CHECK(0 != salt_a);
+    store.AttachFile("");
+    store.Clear();
+}
+
+// P82: the pure parser/merge helpers - tombstone skip (not counted), legacy id
+// preservation, per-kind duplicate-id collapse, the tombstone ceiling, and the
+// merge's memory-priority / disk-only / cap / mint rules.
+static void TestP82ReadRuleDocumentAndMerge() {
+    using namespace vgww::web;
+    const uint64_t kMarker = 1ull << 63;
+
+    // --- ReadRuleDocument: tombstoned entries are skipped, NOT counted -------
+    {
+        const std::string path = WriteRuleFile(
+            "p82_read.json",
+            R"({"version":2,"removed":[100,101],)"
+            R"("portmaps":[)"
+            R"({"proto":"tcp","wan_port":7001,"lan_ip":"192.168.0.10","lan_port":80,"id":100},)"
+            R"({"proto":"tcp","wan_port":7002,"lan_ip":"192.168.0.11","lan_port":80,"id":101},)"
+            R"({"proto":"tcp","wan_port":7003,"lan_ip":"192.168.0.12","lan_port":80,"id":102},)"
+            R"({"proto":"udp","wan_port":7004,"lan_ip":"192.168.0.13","lan_port":80,"id":103}]})");
+        RuleDocument doc;
+        const auto outcome = RuleStore::ReadRuleDocument(path, doc);
+        CHECK(outcome == RuleStore::LoadOutcome::kOk);
+        CHECK(doc.port_maps.size() == 1);        // 100, 101 tombstoned; 103 udp
+        CHECK(doc.tombstones.size() == 2);
+        CHECK(doc.tombstone_order.size() == 2);
+        CHECK(doc.discarded == 1);               // only the udp entry
+        if (doc.port_maps.size() == 1) {
+            CHECK(doc.port_maps[0].id == 102);
+        }
+        std::remove(path.c_str());
+    }
+
+    // --- legacy ids are preserved; id 0 stays 0 for the caller to mint ------
+    {
+        const std::string path = WriteRuleFile(
+            "p82_legacy.json",
+            R"({"portmaps":[{"proto":"tcp","wan_port":7005,"lan_ip":"192.168.0.14","lan_port":80,"id":7}]})");
+        RuleDocument doc;
+        CHECK(RuleStore::LoadOutcome::kOk ==
+              RuleStore::ReadRuleDocument(path, doc));
+        CHECK(doc.port_maps.size() == 1);
+        if (doc.port_maps.size() == 1) {
+            CHECK(doc.port_maps[0].id == 7);    // legacy id preserved
+        }
+        std::remove(path.c_str());
+    }
+
+    // --- a duplicate id inside one document: the latter is dropped+counted ---
+    {
+        const std::string path = WriteRuleFile(
+            "p82_dup.json",
+            R"({"portmaps":[)"
+            R"({"proto":"tcp","wan_port":7006,"lan_ip":"192.168.0.15","lan_port":80,"id":42},)"
+            R"({"proto":"tcp","wan_port":7007,"lan_ip":"192.168.0.16","lan_port":80,"id":42}]})");
+        RuleDocument doc;
+        CHECK(RuleStore::LoadOutcome::kOk ==
+              RuleStore::ReadRuleDocument(path, doc));
+        CHECK(doc.port_maps.size() == 1);
+        CHECK(doc.discarded == 1);
+        std::remove(path.c_str());
+    }
+
+    // --- the tombstone ceiling: a longer list is corrupt wholesale ---------
+    {
+        std::string text = "{\"version\":2,\"removed\":[";
+        for (size_t i = 0; i < kMaxTombstones + 1; ++i) {
+            if (i) text += ",";
+            text += std::to_string(1000 + i);
+        }
+        text += "]}";
+        const std::string path = WriteRuleFile("p82_cap.json", text);
+        RuleDocument doc;
+        CHECK(RuleStore::LoadOutcome::kCorrupt ==
+              RuleStore::ReadRuleDocument(path, doc));
+        std::remove(path.c_str());
+    }
+
+    // --- an illegal tombstone entry is dropped and counted ----------------
+    {
+        const std::string path = WriteRuleFile(
+            "p82_badremoved.json",
+            R"({"removed":[1,"oops",2],"portmaps":[]})");
+        RuleDocument doc;
+        CHECK(RuleStore::LoadOutcome::kOk ==
+              RuleStore::ReadRuleDocument(path, doc));
+        CHECK(doc.tombstones.size() == 2);
+        CHECK(doc.discarded == 1);
+        std::remove(path.c_str());
+    }
+
+    // --- MergeRuleDocuments: disk-only entries are adopted -----------------
+    {
+        RuleDocument memory;
+        RuleDocument disk;
+        PortMappingRule m;
+        m.proto = "tcp";
+        m.wan_port = 7010;
+        m.lan_ip = "192.168.0.20";
+        m.lan_port = 80;
+        m.id = kMarker | 1;
+        memory.port_maps.push_back(m);
+        PortMappingRule d;
+        d.proto = "tcp";
+        d.wan_port = 7011;
+        d.lan_ip = "192.168.0.21";
+        d.lan_port = 80;
+        d.id = kMarker | 2;
+        disk.port_maps.push_back(d);
+        SeqMinter minter;
+        const size_t dropped = RuleStore::MergeRuleDocuments(memory, disk, minter);
+        CHECK(0 == dropped);
+        CHECK(memory.port_maps.size() == 2);
+        if (memory.port_maps.size() == 2) {
+            CHECK(memory.port_maps[1].wan_port == 7011);
+        }
+    }
+
+    // --- memory priority: same id, then same identity ---------------------
+    {
+        RuleDocument memory;
+        RuleDocument disk;
+        PortMappingRule m;
+        m.proto = "tcp";
+        m.wan_port = 7020;
+        m.lan_ip = "192.168.0.30";
+        m.lan_port = 80;
+        m.id = kMarker | 5;
+        memory.port_maps.push_back(m);
+        PortMappingRule d;
+        d.proto = "tcp";
+        d.wan_port = 7021;
+        d.lan_ip = "192.168.0.31";
+        d.lan_port = 80;
+        d.id = kMarker | 5;                    // same id, different target
+        disk.port_maps.push_back(d);
+        PortMappingRule e;
+        e.proto = "tcp";
+        e.wan_port = 7020;                     // same identity as memory
+        e.lan_ip = "192.168.0.32";
+        e.lan_port = 80;
+        e.id = kMarker | 6;
+        disk.port_maps.push_back(e);
+        SeqMinter minter;
+        const size_t dropped = RuleStore::MergeRuleDocuments(memory, disk, minter);
+        CHECK(0 == dropped);
+        CHECK(memory.port_maps.size() == 1);   // both disk entries lost
+        if (memory.port_maps.size() == 1) {
+            CHECK(memory.port_maps[0].lan_ip == "192.168.0.30");
+        }
+    }
+
+    // --- tombstones drop memory AND disk entries; the union propagates -----
+    {
+        RuleDocument memory;
+        RuleDocument disk;
+        PortMappingRule m;
+        m.proto = "tcp";
+        m.wan_port = 7030;
+        m.lan_ip = "192.168.0.40";
+        m.lan_port = 80;
+        m.id = kMarker | 7;
+        memory.port_maps.push_back(m);
+        memory.tombstones.insert(kMarker | 7);
+        memory.tombstone_order.push_back(kMarker | 7);
+        PortMappingRule d;
+        d.proto = "tcp";
+        d.wan_port = 7031;
+        d.lan_ip = "192.168.0.41";
+        d.lan_port = 80;
+        d.id = kMarker | 8;
+        disk.port_maps.push_back(d);
+        disk.tombstones.insert(kMarker | 8);
+        disk.tombstone_order.push_back(kMarker | 8);
+        SeqMinter minter;
+        const size_t dropped = RuleStore::MergeRuleDocuments(memory, disk, minter);
+        CHECK(0 == dropped);
+        CHECK(memory.port_maps.empty());
+        CHECK(memory.tombstones.size() == 2);
+        CHECK(memory.tombstone_order.size() == 2);
+    }
+
+    // --- a disk entry with id 0 is minted ----------------------------------
+    {
+        RuleDocument memory;
+        RuleDocument disk;
+        PortMappingRule d;
+        d.proto = "tcp";
+        d.wan_port = 7040;
+        d.lan_ip = "192.168.0.50";
+        d.lan_port = 80;
+        d.id = 0;
+        disk.port_maps.push_back(d);
+        SeqMinter minter;
+        const size_t dropped = RuleStore::MergeRuleDocuments(memory, disk, minter);
+        CHECK(0 == dropped);
+        CHECK(memory.port_maps.size() == 1);
+        if (memory.port_maps.size() == 1) {
+            CHECK(0 != memory.port_maps[0].id);
+            CHECK((memory.port_maps[0].id >> 63) == 1ull);
+        }
+    }
+
+    // --- the per-kind cap drops the overflow and counts it -----------------
+    {
+        RuleDocument memory;
+        RuleDocument disk;
+        for (size_t i = 0; i < ::vgww::core::limits::kMaxPortMaps; ++i) {
+            PortMappingRule m;
+            m.proto = "tcp";
+            m.wan_port = static_cast<uint16_t>(1 + i);
+            m.lan_ip = "192.168.0.60";
+            m.lan_port = 80;
+            m.id = kMarker | (1000 + i);
+            memory.port_maps.push_back(m);
+        }
+        PortMappingRule d;
+        d.proto = "tcp";
+        d.wan_port = 9999;
+        d.lan_ip = "192.168.0.61";
+        d.lan_port = 80;
+        d.id = kMarker | 5000;
+        disk.port_maps.push_back(d);
+        SeqMinter minter;
+        const size_t dropped = RuleStore::MergeRuleDocuments(memory, disk, minter);
+        CHECK(1 == dropped);
+        CHECK(memory.port_maps.size() ==
+              ::vgww::core::limits::kMaxPortMaps);
+    }
+
+    // --- rate limits dedup by MAC, case-insensitively ----------------------
+    {
+        RuleDocument memory;
+        RuleDocument disk;
+        RateLimitRule m;
+        m.mac = "AA:BB:CC:DD:EE:01";
+        m.uplink_kbps = 100;
+        m.id = kMarker | 9;
+        memory.rate_limits.push_back(m);
+        RateLimitRule d;
+        d.mac = "aa:bb:cc:dd:ee:01";           // same client, other spelling
+        d.uplink_kbps = 200;
+        d.id = kMarker | 10;
+        disk.rate_limits.push_back(d);
+        SeqMinter minter;
+        const size_t dropped = RuleStore::MergeRuleDocuments(memory, disk, minter);
+        CHECK(0 == dropped);
+        CHECK(memory.rate_limits.size() == 1);
+        if (memory.rate_limits.size() == 1) {
+            CHECK(memory.rate_limits[0].uplink_kbps == 100);  // memory wins
+            CHECK(memory.rate_limits[0].id == (kMarker | 9));
+        }
+    }
+
+    // --- bans dedup by BanTargetKey ---------------------------------------
+    {
+        RuleDocument memory;
+        RuleDocument disk;
+        BanEntry m;
+        m.kind = "mac";
+        m.value = "AA:BB:CC:DD:EE:02";
+        m.id = kMarker | 11;
+        memory.bans.push_back(m);
+        BanEntry d;
+        d.kind = "mac";
+        d.value = "aa-bb-cc-dd-ee-02";         // same target, other spelling
+        d.id = kMarker | 12;
+        disk.bans.push_back(d);
+        SeqMinter minter;
+        const size_t dropped = RuleStore::MergeRuleDocuments(memory, disk, minter);
+        CHECK(0 == dropped);
+        CHECK(memory.bans.size() == 1);
+        if (memory.bans.size() == 1) {
+            CHECK(memory.bans[0].id == (kMarker | 11));
+        }
+    }
+}
+
+// P82: the store-level tombstone lifecycle - deletes write a durable
+// "removed" list, the ids survive the round trip, upserts keep their identity,
+// and Clear() empties the tombstone set.
+static void TestP82TombstoneLifecycle() {
+    using namespace vgww::web;
+    auto& store = RuleStore::Instance();
+    const std::string path = "p82_life.json.rules.json";
+    std::remove(path.c_str());
+    store.AttachFile("");
+    store.Clear();
+    store.AttachFile(path);
+
+    // SetPortMap must mint an id (otherwise the rule cannot be removed).
+    PortMappingRule r;
+    r.proto = "tcp";
+    r.wan_port = 8001;
+    r.lan_ip = "192.168.0.70";
+    r.lan_port = 80;
+    store.SetPortMap(r);
+    CHECK(0 != store.PortMaps()[0].id);
+
+    // A delete writes the id into "removed" and it survives a reload.
+    const uint64_t id1 = store.PortMaps()[0].id;
+    bool refused = false;
+    CHECK(store.RemovePortMapChecked(0, refused));
+    CHECK(!refused);
+    const auto removed_ids = [](const std::string& text) {
+        std::vector<uint64_t> out;
+        const auto j = nlohmann::json::parse(text, nullptr, false);
+        if (!j.is_discarded() && j.contains("removed") &&
+            j["removed"].is_array()) {
+            for (const auto& e : j["removed"]) {
+                if (e.is_number_unsigned()) {
+                    out.push_back(e.get<uint64_t>());
+                }
+            }
+        }
+        return out;
+    };
+    {
+        const auto ids = removed_ids(P82ReadText(path));
+        CHECK(ids.size() == 1);
+        if (ids.size() == 1) {
+            CHECK(ids[0] == id1);
+        }
+        const auto j = nlohmann::json::parse(P82ReadText(path));
+        CHECK(j.contains("version"));
+        CHECK(j["version"] == 2);
+    }
+
+    // Re-attach: the tombstone is loaded, the rule stays gone.
+    store.AttachFile("");
+    store.Clear();
+    store.AttachFile(path);
+    CHECK(store.PortMaps().empty());
+    CHECK(store.DiscardedOnLastLoad() == 0);
+
+    // A rate-limit upsert keeps the identity; a MAC change tombstones the old
+    // id and mints a new one.
+    RateLimitRule rl;
+    rl.mac = "02:00:00:00:00:03";
+    rl.uplink_kbps = 100;
+    CHECK(store.SetRateLimitChecked(rl));
+    const uint64_t rate_id = store.RateLimits()[0].id;
+    CHECK(0 != rate_id);
+    rl.uplink_kbps = 200;
+    CHECK(store.SetRateLimitChecked(rl));
+    CHECK(store.RateLimits().size() == 1);
+    CHECK(store.RateLimits()[0].id == rate_id);       // upsert keeps the id
+
+    RateLimitRule renamed;
+    renamed.mac = "02:00:00:00:00:04";
+    renamed.downlink_kbps = 300;
+    CHECK(store.ReplaceRateLimitChecked("02:00:00:00:00:03",
+                                        std::move(renamed)));
+    CHECK(store.RateLimits().size() == 1);
+    CHECK(store.RateLimits()[0].mac == "02:00:00:00:00:04");
+    const uint64_t new_rate_id = store.RateLimits()[0].id;
+    CHECK(new_rate_id != rate_id);
+    {
+        const auto ids = removed_ids(P82ReadText(path));
+        bool found_old = false;
+        for (const uint64_t id : ids) {
+            if (id == rate_id) found_old = true;
+        }
+        CHECK(found_old);      // the renamed rule's old id is tombstoned
+    }
+
+    // RemoveRateLimit tombstones its id.
+    CHECK(store.RemoveRateLimit("02:00:00:00:00:04"));
+    {
+        const auto ids = removed_ids(P82ReadText(path));
+        bool found = false;
+        for (const uint64_t id : ids) {
+            if (id == new_rate_id) found = true;
+        }
+        CHECK(found);
+    }
+
+    // Clear() empties the tombstone set (the fresh document has "removed":[]).
+    store.AttachFile("");
+    store.Clear();
+    store.AttachFile(path);
+    CHECK(store.PortMaps().empty());
+    store.Clear();
+    {
+        const auto ids = removed_ids(P82ReadText(path));
+        CHECK(ids.empty());
+    }
+
+    store.AttachFile("");
+    store.Clear();
+    std::remove(path.c_str());
+}
+
+// P82: a rule another process wrote to the document between two local
+// mutations must be ADOPTED, not overwritten - the lost-update defect.
+static void TestP82DiskInjectionMergesForeignRules() {
+    using namespace vgww::web;
+    auto& store = RuleStore::Instance();
+    const std::string path = "p82_inject.json.rules.json";
+    std::remove(path.c_str());
+    store.AttachFile("");
+    store.Clear();
+    store.AttachFile(path);
+
+    store.AddPortMapTracked(MakeRule("tcp", 8101, "192.168.0.80", 80));
+    // A second process publishes its own document (its rule B, no tombstones).
+    {
+        std::ofstream out(path, std::ios::binary | std::ios::trunc);
+        out << R"({"version":2,"removed":[],"portmaps":[{"proto":"tcp","wan_port":8102,"lan_ip":"192.168.0.81","lan_port":80,"id":500}]})";
+    }
+    // A local mutation must read the disk, merge B in, and write the union.
+    store.AddPortMapTracked(MakeRule("tcp", 8103, "192.168.0.82", 80));
+    const auto maps = store.PortMaps();
+    CHECK(maps.size() == 3);
+    bool has_8101 = false, has_8102 = false, has_8103 = false;
+    for (const auto& m : maps) {
+        if (m.wan_port == 8101) has_8101 = true;
+        if (m.wan_port == 8102) has_8102 = true;
+        if (m.wan_port == 8103) has_8103 = true;
+    }
+    CHECK(has_8101);
+    CHECK(has_8102);
+    CHECK(has_8103);
+    const auto j = nlohmann::json::parse(P82ReadText(path));
+    CHECK(j.contains("portmaps") && j["portmaps"].is_array());
+    CHECK(j["portmaps"].size() == 3);
+    store.AttachFile("");
+    store.Clear();
+    std::remove(path.c_str());
+}
+
+// P82: a deletion must not be undone by a stale writer that re-publishes the
+// old document (the resurrection defect the tombstone list exists for).
+static void TestP82DeleteIsNotResurrected() {
+    using namespace vgww::web;
+    auto& store = RuleStore::Instance();
+    const std::string path = "p82_nores.json.rules.json";
+    std::remove(path.c_str());
+    store.AttachFile("");
+    store.Clear();
+    store.AttachFile(path);
+
+    const uint64_t id_x =
+        store.AddPortMapTracked(MakeRule("tcp", 8201, "192.168.0.90", 80));
+    const uint64_t id_y =
+        store.AddPortMapTracked(MakeRule("tcp", 8202, "192.168.0.91", 80));
+    CHECK(store.RemovePortMapById(id_x));
+    // A stale process re-publishes X (its snapshot predates the delete).
+    {
+        std::ofstream out(path, std::ios::binary | std::ios::trunc);
+        out << R"({"version":2,"removed":[],"portmaps":[)"
+            << R"({"proto":"tcp","wan_port":8201,"lan_ip":"192.168.0.90",)"
+            << R"("lan_port":80,"id":)" << id_x << R"(},)"
+            << R"({"proto":"tcp","wan_port":8202,"lan_ip":"192.168.0.91",)"
+            << R"("lan_port":80,"id":)" << id_y << R"(}]})";
+    }
+    // A local mutation merges: the tombstone must keep X deleted.
+    store.AddPortMapTracked(MakeRule("tcp", 8203, "192.168.0.92", 80));
+    const auto maps = store.PortMaps();
+    bool has_x = false;
+    for (const auto& m : maps) {
+        if (m.wan_port == 8201) has_x = true;
+    }
+    CHECK(!has_x);
+    CHECK(maps.size() == 2);
+    const auto j = nlohmann::json::parse(P82ReadText(path));
+    bool file_has_x = false;
+    for (const auto& e : j["portmaps"]) {
+        if (e.contains("id") && e["id"].get<uint64_t>() == id_x) {
+            file_has_x = true;
+        }
+    }
+    CHECK(!file_has_x);
+    store.AttachFile("");
+    store.Clear();
+    std::remove(path.c_str());
+}
+
+// P82: at the tombstone ceiling a removal is refused WHOLE - the rule stays in
+// memory and on disk, and only deletions are blocked (an add still works).
+static void TestP82TombstoneFullRefusesDelete() {
+    using namespace vgww::web;
+    auto& store = RuleStore::Instance();
+    const std::string path = "p82_full.json.rules.json";
+    std::string text = "{\"version\":2,\"removed\":[";
+    for (size_t i = 0; i < kMaxTombstones; ++i) {
+        if (i) text += ",";
+        text += std::to_string(1000 + i);
+    }
+    text += R"(],"portmaps":[{"proto":"tcp","wan_port":8301,"lan_ip":)"
+            R"("192.168.0.100","lan_port":80,"id":50}]})";
+    const std::string p = WriteRuleFile(path, text);
+    store.AttachFile("");
+    store.Clear();
+    store.AttachFile(p);
+    CHECK(store.PortMaps().size() == 1);
+    const uint64_t id = store.PortMaps()[0].id;
+    CHECK(50 == id);   // legacy id preserved by the loader
+    const size_t failures_before = store.PersistFailureCount();
+    bool refused = false;
+    CHECK(!store.RemovePortMapById(id, refused));
+    CHECK(refused);
+    CHECK(store.PortMaps().size() == 1);   // memory unchanged
+    CHECK(store.PersistFailureCount() == failures_before);
+    {
+        const auto j = nlohmann::json::parse(P82ReadText(p));
+        CHECK(j.contains("removed") && j["removed"].is_array());
+        CHECK(j["removed"].size() == kMaxTombstones);
+        CHECK(j["portmaps"].size() == 1);
+    }
+    // Only deletions are blocked.
+    CHECK(0 != store.AddPortMapTracked(
+                  MakeRule("tcp", 8302, "192.168.0.101", 80)));
+    CHECK(store.PortMaps().size() == 2);
+    store.AttachFile("");
+    store.Clear();
+    std::remove(p.c_str());
+}
+
+// P82: HTTP DELETE must separate "no such rule" (404) from "refused because
+// the tombstone store is full" (500) - a caller must not read 500 as success
+// or 404 as "already gone".
+static void TestP82HttpDeleteDistinguishes404And500() {
+    using namespace vgww::web;
+    using namespace vgww::core;
+    const char* cfg_path = "p82_http.json";
+    const std::string rules = std::string(cfg_path) + ".rules.json";
+    std::remove(cfg_path);
+    std::remove(rules.c_str());
+    std::string text = "{\"version\":2,\"removed\":[";
+    for (size_t i = 0; i < kMaxTombstones; ++i) {
+        if (i) text += ",";
+        text += std::to_string(1000 + i);
+    }
+    text += R"(],"portmaps":[{"proto":"tcp","wan_port":8401,"lan_ip":)"
+            R"("192.168.0.110","lan_port":80,"id":50}]})";
+    {
+        std::ofstream out(rules, std::ios::binary);
+        out << text;
+    }
+    Config cfg;
+    cfg.web.port = 18120;
+    bool ok = false;
+    cfg.gateway.ipv4 = ParseIpv4("192.168.0.40", ok);
+    cfg.gateway.mask = ParseIpv4("255.255.255.0", ok);
+    MacAddress mac{};
+    ParseMac("30:fc:68:88:b4:a9", mac);
+    cfg.gateway.mac = mac;
+    std::string err;
+    CHECK(cfg.SaveToFile(cfg_path, err));
+    vgww::runtime::Dataplane dp(cfg);
+    HttpServer api;
+    RegisterApi(api, dp, cfg, cfg_path);
+    constexpr uint16_t kPort = 18120;
+    std::string start_err;
+    CHECK(api.Start("127.0.0.1", kPort, start_err));
+    std::string body;
+    CHECK(HttpDelete("/api/portmap?id=999999", kPort, body) == 404);
+    CHECK(HttpDelete("/api/portmap?id=50", kPort, body) == 500);
+    api.Stop();
+    std::remove(cfg_path);
+    std::remove(rules.c_str());
+}
+
+// P82 (T12): the cross-process lock is recursive for the same thread.
+// FlushPersist takes it, then WriteFileAtomicDurable takes it again; if that
+// deadlocked, every mutation with persistence enabled would hang.
+// M3 anchor: the flush must also WAIT for another owner instead of publishing
+// without the exclusion. The lock-name override makes the test distinguish the
+// OUTER lock from the one WriteFileAtomicDurable takes internally: with the
+// override active the internal writer no longer waits, so only the outer lock
+// can block the mutation.
+static void TestP82LockReentrantSameThread() {
+    using namespace vgww::web;
+    const std::string rules = "p82_reentrant.json.rules.json";
+    std::remove(rules.c_str());
+    RuleStore& store = RuleStore::Instance();
+    store.AttachFile(rules);
+    store.Clear();
+    CHECK(store.PersistUpToDate());
+
+    // Override the lock name: FlushPersist's outer ConfigFileLock takes the
+    // OVERRIDDEN name; the internal WriteFileAtomicDurable keeps the REAL one.
+    // The test holds the OVERRIDDEN name, so only the outer lock can block the
+    // mutation - the internal lock alone cannot.
+    vgww::core::SetConfigLockNameOverrideForTest(
+        [](const std::string& path) -> std::string {
+            return "p82-outer-" + path;
+        });
+    vgww::core::ConfigFileLock lock(rules);
+    CHECK(lock.locked());
+    std::atomic<bool> done{false};
+    std::thread writer([&] {
+        BanEntry ban;
+        ban.kind = "ip";
+        ban.value = "10.77.0.1";
+        (void)store.AddBanChecked(std::move(ban));
+        done.store(true, std::memory_order_release);
+    });
+    for (int i = 0; i < 40 && !done.load(std::memory_order_acquire); ++i) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(5));
+    }
+    CHECK(!done.load(std::memory_order_acquire));  // blocked by the outer lock
+    lock.~ConfigFileLock();                        // release
+    writer.join();
+    CHECK(done.load(std::memory_order_acquire));
+    CHECK(store.PersistUpToDate());
+    store.AttachFile("");
+    store.Clear();
+    std::remove(rules.c_str());
+}
+
+// P82 (M3 anchor, the opposite arrangement): with the override ACTIVE the
+// test holds the OVERRIDDEN name and FlushPersist's outer lock takes it, so the
+// mutation blocks. With the outer lock removed (M3) the mutation completes
+// immediately -> the assertion below turns red.
+static void TestP82OuterLockBlocksTheFlush() {
+    using namespace vgww::web;
+    const std::string rules = "p82_outer.json.rules.json";
+    std::remove(rules.c_str());
+    RuleStore& store = RuleStore::Instance();
+    store.AttachFile(rules);
+    store.Clear();
+    CHECK(store.PersistUpToDate());
+
+    // The test holds the OVERRIDDEN lock name for the whole mutation; the
+    // override stays ACTIVE so FlushPersist's outer ConfigFileLock takes the
+    // same mutex. The internal WriteFileAtomicDurable takes the REAL name and
+    // therefore does NOT block - so only the outer lock can hold the mutation.
+    vgww::core::SetConfigLockNameOverrideForTest(
+        [](const std::string& path) -> std::string {
+            return "p82-outer-" + path;
+        });
+    vgww::core::ConfigFileLock lock(rules);
+    CHECK(lock.locked());
+    // The override stays ACTIVE: FlushPersist's outer ConfigFileLock takes the
+    // OVERRIDDEN name (the mutex this test holds) -> the mutation blocks. The
+    // internal WriteFileAtomicDurable takes the REAL name -> it does not block.
+    // With the outer lock removed (M3) nothing blocks the mutation -> red.
+    std::atomic<bool> done{false};
+    std::thread writer([&] {
+        BanEntry ban;
+        ban.kind = "ip";
+        ban.value = "10.77.0.2";
+        (void)store.AddBanChecked(std::move(ban));
+        done.store(true, std::memory_order_release);
+    });
+    for (int i = 0; i < 40 && !done.load(std::memory_order_acquire); ++i) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(5));
+    }
+    CHECK(!done.load(std::memory_order_acquire));  // blocked by the outer lock
+    lock.~ConfigFileLock();                        // release
+    writer.join();
+    CHECK(done.load(std::memory_order_acquire));
+    CHECK(store.PersistUpToDate());
+    vgww::core::SetConfigLockNameOverrideForTest(
+        std::function<std::string(const std::string&)>());
+    store.AttachFile("");
+    store.Clear();
+    std::remove(rules.c_str());
+}
+
+#ifdef _WIN32
+// P82 worker: re-executes this binary as a second VGWW process. It attaches to
+// the rules document, signals "ready", waits for "go", performs one mutation,
+// then signals "done" - so the parent test can interleave a real cross-process
+// writer with the named-event synchronisation that keeps the race honest.
+static int P82WorkerMain(int argc, char** argv) {
+    if (argc < 5) {
+        return 2;
+    }
+    const std::string path = argv[2];
+    const std::string op = argv[3];
+    const std::wstring base = L"Local\\vgww-p82-" + P82Wide(argv[4]);
+    vgww::web::RuleStore& store = vgww::web::RuleStore::Instance();
+    store.AttachFile(path);
+    HANDLE ready =
+        ::CreateEventW(nullptr, TRUE, FALSE, (base + L"-ready").c_str());
+    if (ready) {
+        ::SetEvent(ready);
+    }
+    HANDLE go = ::OpenEventW(SYNCHRONIZE, FALSE, (base + L"-go").c_str());
+    if (go) {
+        ::WaitForSingleObject(go, 20000);
+        ::CloseHandle(go);
+    }
+    if (op == "add") {
+        if (argc < 9) {
+            return 3;
+        }
+        vgww::web::PortMappingRule r;
+        r.proto = argv[5];
+        r.wan_port = static_cast<uint16_t>(std::stoul(argv[6]));
+        r.lan_ip = argv[7];
+        r.lan_port = static_cast<uint16_t>(std::stoul(argv[8]));
+        const uint64_t minted = store.AddPortMapTracked(std::move(r));
+        std::ofstream id_out(path + ".worker_id", std::ios::binary |
+                                                    std::ios::trunc);
+        id_out << minted;
+    } else if (op == "del") {
+        if (argc < 6) {
+            return 3;
+        }
+        const uint64_t id = std::strtoull(argv[5], nullptr, 10);
+        bool refused = false;
+        (void)store.RemovePortMapById(id, refused);
+        std::ofstream id_out(path + ".worker_id", std::ios::binary |
+                                                    std::ios::trunc);
+        id_out << id;
+    }
+    HANDLE done =
+        ::CreateEventW(nullptr, TRUE, FALSE, (base + L"-done").c_str());
+    if (done) {
+        ::SetEvent(done);
+    }
+    if (ready) {
+        ::CloseHandle(ready);
+    }
+    return 0;
+}
+#endif
+
+// P82: a REAL second process attaches to the same document, then both sides
+// add a rule. The union must reach disk - the last-writer-wins defect.
+// The worker prints the ids it minted so the parent can assert the two
+// processes did not collide.
+static void TestP82CrossProcessWorker() {
+#ifdef _WIN32
+    using namespace vgww::web;
+    auto& store = RuleStore::Instance();
+    const std::string path = "p82worker.json.rules.json";
+    const std::string id_path = path + ".worker_id";
+    const std::string tag = "add";
+    uint64_t parent_id = 0;
+    std::remove(path.c_str());
+    std::remove(id_path.c_str());
+    {
+        std::ofstream out(path, std::ios::binary);
+        out << R"({"version":2,"removed":[],"portmaps":[{"proto":"tcp","wan_port":7001,"lan_ip":"192.168.0.10","lan_port":80,"id":100}]})";
+    }
+    store.AttachFile("");
+    store.Clear();
+    store.AttachFile(path);
+    CHECK(store.PortMaps().size() == 1);
+
+    const std::wstring base = L"Local\\vgww-p82-" + P82Wide(tag);
+    HANDLE ready =
+        ::CreateEventW(nullptr, TRUE, FALSE, (base + L"-ready").c_str());
+    HANDLE go = ::CreateEventW(nullptr, TRUE, FALSE, (base + L"-go").c_str());
+    HANDLE done =
+        ::CreateEventW(nullptr, TRUE, FALSE, (base + L"-done").c_str());
+    if (ready) ::ResetEvent(ready);
+    if (go) ::ResetEvent(go);
+    if (done) ::ResetEvent(done);
+
+    wchar_t exe[MAX_PATH * 2] = {};
+    const DWORD exe_len = ::GetModuleFileNameW(nullptr, exe, MAX_PATH * 2);
+    CHECK(0 != exe_len);
+    std::wstring cmd = std::wstring(exe, exe_len);
+    cmd += L" --vgww-rules-worker " + P82Wide(path) +
+           L" add " + P82Wide(tag) + L" tcp 7003 192.168.0.13 80";
+
+    STARTUPINFOW si{};
+    si.cb = sizeof(si);
+    PROCESS_INFORMATION pi{};
+    const BOOL started =
+        ::CreateProcessW(nullptr, cmd.data(), nullptr, nullptr, FALSE, 0,
+                         nullptr, nullptr, &si, &pi);
+    CHECK(started);
+    if (started) {
+        ::WaitForSingleObject(ready, 15000);
+        store.AddPortMapTracked(MakeRule("tcp", 7002, "192.168.0.11", 80));
+        parent_id = store.PortMaps().back().id;
+        CHECK((parent_id >> 63) == 1ull);
+        ::SetEvent(go);
+        ::WaitForSingleObject(pi.hProcess, 25000);
+        if (done) ::WaitForSingleObject(done, 5000);
+        ::CloseHandle(pi.hThread);
+        ::CloseHandle(pi.hProcess);
+    }
+    if (ready) ::CloseHandle(ready);
+    if (go) ::CloseHandle(go);
+    if (done) ::CloseHandle(done);
+
+    const auto j = nlohmann::json::parse(P82ReadText(path));
+    CHECK(j.contains("portmaps") && j["portmaps"].is_array());
+    CHECK(j["portmaps"].size() == 3);
+    std::vector<uint64_t> ids;
+    for (const auto& e : j["portmaps"]) {
+        ids.push_back(e["id"].get<uint64_t>());
+    }
+    std::sort(ids.begin(), ids.end());
+    const auto last = std::unique(ids.begin(), ids.end());
+    CHECK(last == ids.end());   // 3 distinct ids (100 + two fresh ones)
+    // The worker's minted id must be one of the document's ids: the id came
+    // from the worker's own channel (the .worker_id side file), NOT from a
+    // disk-derived guess - the parent's later merge can rewrite the document,
+    // so the side file is the only timing-independent source.
+    std::ifstream id_in(id_path, std::ios::binary);
+    uint64_t worker_id = 0;
+    if (id_in) {
+        id_in >> worker_id;
+    }
+    id_in.close();
+    bool worker_in_doc = false;
+    for (const uint64_t id : ids) {
+        if (id == worker_id) {
+            worker_in_doc = true;
+        }
+    }
+    CHECK(worker_in_doc);
+    // M6 anchor: the worker minted an id in a DIFFERENT process, so its salt
+    // must differ - the same id would mean the layout collapsed to a constant.
+    CHECK(0 != worker_id);
+    CHECK(0 != parent_id);
+    CHECK(worker_id != parent_id);
+    CHECK(((worker_id ^ parent_id) >> 31) != 0);   // different salt field
+    CHECK((worker_id >> 63) == 1ull);
+    CHECK((worker_id & ((1ull << 31) - 1)) == 1ull);  // counter from 1
+    std::remove(id_path.c_str());
+    store.AttachFile("");
+    store.Clear();
+    std::remove(path.c_str());
+#else
+    (void)0;
+#endif
+}
+
+// P82: the worker's "del" op is exercised end-to-end. The parent publishes a
+// document, the worker attaches and deletes an id it loaded, and the deletion
+// (plus its tombstone) must reach disk.
+static void TestP82WorkerDeletesTheTombstonedRule() {
+#ifdef _WIN32
+    using namespace vgww::web;
+    auto& store = RuleStore::Instance();
+    const std::string path = "p82worker3.json.rules.json";
+    const std::string tag = "del2";
+    std::remove(path.c_str());
+    {
+        std::ofstream out(path, std::ios::binary);
+        out << R"({"version":2,"removed":[],"portmaps":[)"
+            << R"({"proto":"tcp","wan_port":7201,"lan_ip":"192.168.0.30",)"
+            << R"("lan_port":80,"id":100},)"
+            << R"({"proto":"tcp","wan_port":7202,"lan_ip":"192.168.0.31",)"
+            << R"("lan_port":80,"id":200}]})";
+    }
+    store.AttachFile("");
+    store.Clear();
+    store.AttachFile(path);
+    CHECK(store.PortMaps().size() == 2);
+
+    const std::wstring base = L"Local\\vgww-p82-" + P82Wide(tag);
+    HANDLE ready =
+        ::CreateEventW(nullptr, TRUE, FALSE, (base + L"-ready").c_str());
+    HANDLE go = ::CreateEventW(nullptr, TRUE, FALSE, (base + L"-go").c_str());
+    HANDLE done =
+        ::CreateEventW(nullptr, TRUE, FALSE, (base + L"-done").c_str());
+    if (ready) ::ResetEvent(ready);
+    if (go) ::ResetEvent(go);
+    if (done) ::ResetEvent(done);
+
+    wchar_t exe[MAX_PATH * 2] = {};
+    const DWORD exe_len = ::GetModuleFileNameW(nullptr, exe, MAX_PATH * 2);
+    CHECK(0 != exe_len);
+    std::wstring cmd = std::wstring(exe, exe_len);
+    cmd += L" --vgww-rules-worker " + P82Wide(path) +
+           L" del " + P82Wide(tag) + L" 200";
+
+    STARTUPINFOW si{};
+    si.cb = sizeof(si);
+    PROCESS_INFORMATION pi{};
+    const BOOL started =
+        ::CreateProcessW(nullptr, cmd.data(), nullptr, nullptr, FALSE, 0,
+                         nullptr, nullptr, &si, &pi);
+    CHECK(started);
+    if (started) {
+        ::WaitForSingleObject(ready, 15000);
+        ::SetEvent(go);
+        ::WaitForSingleObject(pi.hProcess, 25000);
+        if (done) ::WaitForSingleObject(done, 5000);
+        ::CloseHandle(pi.hThread);
+        ::CloseHandle(pi.hProcess);
+    }
+    if (ready) ::CloseHandle(ready);
+    if (go) ::CloseHandle(go);
+    if (done) ::CloseHandle(done);
+
+    const auto j = nlohmann::json::parse(P82ReadText(path));
+    CHECK(j.contains("portmaps") && j["portmaps"].is_array());
+    CHECK(j["portmaps"].size() == 1);
+    if (j["portmaps"].size() == 1) {
+        CHECK(j["portmaps"][0]["id"].get<uint64_t>() == 100);
+    }
+    bool tombstone_found = false;
+    if (j.contains("removed") && j["removed"].is_array()) {
+        for (const auto& e : j["removed"]) {
+            if (e.is_number_unsigned() && e.get<uint64_t>() == 200) {
+                tombstone_found = true;
+            }
+        }
+    }
+    CHECK(tombstone_found);
+    store.AttachFile("");
+    store.Clear();
+    std::remove(path.c_str());
+#else
+    (void)0;
+#endif
+}
+
+// P82: the second process loaded the rule BEFORE the parent deleted it; its
+// next write must NOT resurrect the deleted rule (the tombstone propagates).
+static void TestP82CrossProcessDeleteNotResurrected() {
+#ifdef _WIN32
+    using namespace vgww::web;
+    auto& store = RuleStore::Instance();
+    const std::string path = "p82worker2.json.rules.json";
+    const std::string tag = "del";
+    std::remove(path.c_str());
+    {
+        std::ofstream out(path, std::ios::binary);
+        out << R"({"version":2,"removed":[],"portmaps":[)"
+            << R"({"proto":"tcp","wan_port":7101,"lan_ip":"192.168.0.20",)"
+            << R"("lan_port":80,"id":100},)"
+            << R"({"proto":"tcp","wan_port":7102,"lan_ip":"192.168.0.21",)"
+            << R"("lan_port":80,"id":200}]})";
+    }
+    store.AttachFile("");
+    store.Clear();
+    store.AttachFile(path);
+    CHECK(store.PortMaps().size() == 2);
+
+    const std::wstring base = L"Local\\vgww-p82-" + P82Wide(tag);
+    HANDLE ready =
+        ::CreateEventW(nullptr, TRUE, FALSE, (base + L"-ready").c_str());
+    HANDLE go = ::CreateEventW(nullptr, TRUE, FALSE, (base + L"-go").c_str());
+    HANDLE done =
+        ::CreateEventW(nullptr, TRUE, FALSE, (base + L"-done").c_str());
+    if (ready) ::ResetEvent(ready);
+    if (go) ::ResetEvent(go);
+    if (done) ::ResetEvent(done);
+
+    wchar_t exe[MAX_PATH * 2] = {};
+    const DWORD exe_len = ::GetModuleFileNameW(nullptr, exe, MAX_PATH * 2);
+    CHECK(0 != exe_len);
+    std::wstring cmd = std::wstring(exe, exe_len);
+    cmd += L" --vgww-rules-worker " + P82Wide(path) +
+           L" add " + P82Wide(tag) + L" tcp 7103 192.168.0.23 80";
+
+    STARTUPINFOW si{};
+    si.cb = sizeof(si);
+    PROCESS_INFORMATION pi{};
+    const BOOL started =
+        ::CreateProcessW(nullptr, cmd.data(), nullptr, nullptr, FALSE, 0,
+                         nullptr, nullptr, &si, &pi);
+    CHECK(started);
+    if (started) {
+        ::WaitForSingleObject(ready, 15000);
+        // The worker holds X in memory; the parent deletes it and publishes
+        // the tombstone BEFORE the worker's write.
+        bool refused = false;
+        CHECK(store.RemovePortMapById(100, refused));
+        CHECK(!refused);
+        ::SetEvent(go);
+        ::WaitForSingleObject(pi.hProcess, 25000);
+        if (done) ::WaitForSingleObject(done, 5000);
+        ::CloseHandle(pi.hThread);
+        ::CloseHandle(pi.hProcess);
+    }
+    if (ready) ::CloseHandle(ready);
+    if (go) ::CloseHandle(go);
+    if (done) ::CloseHandle(done);
+
+    const auto j = nlohmann::json::parse(P82ReadText(path));
+    CHECK(j.contains("portmaps") && j["portmaps"].is_array());
+    bool has_x = false;
+    bool has_y = false;
+    bool has_w = false;
+    for (const auto& e : j["portmaps"]) {
+        const uint64_t id = e["id"].get<uint64_t>();
+        if (id == 100) has_x = true;
+        if (id == 200) has_y = true;
+        if (0 != id && id != 100 && id != 200) has_w = true;
+    }
+    CHECK(!has_x);       // the deleted rule is not resurrected
+    CHECK(has_y);
+    CHECK(has_w);
+    bool tombstone_found = false;
+    if (j.contains("removed") && j["removed"].is_array()) {
+        for (const auto& e : j["removed"]) {
+            if (e.is_number_unsigned() && e.get<uint64_t>() == 100) {
+                tombstone_found = true;
+            }
+        }
+    }
+    CHECK(tombstone_found);
+    store.AttachFile("");
+    store.Clear();
+    std::remove(path.c_str());
+#else
+    (void)0;
+#endif
+}
+
+int main(int argc, char** argv) {
+#ifdef _WIN32
+    if (argc > 1 && std::string("--vgww-rules-worker") == argv[1]) {
+        return P82WorkerMain(argc, argv);
+    }
+#endif
     TestB121WebApiEscapeKeepsControlCharacters();
     TestB120ErrorBodyKeepsControlCharacters();
     TestB85InvalidContentLengthRejected();
@@ -5549,12 +8409,35 @@ int main() {
     TestH1WebConfigPreservesNativePrefs();
     TestB37tWebConfigAppliesLive();
     TestB38WebApplyStatus();
+    TestB111ApplyStatusIgnoresStaleCompletion();
+    TestB112WebConfigSaveKeepsRuntimeBindings();
+    TestB117WebConfigSaveRefusesToDropDiskBindings();
+    TestB118WebStatusReportsDiscarded();
+    TestB119WebStatusReportsDroppedLeases();
+    TestB120WebStatusReportsCorruptLeases();
+    TestB121WebStatusReportsParseRejects();
+    TestB122WebStatusReportsParseRejects6();
+    TestB123PrivilegedChangesAreAudited();
+    TestB126WebConsoleReportsDropped();
+    TestB127StatusContractKeys();
+    TestB113NoApplierDoesNotStampAttempt();
+    TestB114RefusedApplyClosesTheAttempt();
     TestS1WebSettingsRoundTrip();
     TestB2LeaseEndpointsShape();
     TestB5SystemIdentityFields();
     TestB1ConsoleEndpointFiltersTokens();
     TestB4PrivilegedEndpoints();
     TestB34oCorruptRuleFileIsNotSilentEmpty();
+    TestB83CorruptRulesFilePreserved();
+    TestB85UnreadableRulesFileIsNotOverwritten();
+    TestB87BlockedRulesRecoverWithoutRestart();
+    TestB88BlockedRecoveryMergesEveryRuleKind();
+    TestB89RecoveryQuarantinesCorruptFile();
+    TestB90ConcurrentBlockedRecovery();
+    TestB92MutationReportsPersistFailure();
+    TestB93DhcpBindingPersistsToConfig();
+    TestB101StatusExposesLeasePersistFailures();
+    TestB106RulesWriteUsesCrossProcessLock();
     TestB34oLoadedRulesAreSemanticallyValid();
     TestB34oRuleCapEnforcedInStore();
     TestB34oRuleRemovalIsByIdentity();
@@ -5563,6 +8446,9 @@ int main() {
     TestB34rInternalErrorDoesNotLeakText();
     TestHandlerThrowOutsideDispatchKeepsTheWorker();
     TestAcceptHandlerThrowKeepsAccepting();
+    TestAcceptRearmThrowIsContained();
+    TestBStatusExposesFirewallCounts();
+    TestB86StatusExposesPersistenceHealth();
     TestB34rTokenCompareIsConstantTime();
     TestB34rEmptyTokenNeverDisablesAuth();
     TestB34rQueryTokenIsNotAccepted();
@@ -5570,6 +8456,19 @@ int main() {
     TestB138DeleteIsByIdentityNotPosition();
     TestB141LoadedBanIpIsCanonical();
     TestB144BanDuplicatesAreCollapsed();
+    TestP82RuleIdLayoutAndUniqueness();
+    TestP82IdUniquenessWithoutTestSeam();
+    TestP82ReadRuleDocumentAndMerge();
+    TestP82TombstoneLifecycle();
+    TestP82DiskInjectionMergesForeignRules();
+    TestP82DeleteIsNotResurrected();
+    TestP82TombstoneFullRefusesDelete();
+    TestP82HttpDeleteDistinguishes404And500();
+    TestP82LockReentrantSameThread();
+    TestP82OuterLockBlocksTheFlush();
+    TestP82CrossProcessWorker();
+    TestP82WorkerDeletesTheTombstonedRule();
+    TestP82CrossProcessDeleteNotResurrected();
 
     if (0 == g_failures) {
         std::puts("test_web: ALL PASS");

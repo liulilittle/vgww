@@ -32,6 +32,7 @@ namespace {
 std::atomic<vgww::ui::UiApp*> g_ui_app{nullptr};
 }  // namespace
 
+#include "core/handler_guard.h"
 #include "core/memory.h"
 #include "core/random.h"
 
@@ -223,6 +224,11 @@ namespace {
         };
         std::atomic<bool> instance_stop{false};
         InstanceWatcher instance_watcher;
+        /// Detached-thread bodies that threw and were reported instead of
+        /// terminating the process (telemetry; a std::thread body is its own
+        /// entry point, so an escape is fatal).
+        static std::atomic<uint64_t> instance_watcher_errors{0};
+        static std::atomic<uint64_t> config_apply_errors{0};
 
         // batch37h (user): a GUI launch must ALWAYS participate in the
         // single-instance gate. Only a headless run (no window) may bypass it;
@@ -249,23 +255,29 @@ namespace {
                 HANDLE ev = instance_watcher.event;
                 std::atomic<bool>* stop_flag = &instance_stop;
                 instance_watcher.thread = std::thread([ev, stop_flag] {
-                    while (!stop_flag->load()) {
-                        if (WAIT_OBJECT_0 !=
-                            ::WaitForSingleObject(ev, INFINITE)) {
-                            break;
-                        }
-                        if (stop_flag->load()) {
-                            break;
-                        }
-                        // The window may not exist yet (a second launch during
-                        // our own startup): retry briefly.
-                        for (int i = 0; i < 50 && !stop_flag->load(); ++i) {
-                            if (vgww::ui::ActivateRunningInstance()) {
-                                break;
+                    ::vgww::core::RunDetachedBodyGuarded(
+                        instance_watcher_errors, [&] {
+                            while (!stop_flag->load()) {
+                                if (WAIT_OBJECT_0 !=
+                                    ::WaitForSingleObject(ev, INFINITE)) {
+                                    break;
+                                }
+                                if (stop_flag->load()) {
+                                    break;
+                                }
+                                // The window may not exist yet (a second
+                                // launch during our own startup): retry
+                                // briefly.
+                                for (int i = 0;
+                                     i < 50 && !stop_flag->load(); ++i) {
+                                    if (vgww::ui::ActivateRunningInstance()) {
+                                        break;
+                                    }
+                                    ::Sleep(100);
+                                }
                             }
-                            ::Sleep(100);
-                        }
-                    }
+                        },
+                        [] {});
                 });
             }
         }
@@ -808,7 +820,14 @@ namespace {
                 web_running = false;
             }
             if (was_running) {
-                dataplane.Stop();
+                // batch101: a live apply stops to swap the config. A stop that
+                // could not persist its lease document must not vanish: log it
+                // (the sticky verdict also stays visible on /api/status), then
+                // let the restart below decide whether the apply succeeded.
+                std::string stop_error;
+                if (!dataplane.Stop(stop_error) || !stop_error.empty()) {
+                    std::fprintf(stderr, "[vgww] %s\n", stop_error.c_str());
+                }
             }
             {
                 // The snapshot publisher reads the same config on its own
@@ -942,10 +961,10 @@ namespace {
             // every apply outcome (from either path) is recorded so the Web
             // page can report success/failure truthfully.
             [&apply_config_live, config_apply_status](
-                const vgww::core::Config& cfg) {
-                auto sink = [config_apply_status](
+                const vgww::core::Config& cfg, uint64_t attempt_id) {
+                auto sink = [config_apply_status, attempt_id](
                                 bool ok, const std::string& err) {
-                    config_apply_status->Record(ok, err);
+                    config_apply_status->Record(attempt_id, ok, err);
                 };
                 vgww::ui::UiApp* app = g_ui_app.load();
                 if (app != nullptr) {
@@ -953,28 +972,37 @@ namespace {
                     return true;
                 }
                 std::thread([&apply_config_live, cfg, sink] {
-                    ::Sleep(150);
-                    std::wstring error;
-                    const bool ok = apply_config_live(cfg, error);
-                    std::string utf8;
-                    if (!error.empty()) {
-                        const int need = ::WideCharToMultiByte(
-                            CP_UTF8, 0, error.c_str(),
-                            static_cast<int>(error.size()), nullptr, 0,
-                            nullptr, nullptr);
-                        if (need > 0) {
-                            utf8.resize(static_cast<std::size_t>(need));
-                            ::WideCharToMultiByte(
-                                CP_UTF8, 0, error.c_str(),
-                                static_cast<int>(error.size()), utf8.data(),
-                                need, nullptr, nullptr);
-                        }
-                    }
-                    sink(ok, utf8);
+                    ::vgww::core::RunDetachedBodyGuarded(
+                        config_apply_errors,
+                        [&] {
+                            ::Sleep(150);
+                            std::wstring error;
+                            const bool ok = apply_config_live(cfg, error);
+                            std::string utf8;
+                            if (!error.empty()) {
+                                const int need = ::WideCharToMultiByte(
+                                    CP_UTF8, 0, error.c_str(),
+                                    static_cast<int>(error.size()), nullptr, 0,
+                                    nullptr, nullptr);
+                                if (need > 0) {
+                                    utf8.resize(
+                                        static_cast<std::size_t>(need));
+                                    ::WideCharToMultiByte(
+                                        CP_UTF8, 0, error.c_str(),
+                                        static_cast<int>(error.size()),
+                                        utf8.data(), need, nullptr, nullptr);
+                                }
+                            }
+                            sink(ok, utf8);
+                        },
+                        [&] { sink(false, "config apply failed"); });
                 }).detach();
                 return true;
             },
-            config_apply_status);
+            config_apply_status,
+            // batch126: the console ring's eviction counter is visible on
+            // /api/console instead of being a silent loss.
+            [] { return vgww::ui::console_log::DroppedLineCount(); });
 
         // HttpServer is OPT-IN (--web / --web-only; S4.4 switched the default off).
         // It binds the configured web.bind (default 127.0.0.1) - never every

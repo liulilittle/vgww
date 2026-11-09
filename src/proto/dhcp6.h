@@ -100,6 +100,10 @@ namespace vgww {
         bool ParseDhcp6Frame(const uint8_t* data, size_t len,
                              Dhcp6View& out) noexcept;
 
+        /// batch122: cumulative count of frames dropped by ParseDhcp6Frame.
+        /// Monotonic (never reset); the status surface reports deltas.
+        uint64_t ParseRejected6Count() noexcept;
+
         /// Everything BuildDhcp6ReplyFrame needs. Keeping it in one struct
         /// avoids a 20-parameter function.
         struct Dhcp6Reply final {
@@ -189,7 +193,7 @@ namespace vgww {
             /// Persists dynamic leases to a versioned JSON file (atomic
             /// temp+rename, FlushFileBuffers). Returns false on I/O failure.
             bool DumpLeases(const std::string& path,
-                            std::chrono::steady_clock::time_point now) const;
+                            std::chrono::steady_clock::time_point now);
 
             /// batch34c: same outcome contract as the v4 server (see
             /// DhcpServer::LoadOutcome). The bool alone reported a corrupt or
@@ -198,6 +202,9 @@ namespace vgww {
                 kRestored,
                 kNoFile,
                 kCorrupt,
+                kUnreadable  ///< exists but could not be opened even after
+                             ///< bounded retries: nothing was parsed, so
+                             ///< nothing may be overwritten by a later dump
             };
 
             /// Restores leases persisted by DumpLeases. Expired entries are
@@ -217,6 +224,12 @@ namespace vgww {
             /// failed. Monotonic; callers report deltas.
             uint64_t PoolExhaustedCount() const noexcept;
             uint64_t PersistFailureCount() const noexcept;
+            /// batch119: see DhcpServer::DroppedLeaseCount().
+            uint64_t DroppedLeaseCount() const noexcept;
+            /// batch120: see DhcpServer::LeaseFileCorrupt().
+            bool LeaseFileCorrupt() const noexcept;
+            /// batch86: see DhcpServer::PersistBlocked.
+            bool PersistBlocked() const noexcept;
             /// batch34j: times the anti-storm rate-window map was cleared
             /// wholesale because it hit kMaxRateEntries.
             uint64_t RateLimitResets() const noexcept;
@@ -343,6 +356,14 @@ namespace vgww {
             static constexpr size_t kMaxRateEntries = 4096;
 
             mutable std::atomic<uint64_t> persist_failures_{0};
+            /// batch119: see DroppedLeaseCount().
+            mutable std::atomic<uint64_t> dropped_leases_{0};
+            /// batch120: see LeaseFileCorrupt().
+            mutable std::atomic<bool> lease_file_corrupt_{false};
+            /// batch85: set when LoadLeases could not open the file; every
+            /// dump is refused so a briefly locked (but valid) file is never
+            /// overwritten.
+            mutable std::atomic<bool> persist_blocked_{false};
     /// batch34j: times the per-client rate window map was cleared wholesale
     /// because it hit kMaxRateEntries (anti-storm protection lost briefly).
     mutable std::atomic<uint64_t> rate_limit_resets_{0};

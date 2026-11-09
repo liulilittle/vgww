@@ -21,6 +21,7 @@
 #include <cstring>
 #include <filesystem>
 #include <fstream>
+#include <set>
 #include <sstream>
 #include <string>
 #include <unordered_set>
@@ -34,6 +35,11 @@ namespace vgww {
     namespace proto {
 
         namespace {
+
+            /// batch122: cumulative DHCPv6 frames refused by ParseDhcp6Frame
+            /// (v4 sibling: ParseRejectedCount). Surfaced so malformed v6
+            /// clients are never a silent drop.
+            std::atomic<uint64_t> g_parse_rejected6{0};
 
             inline uint16_t ReadU16(const uint8_t* p) noexcept {
                 return static_cast<uint16_t>((p[0] << 8) | p[1]);
@@ -97,28 +103,36 @@ namespace vgww {
 
         }  // namespace
 
+        uint64_t ParseRejected6Count() noexcept {
+            return g_parse_rejected6.load(std::memory_order_relaxed);
+        }
+
         bool ParseDhcp6Frame(const uint8_t* data, size_t len,
                              Dhcp6View& out) noexcept {
             out = Dhcp6View{};
-            if (nullptr == data || len < kDhcp6FrameMin) {
+            const auto fail = []() noexcept {
+                g_parse_rejected6.fetch_add(1, std::memory_order_relaxed);
                 return false;
+            };
+            if (nullptr == data || len < kDhcp6FrameMin) {
+                return fail();
             }
             net::EthHeaderView eth;
             if (!net::ParseEthHeader(data, len, eth) ||
                 net::kEthertypeIpv6 != eth.ethertype) {
-                return false;
+                return fail();
             }
             const uint8_t* ip = data + net::kEthernetHeaderLen;
             // IPv6 fixed header: version 6, next header UDP (RFC 8200).
             if (6 != (ip[0] >> 4) || 17 != ip[6]) {
-                return false;
+                return fail();
             }
             const size_t l4_offset = net::kEthernetHeaderLen + 40;
             if (len < l4_offset + kUdpHeaderLen + 4) {
-                return false;
+                return fail();
             }
             if (!IsLinkLocal(ip + 8)) {
-                return false;
+                return fail();
             }
             const uint8_t* udp = data + l4_offset;
             const uint16_t sport = ReadU16(udp);
@@ -127,17 +141,17 @@ namespace vgww {
             // F1 discipline: 546 -> 547 only, and the UDP length must agree
             // with the bytes actually held.
             if (kDhcp6ClientPort != sport || kDhcp6ServerPort != dport) {
-                return false;
+                return fail();
             }
             if (udp_len < kUdpHeaderLen + 4 ||
                 static_cast<size_t>(udp_len) != len - l4_offset) {
-                return false;
+                return fail();
             }
             const uint8_t* payload = udp + kUdpHeaderLen;
             const size_t payload_len = udp_len - kUdpHeaderLen;
             const uint8_t msg_type = payload[0];
             if (!IsClientMessage(msg_type)) {
-                return false;
+                return fail();
             }
             out.msg_type = msg_type;
             out.xid = (static_cast<uint32_t>(payload[1]) << 16) |
@@ -154,27 +168,27 @@ namespace vgww {
                 const uint16_t olen = ReadU16(payload + pos + 2);
                 pos += 4;
                 if (pos + olen > payload_len) {
-                    return false;
+                    return fail();
                 }
                 const uint8_t* value = payload + pos;
                 switch (code) {
                     case kDhcp6OptClientId:
                         if (olen < 1 || olen > kDhcp6MaxDuidLen) {
-                            return false;
+                            return fail();
                         }
                         out.has_client_id = true;
                         out.client_duid.assign(value, value + olen);
                         break;
                     case kDhcp6OptServerId:
                         if (olen < 1 || olen > kDhcp6MaxDuidLen) {
-                            return false;
+                            return fail();
                         }
                         out.has_server_id = true;
                         out.server_duid.assign(value, value + olen);
                         break;
                     case kDhcp6OptIaNa: {
                         if (olen < kDhcp6IaNaMin) {
-                            return false;
+                            return fail();
                         }
                         out.has_ia_na = true;
                         out.iaid = ReadU32(value);
@@ -184,11 +198,11 @@ namespace vgww {
                             const uint16_t ilen = ReadU16(value + inner + 2);
                             inner += 4;
                             if (inner + ilen > olen) {
-                                return false;
+                                return fail();
                             }
                             if (kDhcp6OptIaAddr == icode) {
                                 if (ilen < 24) {
-                                    return false;
+                                    return fail();
                                 }
                                 std::memcpy(out.ia_addr.data(), value + inner,
                                             16);
@@ -197,7 +211,7 @@ namespace vgww {
                             inner += ilen;
                         }
                         if (inner != olen) {
-                            return false;
+                            return fail();
                         }
                         break;
                     }
@@ -210,13 +224,13 @@ namespace vgww {
                 pos += olen;
             }
             if (pos != payload_len) {
-                return false;
+                return fail();
             }
             if (!out.has_client_id) {
-                return false;  // RFC 8415 16.1: Client Identifier mandatory
+                return fail();  // RFC 8415 16.1: Client Identifier mandatory
             }
             if (RequiresIaNa(msg_type) && !out.has_ia_na) {
-                return false;
+                return fail();
             }
             return true;
         }
@@ -822,7 +836,46 @@ namespace vgww {
 
         bool Dhcp6Server::DumpLeases(
             const std::string& path,
-            std::chrono::steady_clock::time_point now) const {
+            std::chrono::steady_clock::time_point now) {
+            // batch85: never overwrite a file this server could not read.
+            // batch87: retry the read; a successful again-read merges the
+            // on-disk leases (live leases win on address conflicts) and clears
+            // the block instead of requiring a restart.
+            if (persist_blocked_.load(std::memory_order_relaxed)) {
+                // batch87: retry the read; a successful re-read merges the
+                // on-disk leases, but a DISK entry whose address a live client
+                // already holds is dropped afterwards (one address, one owner,
+                // batch134). The block clears without a restart.
+                std::unordered_map<Key, Lease, KeyHash> live;
+                {
+                    std::lock_guard<std::mutex> lock(
+                        const_cast<std::mutex&>(mutex_));
+                    live = leases_;
+                }
+                size_t dropped = 0;
+                const LoadOutcome outcome = LoadLeases(path, now, &dropped);
+                if (LoadOutcome::kUnreadable == outcome) {
+                    ++persist_failures_;
+                    return false;
+                }
+                persist_blocked_.store(false, std::memory_order_relaxed);
+                {
+                    std::lock_guard<std::mutex> lock(
+                        const_cast<std::mutex&>(mutex_));
+                    std::set<std::array<uint8_t, 16>> live_ips;
+                    for (const auto& kv : live) {
+                        live_ips.insert(kv.second.ip);
+                    }
+                    for (auto it = leases_.begin(); it != leases_.end();) {
+                        if (0 == live.count(it->first) &&
+                            live_ips.end() != live_ips.find(it->second.ip)) {
+                            it = leases_.erase(it);
+                        } else {
+                            ++it;
+                        }
+                    }
+                }
+            }
             // Acquire/Decline/Sweep mutate the map from the RX and control
             // threads.
             //
@@ -888,77 +941,22 @@ namespace vgww {
                 json << row.dump();
             }
             json << "]}";
-            // F4: every failure path is observable (counted + logged).
-            const auto fail = [this](const char* what, unsigned long code) {
-                ++persist_failures_;
-                std::fprintf(
-                    stderr,
-                    "[vgww] dhcp6: lease dump failed: %s (code=%lu)\n", what,
-                    code);
-                return false;
-            };
-            const std::string tmp = path + ".tmp";
+            // batch82: shared durable writer. Temp naming, the device flush
+            // contract, the bounded publish retry and every failure path live
+            // in ONE implementation (same one the v4 writer, the config and
+            // the rule store use) instead of a per-protocol copy that can
+            // drift - and that copy ignored nothing here, but had no unique
+            // temp name and no publish retry (C6/C9). Failures stay observable
+            // (counted + logged).
             const std::string data = json.str();
-
-#ifdef _WIN32
-            {
-                const std::wstring wtmp = ToWideLongPath(tmp);
-                const std::wstring wpath = ToWideLongPath(path);
-                if (!wtmp.empty() && !wpath.empty()) {
-                    FILE* f = nullptr;
-                    if (0 == ::_wfopen_s(&f, wtmp.c_str(), L"wb") &&
-                        nullptr != f) {
-                        const size_t written =
-                            ::fwrite(data.data(), 1, data.size(), f);
-                        const bool flushed = 0 == ::fflush(f);
-                        // fflush only drains the CRT buffer; the data must
-                        // reach the device before the rename makes the name
-                        // visible.
-                        const HANDLE handle = reinterpret_cast<HANDLE>(
-                            ::_get_osfhandle(::_fileno(f)));
-                        const bool synced =
-                            (INVALID_HANDLE_VALUE != handle) &&
-                            (0 != ::FlushFileBuffers(handle));
-                        const int close_ok = ::fclose(f);
-                        if (written == data.size() && flushed && synced &&
-                            0 == close_ok) {
-                            if (::MoveFileExW(
-                                    wtmp.c_str(), wpath.c_str(),
-                                    MOVEFILE_REPLACE_EXISTING |
-                                        MOVEFILE_WRITE_THROUGH)) {
-                                return true;
-                            }
-                            ::DeleteFileW(wtmp.c_str());
-                            return fail("atomic replace failed",
-                                        static_cast<unsigned long>(
-                                            ::GetLastError()));
-                        }
-                        ::DeleteFileW(wtmp.c_str());
-                        return fail("short write, flush or close error",
-                                    static_cast<unsigned long>(errno));
-                    }
-                }
-            }
-#endif
-            std::ofstream file(tmp);
-            if (!file) {
-                return fail("cannot open temp file",
-                            static_cast<unsigned long>(errno));
-            }
-            file << data;
-            file.flush();
-            file.close();
-            if (!file) {  // flush/close error: keep the old file
-                return fail("short write, flush or close error",
-                            static_cast<unsigned long>(errno));
-            }
-            std::error_code ec;
-            std::filesystem::rename(tmp, path, ec);
-            if (ec) {
-                std::error_code ignore;
-                std::filesystem::remove(tmp, ignore);
-                return fail("atomic replace failed",
-                            static_cast<unsigned long>(ec.value()));
+            std::string write_error;
+            if (core::AtomicWriteOutcome::kOk !=
+                core::WriteFileAtomicDurable(path, data, write_error)) {
+                ++persist_failures_;
+                std::fprintf(stderr,
+                             "[vgww] dhcp6: lease dump failed: %s\n",
+                             write_error.c_str());
+                return false;
             }
             return true;
         }
@@ -980,21 +978,88 @@ namespace vgww {
             size_t dropped = 0;
             nlohmann::json parsed;
 
+            // batch82: preserve a file the loader cannot read (see v4): the
+            // next 60 s snapshot used to overwrite it, destroying both the
+            // chance of manual recovery and the evidence of the loss.
+            const auto corrupt = [&path, this]() {
+                core::SetAsideFile(path, ".corrupt");
+                lease_file_corrupt_.store(true, std::memory_order_relaxed);
+                return LoadOutcome::kCorrupt;
+            };
+
 #ifdef _WIN32
             {
                 const std::wstring wpath = ToWideLongPath(path);
                 if (!wpath.empty()) {
                     FILE* f = nullptr;
-                    if (0 == ::_wfopen_s(&f, wpath.c_str(), L"rb") &&
-                        nullptr != f) {
+                    // batch85: same discipline as v4 - retry a transient
+                    // holder; classify "could not open" as kUnreadable, never
+                    // as corruption, and stop writing so the file survives.
+                    bool open_file_exists = true;
+                    bool open_simulated = false;
+                    unsigned long open_error = 0;
+                    constexpr int kOpenAttempts = 3;
+
+                    for (int attempt = 0;; ++attempt) {
+                        const unsigned long simulated =
+                            core::SimulatedOpenFailure(path);
+                        const DWORD attrs = ::GetFileAttributesW(wpath.c_str());
+                        open_file_exists = (INVALID_FILE_ATTRIBUTES != attrs);
+
+                        if (0 == simulated) {
+                            if (0 == ::_wfopen_s(&f, wpath.c_str(), L"rb") &&
+                                nullptr != f) {
+                                break;
+                            }
+                            open_simulated = false;
+                            open_error = static_cast<unsigned long>(
+                                ::GetLastError());
+                        } else {
+                            open_simulated = true;
+                            open_error = simulated;
+                        }
+
+                        if (!open_file_exists || attempt + 1 >= kOpenAttempts) {
+                            break;
+                        }
+                        ::Sleep(static_cast<DWORD>(attempt + 1));
+                    }
+
+                    if (nullptr == f && (open_file_exists || open_simulated)) {
+                        if (open_file_exists && !open_simulated) {
+                            const DWORD attrs =
+                                ::GetFileAttributesW(wpath.c_str());
+                            if (INVALID_FILE_ATTRIBUTES != attrs &&
+                                0 != (attrs & FILE_ATTRIBUTE_DIRECTORY)) {
+                                return corrupt();
+                            }
+                        }
+                        persist_blocked_.store(true,
+                                               std::memory_order_relaxed);
+                        std::fprintf(stderr,
+                                     "[vgww] dhcp6: lease file not readable "
+                                     "(%s, error %lu); persistence paused so "
+                                     "the file is not overwritten\n",
+                                     path.c_str(), open_error);
+                        return LoadOutcome::kUnreadable;
+                    }
+
+                    if (nullptr != f) {
                         ::fseek(f, 0, SEEK_END);
                         const long sz = ::ftell(f);
                         ::fseek(f, 0, SEEK_SET);
                         constexpr long kLeaseCap = static_cast<long>(
                             ::vgww::core::limits::kMaxLeases6Bytes);
+                        // batch82: ftell == -1 is an I/O failure, not an
+                        // empty file (an empty file would report "restored"
+                        // while dropping everything the file held).
+                        if (sz < 0) {
+                            ::fclose(f);
+                            return corrupt();
+                        }
                         if (sz > kLeaseCap) {
                             ::fclose(f);
-                            return LoadOutcome::kCorrupt;
+                            return corrupt();
                         }
                         std::string raw;
                         if (sz > 0) {
@@ -1011,7 +1076,7 @@ namespace vgww {
                                 parsed = nlohmann::json::array();
                             }
                         } catch (...) {
-                            return LoadOutcome::kCorrupt;
+                            return corrupt();
                         }
                         goto parsed_ok;
                     }
@@ -1027,14 +1092,17 @@ namespace vgww {
                 constexpr std::streamoff kLeaseCap2 =
                     static_cast<std::streamoff>(
                         ::vgww::core::limits::kMaxLeases6Bytes);
+                if (sz2 < 0) {
+                    return corrupt();
+                }
                 if (sz2 > kLeaseCap2) {
-                    return LoadOutcome::kCorrupt;
+                    return corrupt();
                 }
                 file.seekg(0, std::ios::beg);
                 try {
                     file >> parsed;
                 } catch (...) {
-                    return LoadOutcome::kCorrupt;
+                    return corrupt();
                 }
             }
 #ifdef _WIN32
@@ -1046,16 +1114,16 @@ namespace vgww {
                 const auto ver = parsed.find("version");
                 if (ver == parsed.end() || !ver->is_number_integer() ||
                     ver->get<int>() != 1) {
-                    return LoadOutcome::kCorrupt;  // schema changed: do not misparse
+                    return corrupt();  // schema changed: do not misparse
                 }
                 const auto it = parsed.find("leases");
                 if (it == parsed.end() || !it->is_array()) {
-                    return LoadOutcome::kCorrupt;
+                    return corrupt();
                 }
                 parsed = *it;
             }
             if (!parsed.is_array()) {
-                return LoadOutcome::kCorrupt;
+                return corrupt();
             }
             std::lock_guard<std::mutex> lock(mutex_);
             // batch134: one address, one owner (mirrors the v4 loader and
@@ -1136,6 +1204,8 @@ namespace vgww {
             if (dropped_out != nullptr) {
                 *dropped_out = dropped;
             }
+            dropped_leases_.fetch_add(static_cast<uint64_t>(dropped),
+                                      std::memory_order_relaxed);
             return LoadOutcome::kRestored;
         }
 
@@ -1158,6 +1228,18 @@ namespace vgww {
 
         uint64_t Dhcp6Server::PersistFailureCount() const noexcept {
             return persist_failures_.load(std::memory_order_relaxed);
+        }
+
+        uint64_t Dhcp6Server::DroppedLeaseCount() const noexcept {
+            return dropped_leases_.load(std::memory_order_relaxed);
+        }
+
+        bool Dhcp6Server::LeaseFileCorrupt() const noexcept {
+            return lease_file_corrupt_.load(std::memory_order_relaxed);
+        }
+
+        bool Dhcp6Server::PersistBlocked() const noexcept {
+            return persist_blocked_.load(std::memory_order_relaxed);
         }
 
         std::vector<Dhcp6Server::LeaseEntry> Dhcp6Server::Leases(

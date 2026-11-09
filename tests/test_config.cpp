@@ -2,14 +2,22 @@
 // test_config.cpp - Configuration parsing, validation and helpers.
 // ============================================================================
 #include "core/config.h"
+#include "core/handler_guard.h"
 
+#include <atomic>
+#include <chrono>
 #include <cstdio>
 #include <direct.h>
+#include <filesystem>
 #include <fstream>
+#include <iterator>
 #include <stdexcept>
 #include <string>
+#include <thread>
 #include <vector>
 #include <windows.h>
+
+vgww::core::Config MakeFullConfig();
 
 namespace {
 
@@ -31,6 +39,180 @@ namespace {
         if (!out) return false;
         out << content;
         return true;
+    }
+
+    /// A throwing DETACHED thread body must not call std::terminate: the
+    /// shared firewall swallows it, counts it, and publishes a failure the
+    /// caller can show. A throwing report path is contained too.
+    void TestDetachedBodyGuardPublishesFailure() {
+        std::atomic<uint64_t> errors{0};
+        int reports = 0;
+        bool reported_ok = true;
+        std::string reported_text;
+
+        vgww::core::RunDetachedBodyGuarded(
+            errors, [] { throw std::runtime_error("deferred body"); },
+            [&] {
+                ++reports;
+                reported_ok = false;
+                reported_text = "apply failed";
+            });
+        CHECK(1 == errors.load());
+        CHECK(1 == reports);
+        CHECK(!reported_ok);
+        CHECK(reported_text == "apply failed");
+
+        // The normal path runs once and reports nothing.
+        int ran = 0;
+        vgww::core::RunDetachedBodyGuarded(errors, [&ran] { ++ran; },
+                                           [&ran] { --ran; });
+        CHECK(1 == ran);
+        CHECK(1 == errors.load());
+
+        // A throwing failure sink must also be contained: the body throw and
+        // the report throw are both counted (1 + 1 on top of the first case).
+        vgww::core::RunDetachedBodyGuarded(
+            errors, [] { throw std::runtime_error("body"); },
+            [] { throw std::runtime_error("report"); });
+        CHECK(3 == errors.load());
+    }
+
+    /// A DEVICE-FLUSH failure must not be reported as a successful save. The
+    /// writer used to ignore FlushFileBuffers and publish anyway, claiming a
+    /// durability the volume never provided (the "saved" config/rule set can
+    /// vanish or come back torn after a power cut).
+    void TestFileFlushFailureIsNotSaved() {
+        const std::string path = "b-flush-record.json";
+        std::remove(path.c_str());
+        const auto read_all = [](const std::string& p) {
+            std::ifstream in(p, std::ios::binary);
+            return std::string(std::istreambuf_iterator<char>(in),
+                               std::istreambuf_iterator<char>());
+        };
+
+        Config c = MakeFullConfig();
+        c.adapter = "flush-A";
+        std::string err;
+        CHECK(c.SaveToFile(path, err));
+        const std::string original = read_all(path);
+        CHECK(original.find("flush-A") != std::string::npos);
+
+        Config next = c;
+        next.adapter = "flush-B";
+        vgww::core::SetFileFlushHookForTest(
+            [](std::intptr_t) { return false; });
+        std::string flush_err;
+        const bool saved = next.SaveToFile(path, flush_err);
+        vgww::core::SetFileFlushHookForTest(nullptr);
+        CHECK(!saved);
+        CHECK(!flush_err.empty());
+        // The destination was left untouched (still the previous document).
+        CHECK(read_all(path) == original);
+        // No temp leftovers next to the destination.
+        size_t stale = 0;
+        for (const auto& entry : std::filesystem::directory_iterator(".")) {
+            const std::string name = entry.path().filename().string();
+            if (0 == name.rfind("b-flush-record.json.tmp.", 0)) {
+                ++stale;
+            }
+        }
+        CHECK(0 == stale);
+        // Once the device flushes again, the new document is what lands.
+        CHECK(next.SaveToFile(path, err));
+        CHECK(read_all(path).find("flush-B") != std::string::npos);
+        std::remove(path.c_str());
+    }
+
+    /// A failed load is READ-ONLY. Startup exits on a corrupt config (main.cpp
+    /// reports the error and returns), so the file the operator wrote must
+    /// still be there byte-for-byte for them to inspect - the same
+    /// "preserve, never silently destroy" rule the rules/lease stores follow.
+    void TestLoadFailureDoesNotTouchTheFile() {
+        const std::string path = "b-load-corrupt.json";
+        std::remove(path.c_str());
+        const std::string garbage = "{\"gateway\":";
+        {
+            std::ofstream out(path, std::ios::binary);
+            out << garbage;
+        }
+        std::string error;
+        CHECK(!Config::LoadFromFile(path, error).has_value());
+        CHECK(!error.empty());
+        {
+            std::ifstream in(path, std::ios::binary);
+            CHECK(in.good());
+            CHECK(std::string((std::istreambuf_iterator<char>(in)),
+                              std::istreambuf_iterator<char>()) == garbage);
+        }
+        // Reloading gives the same verdict and changes nothing either.
+        std::string second_error;
+        CHECK(!Config::LoadFromFile(path, second_error).has_value());
+        CHECK(second_error == error);
+        std::remove(path.c_str());
+    }
+
+    /// batch84: a transient holder (AV scanner / indexer) that makes the file
+    /// un-openable for a moment must not abort startup. The loader retries a
+    /// bounded number of times, then reports it as unreadable (never as
+    /// "missing" and never as "corrupt").
+    void TestConfigOpenRetryOnTransientLock() {
+        const std::string path = "b-open-retry.json";
+        std::remove(path.c_str());
+        Config c;
+        c.adapter = "retry-A";
+        bool ok = false;
+        c.gateway.ipv4 = vgww::core::ParseIpv4("192.168.50.1", ok);
+        c.gateway.mask = vgww::core::ParseIpv4("255.255.255.0", ok);
+        CHECK(vgww::core::ParseMac("02:11:22:33:44:55", c.gateway.mac));
+        std::string err;
+        CHECK(c.SaveToFile(path, err));
+
+        std::atomic<int> calls{0};
+        vgww::core::SetConfigOpenFailureHookForTest(
+            [&calls](const std::string&) -> unsigned long {
+                const int n = calls.fetch_add(1) + 1;
+                // ERROR_SHARING_VIOLATION for the first two attempts.
+                return n <= 2 ? 32u : 0u;
+            });
+        std::string load_err;
+        const auto loaded = Config::LoadFromFile(path, load_err);
+        vgww::core::SetConfigOpenFailureHookForTest(
+            std::function<unsigned long(const std::string&)>());
+        CHECK(loaded.has_value());
+        CHECK(loaded && loaded->adapter == "retry-A");
+        CHECK(calls.load() == 3);
+        std::remove(path.c_str());
+    }
+
+    void TestConfigOpenFailureIsClassified() {
+        // An existing file that stays un-openable is reported as unreadable
+        // (with the OS error) and is left untouched.
+        const std::string path = "b-open-locked.json";
+        std::remove(path.c_str());
+        {
+            std::ofstream out(path, std::ios::binary);
+            out << "{}";
+        }
+        vgww::core::SetConfigOpenFailureHookForTest(
+            [](const std::string&) -> unsigned long { return 32u; });
+        std::string err;
+        const bool loaded = Config::LoadFromFile(path, err).has_value();
+        vgww::core::SetConfigOpenFailureHookForTest(
+            std::function<unsigned long(const std::string&)>());
+        CHECK(!loaded);
+        CHECK(err.find("not readable") != std::string::npos);
+        CHECK(err.find("32") != std::string::npos);
+        {
+            std::ifstream in(path, std::ios::binary);
+            CHECK(in.good());
+        }
+        std::remove(path.c_str());
+
+        // A missing file is classified differently.
+        std::string missing_error;
+        CHECK(!Config::LoadFromFile("b-open-absent.json", missing_error)
+                   .has_value());
+        CHECK(missing_error.find("not found") != std::string::npos);
     }
 
     void TestMacRoundTrip() {
@@ -1303,6 +1485,518 @@ void TestConfigSaveAtomic() {
     std::remove(path.c_str());
 }
 
+    /// batch94: two writers of the same config document (two binding POSTs, or
+    /// a binding POST racing a whole-document publish) must not overwrite each
+    /// other's just-loaded change with a stale snapshot. UpdateFile serializes
+    /// load-mutate-publish per path; without it only one of N survives.
+    void TestB94ConfigUpdateSerialized() {
+        const std::string path = "test_cfg_b94_update.json";
+        std::remove(path.c_str());
+        {
+            Config seed = MakeFullConfig();
+            seed.dhcp.static_bindings.clear();
+            std::string seed_error;
+            CHECK(seed.SaveToFile(path, seed_error));
+        }
+        constexpr int kThreads = 8;
+        std::atomic<bool> go{false};
+        std::atomic<int> ready{0};
+        std::atomic<int> failures{0};
+        std::atomic<int> bad_ip{0};
+        std::vector<std::thread> workers;
+        for (int i = 0; i < kThreads; ++i) {
+            workers.emplace_back([&, i] {
+                ++ready;
+                while (!go.load(std::memory_order_acquire)) {
+                    std::this_thread::yield();
+                }
+                std::string error;
+                const bool ok = Config::UpdateFile(
+                    path,
+                    [i, &bad_ip](Config& c) {
+                        // Widen the load->publish window so a missing lock
+                        // deterministically loses all but the last writer.
+                        std::this_thread::sleep_for(
+                            std::chrono::milliseconds(2));
+                        bool parsed = false;
+                        vgww::core::StaticBinding b;
+                        b.mac = {0x02, 0x00, 0x00, 0x00, 0x94,
+                                 static_cast<uint8_t>(i)};
+                        b.ip = vgww::core::ParseIpv4(
+                            "192.168.50." + std::to_string(20 + i), parsed);
+                        if (!parsed) {
+                            ++bad_ip;
+                            return;
+                        }
+                        b.hostname = "b94";
+                        c.dhcp.static_bindings.push_back(b);
+                    },
+                    error);
+                if (!ok) ++failures;
+            });
+        }
+        while (ready.load(std::memory_order_acquire) < kThreads) {
+            std::this_thread::yield();
+        }
+        go.store(true, std::memory_order_release);
+        for (auto& w : workers) w.join();
+        CHECK(0 == failures.load());
+        CHECK(0 == bad_ip.load());
+        std::string error;
+        const auto disk = Config::LoadFromFile(path, error);
+        CHECK(disk.has_value());
+        int found = 0;
+        if (disk) {
+            for (const auto& b : disk->dhcp.static_bindings) {
+                if (b.hostname == "b94") ++found;
+            }
+        }
+        CHECK(kThreads == found);
+        std::remove(path.c_str());
+    }
+
+    /// batch95: two VGWW processes can share one config path (a --headless
+    /// WebUI run bypasses the single-instance gate), so the document needs a
+    /// cross-process guard: a second owner must be refused a non-blocking
+    /// lock while the first holds it, and UpdateFile must wait for it.
+    void TestB95ConfigFileLockExcludesOtherOwners() {
+        const std::string path = "test_cfg_b95_lock.json";
+        std::remove(path.c_str());
+        {
+            const Config seed = MakeFullConfig();
+            std::string seed_error;
+            CHECK(seed.SaveToFile(path, seed_error));
+        }
+
+        std::atomic<bool> held{false};
+        std::atomic<bool> release{false};
+        std::atomic<bool> holder_locked{false};
+        std::thread holder([&] {
+            vgww::core::ConfigFileLock first(path);
+            holder_locked.store(first.locked());
+            held.store(true, std::memory_order_release);
+            while (!release.load(std::memory_order_acquire)) {
+                std::this_thread::yield();
+            }
+        });
+        while (!held.load(std::memory_order_acquire)) {
+            std::this_thread::yield();
+        }
+        CHECK(holder_locked.load());
+        {
+            vgww::core::ConfigFileLock second(path, false);
+            CHECK(!second.locked());
+        }
+
+        // The guard is actually wired into the read-modify-write: this
+        // UpdateFile only has the in-process mutex of ITS OWN process, so it
+        // must stay blocked while the other owner holds the kernel lock.
+        std::atomic<bool> update_done{false};
+        std::thread updater([&] {
+            std::string error;
+            (void)Config::UpdateFile(
+                path, [](Config& c) { c.ui_scale = "125"; }, error);
+            update_done.store(true, std::memory_order_release);
+        });
+        for (int i = 0; i < 40 && !update_done.load(std::memory_order_acquire);
+             ++i) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(5));
+        }
+        CHECK(!update_done.load(std::memory_order_acquire));
+        release.store(true, std::memory_order_release);
+        holder.join();
+        updater.join();
+        CHECK(update_done.load(std::memory_order_acquire));
+        {
+            vgww::core::ConfigFileLock third(path, false);
+            CHECK(third.locked());
+        }
+        std::remove(path.c_str());
+    }
+
+    /// batch96: a settings save from a snapshot taken before a binding POST
+    /// must not delete the bindings that reached disk meanwhile (the UI owns
+    /// its settings, the binding routes own their lists).
+    void TestB96SettingsSavePreservesNewerBindings() {
+        const std::string path = "test_cfg_b96_bindings.json";
+        std::remove(path.c_str());
+        const Config snapshot = MakeFullConfig();
+        std::string error;
+        CHECK(snapshot.SaveToFile(path, error));
+
+        bool added = false;
+        {
+            std::string update_error;
+            added = Config::UpdateFile(
+                path,
+                [](Config& c) {
+                    bool parsed = false;
+                    vgww::core::StaticBinding extra;
+                    vgww::core::ParseMac("02:00:00:00:96:01", extra.mac);
+                    extra.ip = vgww::core::ParseIpv4("192.168.50.96", parsed);
+                    extra.hostname = "late-v4";
+                    c.dhcp.static_bindings.push_back(extra);
+
+                    vgww::core::Dhcp6StaticBinding extra6;
+                    extra6.duid = {0x00, 0x03, 0x00, 0x01, 0x96};
+                    extra6.ip = {0xFD, 0xAA, 0, 0, 0, 0, 0, 0,
+                                 0,    0,    0, 0, 0, 0, 0x96, 0x01};
+                    extra6.hostname = "late-v6";
+                    c.ipv6.dhcpv6.static_bindings.push_back(extra6);
+                },
+                update_error);
+        }
+        CHECK(added);
+
+        Config settings = snapshot;  // predates the two late bindings
+        settings.ui_scale = "125";
+        error.clear();
+        CHECK(settings.SaveToFilePreservingBindings(path, error));
+
+        error.clear();
+        const auto disk = Config::LoadFromFile(path, error);
+        CHECK(disk.has_value());
+        if (disk) {
+            CHECK(disk->ui_scale == "125");
+            CHECK(2 == disk->dhcp.static_bindings.size());
+            CHECK(2 == disk->ipv6.dhcpv6.static_bindings.size());
+            bool late4 = false;
+            for (const auto& b : disk->dhcp.static_bindings) {
+                if (b.hostname == "late-v4") late4 = true;
+            }
+            bool late6 = false;
+            for (const auto& b : disk->ipv6.dhcpv6.static_bindings) {
+                if (b.hostname == "late-v6") late6 = true;
+            }
+            CHECK(late4);
+            CHECK(late6);
+        }
+        std::remove(path.c_str());
+    }
+
+    /// batch97: the shared binding-persistence helpers used by the HTTP
+    /// routes AND the native UI commands. Upsert matches on the identity key
+    /// (no duplicates), delete of an absent key still succeeds, and an empty
+    /// path reports false instead of pretending durability.
+    void TestB97SharedBindingPersistence() {
+        const std::string path = "test_cfg_b97_bindings.json";
+        std::remove(path.c_str());
+        const Config seed = MakeFullConfig();
+        std::string error;
+        CHECK(seed.SaveToFile(path, error));
+
+        vgww::core::MacAddress mac{};
+        CHECK(vgww::core::ParseMac("02:00:00:00:97:01", mac));
+        bool parsed = false;
+        const uint32_t ip = vgww::core::ParseIpv4("192.168.50.97", parsed);
+        CHECK(parsed);
+        CHECK(vgww::core::UpsertDhcpBinding(path, mac, ip, "ui-v4", error));
+        CHECK(vgww::core::UpsertDhcpBinding(path, mac, ip, "ui-v4b", error));
+
+        std::vector<uint8_t> duid = {0x00, 0x03, 0x00, 0x01, 0x97, 0x01};
+        const std::array<uint8_t, 16> ip6 = {
+            0xFD, 0xAA, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x97, 0x01};
+        CHECK(vgww::core::UpsertDhcp6Binding(path, duid, ip6, "ui-v6", error));
+
+        const auto disk = Config::LoadFromFile(path, error);
+        CHECK(disk.has_value());
+        if (disk) {
+            int found = 0;
+            for (const auto& b : disk->dhcp.static_bindings) {
+                if (b.mac == mac) {
+                    ++found;
+                    CHECK(b.hostname == "ui-v4b");
+                }
+            }
+            CHECK(1 == found);
+            int found6 = 0;
+            for (const auto& b : disk->ipv6.dhcpv6.static_bindings) {
+                if (b.duid == duid) {
+                    ++found6;
+                    CHECK(b.hostname == "ui-v6");
+                }
+            }
+            CHECK(1 == found6);
+        }
+
+        CHECK(vgww::core::DeleteDhcpBinding(path, mac, error));
+        CHECK(vgww::core::DeleteDhcp6Binding(path, duid, error));
+        // Deleting an absent row is the requested state already: success.
+        CHECK(vgww::core::DeleteDhcpBinding(path, mac, error));
+        const auto after = Config::LoadFromFile(path, error);
+        CHECK(after.has_value());
+        if (after) {
+            for (const auto& b : after->dhcp.static_bindings) {
+                CHECK(!(b.mac == mac));
+            }
+            for (const auto& b : after->ipv6.dhcpv6.static_bindings) {
+                CHECK(!(b.duid == duid));
+            }
+        }
+
+        std::string empty_error;
+        CHECK(!vgww::core::UpsertDhcpBinding("", mac, ip, "x", empty_error));
+        CHECK(!empty_error.empty());
+        std::remove(path.c_str());
+    }
+
+    /// batch107: when the cross-process lock cannot be acquired within the
+    /// wait budget, the save must FAIL loudly instead of publishing without
+    /// mutual exclusion (which would overwrite the other process's document).
+    void TestB107LockTimeoutRefusesTheWrite() {
+        const std::string path = "test_cfg_b107_lock.json";
+        std::remove(path.c_str());
+        const Config cfg = MakeFullConfig();
+        std::string error;
+        CHECK(cfg.SaveToFile(path, error));
+        Config next = cfg;
+        next.ui_scale = "150";
+
+        vgww::core::SetConfigLockWaitForTest(std::chrono::milliseconds(20));
+        std::atomic<bool> held{false};
+        std::atomic<bool> release{false};
+        std::thread holder([&] {
+            vgww::core::ConfigFileLock lock(path);
+            held.store(true, std::memory_order_release);
+            while (!release.load(std::memory_order_acquire)) {
+                std::this_thread::yield();
+            }
+        });
+        while (!held.load(std::memory_order_acquire)) {
+            std::this_thread::yield();
+        }
+        error.clear();
+        CHECK(!next.SaveToFile(path, error));  // refused, not silent
+        CHECK(!error.empty());
+        release.store(true, std::memory_order_release);
+        holder.join();
+        vgww::core::SetConfigLockWaitForTest(std::chrono::milliseconds(0));
+
+        std::string load_error;
+        const auto disk = Config::LoadFromFile(path, load_error);
+        CHECK(disk.has_value());
+        if (disk) {
+            CHECK(disk->ui_scale != "150");  // target untouched
+        }
+        std::remove(path.c_str());
+    }
+
+    /// batch108: the corrupt-file "preserve" path renames the document aside.
+    /// It must not steal a file another process is publishing: the rename is
+    /// refused while the destination's lock is held elsewhere.
+    void TestB108SetAsideRespectsCrossProcessLock() {
+        const std::string path = "test_cfg_b108_aside.json";
+        const std::string aside = path + ".corrupt";
+        std::remove(path.c_str());
+        std::remove(aside.c_str());
+        CHECK(WriteFile(path, "{\"version\":1}"));
+
+        vgww::core::SetConfigLockWaitForTest(std::chrono::milliseconds(20));
+        std::atomic<bool> held{false};
+        std::atomic<bool> release{false};
+        std::thread holder([&] {
+            vgww::core::ConfigFileLock lock(path);
+            held.store(true, std::memory_order_release);
+            while (!release.load(std::memory_order_acquire)) {
+                std::this_thread::yield();
+            }
+        });
+        while (!held.load(std::memory_order_acquire)) {
+            std::this_thread::yield();
+        }
+        CHECK(!vgww::core::SetAsideFile(path, ".corrupt"));
+        {
+            std::ifstream still(path);
+            CHECK(still.good());  // source untouched
+        }
+        {
+            std::ifstream moved(aside);
+            CHECK(!moved.good());  // nothing preserved behind its back
+        }
+        release.store(true, std::memory_order_release);
+        holder.join();
+        vgww::core::SetConfigLockWaitForTest(std::chrono::milliseconds(0));
+
+        // With the lock free the preserve works as before.
+        CHECK(vgww::core::SetAsideFile(path, ".corrupt"));
+        {
+            std::ifstream moved(aside);
+            CHECK(moved.good());
+        }
+        std::remove(path.c_str());
+        std::remove(aside.c_str());
+    }
+
+    /// batch109: an in-place update is published only if the document it
+    /// produces still loads. Otherwise one write could persist a config the
+    /// next start refuses wholesale (a single-write brick).
+    void TestB109UpdateFileRejectsUnloadableDocument() {
+        const std::string path = "test_cfg_b109_validator.json";
+        std::remove(path.c_str());
+        Config seed = MakeFullConfig();
+        std::string error;
+        CHECK(seed.SaveToFile(path, error));
+        const auto read_back = [](const std::string& p) {
+            std::ifstream in(p, std::ios::binary);
+            return std::string(std::istreambuf_iterator<char>(in),
+                               std::istreambuf_iterator<char>());
+        };
+        const std::string before = read_back(path);
+
+        const bool written = Config::UpdateFile(
+            path,
+            [](Config& c) {
+                // Inverted pool: parses fine, ValidateConfig rejects it.
+                const uint32_t start = c.dhcp.pool_start;
+                c.dhcp.pool_start = c.dhcp.pool_end;
+                c.dhcp.pool_end = start;
+            },
+            error);
+        CHECK(!written);
+        CHECK(!error.empty());
+        CHECK(read_back(path) == before);  // destination untouched
+
+        size_t stale = 0;
+        for (const auto& entry : std::filesystem::directory_iterator(".")) {
+            const std::string name = entry.path().filename().string();
+            if (0 == name.rfind("test_cfg_b109_validator.json.tmp.", 0)) {
+                ++stale;
+            }
+        }
+        CHECK(0 == stale);
+
+        // Valid updates still publish (the guard is not a blanket refusal).
+        const bool ok_written = Config::UpdateFile(
+            path, [](Config& c) { c.dhcp.lease_seconds = 3600; }, error);
+        CHECK(ok_written);
+        std::string load_error;
+        const auto reloaded = Config::LoadFromFile(path, load_error);
+        CHECK(reloaded.has_value());
+        CHECK(reloaded && reloaded->dhcp.lease_seconds == 3600);
+        std::remove(path.c_str());
+    }
+
+    /// batch110: SaveToFile is the UI's main publishing path and used to rely
+    /// on its caller having validated first. Enforce the invariant at the exit:
+    /// an unloadable document is never published, and an existing destination
+    /// keeps its previous bytes.
+    void TestB110SaveToFileRejectsUnloadableDocument() {
+        const std::string fresh = "test_cfg_b110_fresh.json";
+        const std::string keep = "test_cfg_b110_keep.json";
+        std::remove(fresh.c_str());
+        std::remove(keep.c_str());
+
+        Config bad = MakeFullConfig();
+        const uint32_t start = bad.dhcp.pool_start;
+        bad.dhcp.pool_start = bad.dhcp.pool_end;
+        bad.dhcp.pool_end = start;
+        std::string error;
+        CHECK(!bad.SaveToFile(fresh, error));
+        CHECK(!error.empty());
+        {
+            std::ifstream created(fresh);
+            CHECK(!created.good());  // nothing published at all
+        }
+
+        Config good = MakeFullConfig();
+        CHECK(good.SaveToFile(keep, error));
+        const auto read_back = [](const std::string& p) {
+            std::ifstream in(p, std::ios::binary);
+            return std::string(std::istreambuf_iterator<char>(in),
+                               std::istreambuf_iterator<char>());
+        };
+        const std::string before = read_back(keep);
+        error.clear();
+        CHECK(!bad.SaveToFile(keep, error));
+        CHECK(read_back(keep) == before);  // previous document untouched
+        std::remove(fresh.c_str());
+        std::remove(keep.c_str());
+    }
+
+    /// batch116: the settings-save merge must never silently DROP a disk-only
+    /// binding. When the snapshot already sits at the cap, the old code broke
+    /// out of the merge loop and published the snapshot anyway - the API-added
+    /// binding (delete + add churn at the cap) vanished from disk. Refuse the
+    /// save instead; the operator sees a failure, not a quiet loss.
+    void TestB116SettingsSaveRefusesToDropDiskBindings() {
+        const std::string path = "test_cfg_b116_cap.json";
+        std::remove(path.c_str());
+        using vgww::core::limits::kMaxStaticBindings;
+        using vgww::core::ParseIpv4;
+        using vgww::core::ParseMac;
+        using vgww::core::StaticBinding;
+        const auto read_back = [](const std::string& p) {
+            std::ifstream in(p, std::ios::binary);
+            return std::string(std::istreambuf_iterator<char>(in),
+                               std::istreambuf_iterator<char>());
+        };
+        bool ok = false;
+        Config snapshot = MakeFullConfig();
+        snapshot.gateway.mask = ParseIpv4("255.255.0.0", ok);
+        CHECK(ok);
+        snapshot.dhcp.pool_start = ParseIpv4("192.168.10.1", ok);
+        CHECK(ok);
+        snapshot.dhcp.pool_end = ParseIpv4("192.168.14.254", ok);
+        CHECK(ok);
+        snapshot.dhcp.static_bindings.clear();
+        snapshot.ipv6.dhcpv6.static_bindings.clear();
+        char mac_text[32];
+        for (size_t i = 0; i < kMaxStaticBindings; ++i) {
+            StaticBinding b;
+            const unsigned hi = static_cast<unsigned>(i >> 8);
+            const unsigned lo = static_cast<unsigned>(i & 0xFF);
+            std::snprintf(mac_text, sizeof(mac_text), "02:%02x:%02x:00:00:01",
+                          hi, lo);
+            CHECK(ParseMac(mac_text, b.mac));
+            const unsigned last =
+                1u + static_cast<unsigned>(i % 254u);
+            const unsigned third = 10u + static_cast<unsigned>(i / 254u);
+            b.ip = ParseIpv4("192.168." + std::to_string(third) + "." +
+                                 std::to_string(last),
+                             ok);
+            CHECK(ok);
+            b.hostname = "h" + std::to_string(i);
+            snapshot.dhcp.static_bindings.push_back(b);
+        }
+        std::string error;
+        CHECK(snapshot.SaveToFile(path, error));
+
+        // Cap churn: the binding route deletes one entry and adds another, so
+        // the disk list differs from the snapshot while staying at the cap.
+        CHECK(Config::UpdateFile(
+            path,
+            [&](Config& c) {
+                c.dhcp.static_bindings.erase(c.dhcp.static_bindings.begin());
+                StaticBinding extra;
+                ParseMac("02:00:00:00:ff:ff", extra.mac);
+                extra.ip = ParseIpv4("192.168.15.9", ok);
+                extra.hostname = "churned-in";
+                c.dhcp.static_bindings.push_back(std::move(extra));
+            },
+            error));
+        const std::string after_churn = read_back(path);
+        CHECK(after_churn.find("churned-in") != std::string::npos);
+
+        error.clear();
+        CHECK(!snapshot.SaveToFilePreservingBindings(path, error));
+        CHECK(!error.empty());
+        CHECK(read_back(path) == after_churn);  // destination untouched
+
+        std::string load_error;
+        const auto disk = Config::LoadFromFile(path, load_error);
+        CHECK(disk.has_value());
+        if (disk) {
+            bool churned = false;
+            for (const auto& b : disk->dhcp.static_bindings) {
+                if (b.hostname == "churned-in") {
+                    churned = true;
+                }
+            }
+            CHECK(churned);  // still on disk, not silently dropped
+        }
+        std::remove(path.c_str());
+    }
+
 void TestValidateConfigPublic() {
     std::string error;
     const vgww::core::Config good = MakeFullConfig();
@@ -2389,6 +3083,11 @@ int main() {
     TestThemePersistence();
     TestB20WebEnabledDefault();
     TestMacRoundTrip();
+    TestDetachedBodyGuardPublishesFailure();
+    TestFileFlushFailureIsNotSaved();
+    TestLoadFailureDoesNotTouchTheFile();
+    TestConfigOpenRetryOnTransientLock();
+    TestConfigOpenFailureIsClassified();
     TestIpv4Helpers();
     TestLoadValidConfig();
     TestValidation();
@@ -2420,6 +3119,15 @@ int main() {
     TestConfigJsonRoundTrip();
     TestToJsonStringRejectsNonWholeHourLease();
     TestConfigSaveAtomic();
+    TestB94ConfigUpdateSerialized();
+    TestB95ConfigFileLockExcludesOtherOwners();
+    TestB96SettingsSavePreservesNewerBindings();
+    TestB97SharedBindingPersistence();
+    TestB107LockTimeoutRefusesTheWrite();
+    TestB108SetAsideRespectsCrossProcessLock();
+    TestB109UpdateFileRejectsUnloadableDocument();
+    TestB110SaveToFileRejectsUnloadableDocument();
+    TestB116SettingsSaveRefusesToDropDiskBindings();
     TestValidateConfigPublic();
     TestB105ProgrammaticConfigObeysLoaderRules();
     TestB106CliOverrideMustValidate();

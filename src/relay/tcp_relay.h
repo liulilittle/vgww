@@ -28,13 +28,17 @@
 // ============================================================================
 #pragma once
 
+#include "core/handler_guard.h"
+
 #include <xtcp/mimt/mimt.h>
 
 #include <asio.hpp>
 
 #include <array>
+#include <atomic>
 #include <cstdint>
 #include <memory>
+#include <utility>
 
 namespace vgww {
     namespace relay {
@@ -72,7 +76,32 @@ namespace vgww {
             /// uses this to sweep its registry.
             bool Finished() const noexcept { return finished_; }
 
+            /// Completion bodies that threw and were swallowed instead of
+            /// unwinding the worker thread (telemetry/tests). A throw escaping
+            /// here would unwind through MimtFlow::Dispatch() (noexcept) or
+            /// the worker's io_context::poll(), i.e. kill the worker or the
+            /// whole process instead of costing one connection.
+            uint64_t HandlerErrors() const noexcept {
+                return handler_errors_.load(std::memory_order_relaxed);
+            }
+
         private:
+            /// Runs one completion body under the exception firewall. A body
+            /// that throws leaves the pump half-armed (the chunk read/written
+            /// but not reissued), so the failure tears down THIS relay instead
+            /// of stranding it - the same rule the other asio users follow.
+            /// Returns false when the body threw.
+            template <typename Fn>
+            bool RunCompletion(Fn&& fn) noexcept {
+                if (core::InvokeHandlerGuarded(handler_errors_,
+                                               std::forward<Fn>(fn))) {
+                    return true;
+                }
+                core::InvokeHandlerGuarded(handler_errors_,
+                                           [this] { Finish(false); });
+                return false;
+            }
+
             void PumpFlowToSocket();
             void PumpSocketToFlow();
             void WriteToFlow(UInt32 len);
@@ -101,6 +130,7 @@ namespace vgww {
             /// a new arrival cannot overwrite the held bytes.
             bool retry_pending_ = false;
             bool finished_ = false;
+            std::atomic<uint64_t> handler_errors_{0};
         };
 
     }  // namespace relay

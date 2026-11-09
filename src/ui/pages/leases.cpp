@@ -245,6 +245,12 @@ namespace vgww {
                 SegmentedControl* tabs_ = nullptr;
                 View views_[kTabCount] = {};
                 Text* hint_ = nullptr;
+                /// batch119: persisted-lease entries dropped at load.
+                Text* dropped_hint_ = nullptr;
+                /// batch120: the lease document itself was corrupt.
+                Text* corrupt_hint_ = nullptr;
+                /// batch121: DHCP frames refused by strict parsing.
+                Text* parse_hint_ = nullptr;
                 std::vector<vgww::runtime::Dataplane::BindingView> bindings4_;
                 std::vector<vgww::runtime::Dataplane::Binding6View> bindings6_;
                 /// M10-1: last-built row keys (the bindings vectors above are
@@ -382,6 +388,27 @@ namespace vgww {
                     ColorToken::TextDim, true)));
                 hint_->id = "leases.runtime_hint";
 
+                auto dropped = std::make_unique<Text>(
+                    I18n::Instance().T(Str::LeasesDropped), FontToken::Small,
+                    ColorToken::Warning, true);
+                dropped->id = "leases.dropped_hint";
+                dropped->visible = false;
+                dropped_hint_ = static_cast<Text*>(host.Add(std::move(dropped)));
+
+                auto corrupt = std::make_unique<Text>(
+                    I18n::Instance().T(Str::LeasesCorrupt), FontToken::Small,
+                    ColorToken::Warning, true);
+                corrupt->id = "leases.corrupt_hint";
+                corrupt->visible = false;
+                corrupt_hint_ = static_cast<Text*>(host.Add(std::move(corrupt)));
+
+                auto parse = std::make_unique<Text>(
+                    I18n::Instance().T(Str::LeasesParseRejected),
+                    FontToken::Small, ColorToken::Warning, true);
+                parse->id = "leases.parse_hint";
+                parse->visible = false;
+                parse_hint_ = static_cast<Text*>(host.Add(std::move(parse)));
+
                 SetTab(LeaseTab::V4, false);
             }
 
@@ -425,11 +452,26 @@ namespace vgww {
                 // stop getting addresses (or whose mappings silently stop
                 // surviving a restart) can see WHY.
                 if (hint_ != nullptr) {
-                    if (snapshot.dhcp_pool_exhausted > 0) {
+                    // batch104: the hint describes the ACTIVE family. v6
+                    // failures used to be invisible here because only the v4
+                    // counters were read.
+                    const bool v6_view =
+                        (LeaseTab::V6 == tab_ || LeaseTab::Bind6 == tab_);
+                    const uint64_t pool_hits =
+                        v6_view ? snapshot.dhcp6_pool_exhausted
+                                : snapshot.dhcp_pool_exhausted;
+                    const uint64_t persist_hits =
+                        v6_view
+                            ? (snapshot.lease_persist_failed ? 1u : 0u)
+                            : (snapshot.dhcp_persist_failures > 0 ||
+                                       snapshot.lease_persist_failed
+                                   ? 1u
+                                   : 0u);
+                    if (pool_hits > 0) {
                         hint_->SetText(
                             I18n::Instance().T(Str::LeasesPoolExhausted));
                         hint_->SetColor(ColorToken::Warning);
-                    } else if (snapshot.dhcp_persist_failures > 0) {
+                    } else if (persist_hits > 0) {
                         hint_->SetText(
                             I18n::Instance().T(Str::LeasesPersistFailed));
                         hint_->SetColor(ColorToken::Warning);
@@ -437,6 +479,52 @@ namespace vgww {
                         hint_->SetText(
                             I18n::Instance().T(Str::LeasesRuntimeHint));
                         hint_->SetColor(ColorToken::TextDim);
+                    }
+                }
+                // batch119: dropped lease entries are a separate, always-warn
+                // condition (they never applied), shown on the active family.
+                if (dropped_hint_ != nullptr) {
+                    const bool v6_view =
+                        (LeaseTab::V6 == tab_ || LeaseTab::Bind6 == tab_);
+                    const bool dropped = v6_view
+                        ? snapshot.dhcp6_leases_dropped > 0
+                        : snapshot.dhcp_leases_dropped > 0;
+                    if (dropped_hint_->visible != dropped) {
+                        dropped_hint_->visible = dropped;
+                        RelayoutHost(*host_);
+                    }
+                    if (dropped) {
+                        dropped_hint_->SetText(
+                            i18n.T(Str::LeasesDropped));
+                    }
+                }
+                if (corrupt_hint_ != nullptr) {
+                    const bool v6_view =
+                        (LeaseTab::V6 == tab_ || LeaseTab::Bind6 == tab_);
+                    const bool corrupt = v6_view
+                        ? snapshot.dhcp6_leases_corrupt
+                        : snapshot.dhcp_leases_corrupt;
+                    if (corrupt_hint_->visible != corrupt) {
+                        corrupt_hint_->visible = corrupt;
+                        RelayoutHost(*host_);
+                    }
+                    if (corrupt) {
+                        corrupt_hint_->SetText(i18n.T(Str::LeasesCorrupt));
+                    }
+                }
+                if (parse_hint_ != nullptr) {
+                    const bool v6_view =
+                        (LeaseTab::V6 == tab_ || LeaseTab::Bind6 == tab_);
+                    const bool rejected = v6_view
+                        ? snapshot.dhcp6_parse_rejected > 0
+                        : snapshot.dhcp_parse_rejected > 0;
+                    if (parse_hint_->visible != rejected) {
+                        parse_hint_->visible = rejected;
+                        RelayoutHost(*host_);
+                    }
+                    if (rejected) {
+                        parse_hint_->SetText(
+                            i18n.T(Str::LeasesParseRejected));
                     }
                 }
                 if (pending_error_ != Str::_Count) {

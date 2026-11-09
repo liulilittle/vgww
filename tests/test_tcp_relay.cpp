@@ -34,6 +34,7 @@
 #include <cstdio>
 #include <cstring>
 #include <memory>
+#include <stdexcept>
 #include <thread>
 #include <string>
 #include <vector>
@@ -60,6 +61,9 @@ namespace {
         std::shared_ptr<TcpRelay> relay;
         FinishRecord record;
         bool ready = false;
+        /// Injects a throw into the teardown hook, i.e. into the completion
+        /// body that invoked it (flow Dispatch or asio completion).
+        bool throw_on_finish = false;
 
         Fixture() { ready = Build(); }
 
@@ -95,6 +99,9 @@ namespace {
                 ++record.calls;
                 record.graceful = graceful;
                 record.conn_id = conn_id;
+                if (throw_on_finish) {
+                    throw std::runtime_error("hook failure");
+                }
             };
             relay = std::make_shared<TcpRelay>(flow, std::move(peer), std::move(hooks));
             relay->Start();
@@ -516,6 +523,47 @@ namespace vgww {
         return 0;
     }
 
+    /// A throwing teardown hook fired from a FLOW completion must not escape:
+    /// MimtFlow::Dispatch() is noexcept (mimt.h:154), so the throw would be
+    /// std::terminate, not a catchable unwind. The guard swallows and counts
+    /// it, and the relay still tears down exactly once.
+    int TestFlowCompletionThrowIsContained() {
+        Fixture f;
+        CHECK(f.ready);
+        f.throw_on_finish = true;
+        f.StartRelay();
+
+        f.flow->Close();
+        f.Pump();
+
+        CHECK(1 == f.record.calls);
+        CHECK(!f.record.graceful);
+        CHECK(f.relay->Finished());
+        CHECK(1 == f.relay->HandlerErrors());
+        return 0;
+    }
+
+    /// Same firewall on the ASIO side: an upstream EOF completion whose body
+    /// throws must not unwind io_context::poll() (undefined behaviour that
+    /// crashes the worker). Swallowed, counted, and torn down once.
+    int TestSocketCompletionThrowIsContained() {
+        Fixture f;
+        CHECK(f.ready);
+        f.throw_on_finish = true;
+        f.StartRelay();
+
+        std::error_code err;
+        f.server.close(err);
+        CHECK(!err);
+        f.Pump();
+
+        CHECK(1 == f.record.calls);
+        CHECK(f.record.graceful);   // EOF still decides FIN, not RST
+        CHECK(f.relay->Finished());
+        CHECK(1 == f.relay->HandlerErrors());
+        return 0;
+    }
+
 }  // namespace vgww
 
 int main() {
@@ -533,6 +581,8 @@ int main() {
     if (vgww::TestFinishClosesUpstreamSocket()) return 1;
     if (vgww::TestSyncReadRefusalTearsDown()) return 1;
     if (vgww::TestSyncWriteRefusalTearsDown()) return 1;
+    if (vgww::TestFlowCompletionThrowIsContained()) return 1;
+    if (vgww::TestSocketCompletionThrowIsContained()) return 1;
     std::puts("test_tcp_relay: ALL PASS");
     return 0;
 }

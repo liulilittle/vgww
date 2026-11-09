@@ -9,6 +9,7 @@
 #include "dsp/classifier.h"
 #include "dsp/spsc_ring.h"
 #include "driver/ndisrd_client.h"
+#include "core/handler_guard.h"
 #include "net/eth.h"
 #include "ndisapi/Common.h"
 #include "proto/arp.h"
@@ -31,6 +32,7 @@
 #include <chrono>
 #include <cstdio>
 #include <cstring>
+#include <functional>
 #include <mutex>
 #include <thread>
 #include <unordered_map>
@@ -661,6 +663,17 @@ namespace vgww {
             /// the same double (production clients are re-opened).
             bool client_injected_ = false;
 
+            /// Test seam (SetDialCompletionProbeForTest): runs at the top of
+            /// every upstream dial completion body, inside its guard.
+            std::function<void()> dial_completion_probe_;
+
+            /// batch99: periodic lease snapshot cadence (both families).
+            std::atomic<int64_t> lease_dump_interval_ms_{60000};
+
+            /// batch100: the last Stop() finished teardown but could not write
+            /// a lease document, so the mappings it held are gone for good.
+            bool stop_persist_failed_ = false;
+
             /// H2: sticky flag - a stop timed out and a thread may still run
             /// inside driver/stack code. Start() must refuse afterwards
             /// because the state was intentionally left untouched.
@@ -1003,7 +1016,13 @@ namespace vgww {
                             : (outcome ==
                                        dhcp::DhcpServer::LoadOutcome::kNoFile
                                    ? "no lease file"
-                                   : "LEASE FILE UNREADABLE - mappings lost");
+                                   : (outcome == dhcp::DhcpServer::LoadOutcome::
+                                                      kUnreadable
+                                          ? "LEASE FILE NOT READABLE (a "
+                                            "scanner may hold it) - "
+                                            "persistence paused, file kept"
+                                          : "LEASE FILE UNREADABLE - mappings "
+                                            "lost"));
                     std::fprintf(stderr,
                                  "[vgww] dhcp: v4 server assembled (%s)\n",
                                  status);
@@ -1035,7 +1054,13 @@ namespace vgww {
                             : (outcome6 ==
                                        dhcp6::Dhcp6Server::LoadOutcome::kNoFile
                                    ? "no lease file"
-                                   : "LEASE FILE UNREADABLE - mappings lost");
+                                   : (outcome6 == dhcp6::Dhcp6Server::
+                                                      LoadOutcome::kUnreadable
+                                          ? "LEASE FILE NOT READABLE (a "
+                                            "scanner may hold it) - "
+                                            "persistence paused, file kept"
+                                          : "LEASE FILE UNREADABLE - mappings "
+                                            "lost"));
                     std::fprintf(stderr,
                                  "[vgww] dhcp6: v6 server assembled (%s)\n",
                                  status6);
@@ -1282,9 +1307,14 @@ namespace vgww {
                 // Persist the DHCPv4 leases before any object is torn down: a
                 // restart then keeps address mappings stable. Reached only on
                 // a clean stop, so no live thread can touch the server.
+                bool lease_persist_failed = false;
+                std::string lease_persist_error;
                 if (dhcp_) {
                     if (!dhcp_->DumpLeases(lease_file,
                                            std::chrono::steady_clock::now())) {
+                        lease_persist_failed = true;
+                        lease_persist_error +=
+                            "dhcp: lease dump failed on stop: " + lease_file;
                         std::fprintf(stderr,
                                      "[vgww] dhcp: lease dump failed on stop: "
                                      "%s\n",
@@ -1298,6 +1328,13 @@ namespace vgww {
                 if (dhcp6_) {
                     if (!dhcp6_->DumpLeases(LeaseFile6(),
                                             std::chrono::steady_clock::now())) {
+                        if (lease_persist_failed) {
+                            lease_persist_error += "; ";
+                        }
+                        lease_persist_failed = true;
+                        lease_persist_error +=
+                            "dhcp6: lease dump failed on stop: " +
+                            LeaseFile6();
                         std::fprintf(stderr,
                                      "[vgww] dhcp6: lease dump failed on stop: "
                                      "%s\n",
@@ -1305,6 +1342,12 @@ namespace vgww {
                     }
                     dhcp6_.reset();
                 }
+                // batch100: the teardown itself succeeded, so Stop() still
+                // returns true - but a dirty lease document must not look
+                // like a clean shutdown. The sticky flag survives the server
+                // teardown; the text is attached after the success path's
+                // final error.clear() below.
+                stop_persist_failed_ = lease_persist_failed;
 
                 if (nullptr != adapter && nullptr != client) {
                     std::string ignored;
@@ -1387,6 +1430,13 @@ namespace vgww {
                 adapter = nullptr;
                 ClearAdapterBinding();
                 error.clear();
+                // batch100: a clean teardown with a failed lease snapshot is
+                // reported through the error text (Stop still returns true:
+                // the plane did stop). StopPersistFailed() keeps the verdict
+                // readable after the servers are gone.
+                if (lease_persist_failed) {
+                    error = lease_persist_error;
+                }
                 // batch31 P1-4: release the 1 ms timer resolution exactly once,
                 // after every thread that relied on it is joined.
                 if (timer_period_active_) {
@@ -3300,36 +3350,66 @@ namespace vgww {
                         destination,
                         [this, index, flow, timer, socket, destination](
                             const std::error_code& err) mutable {
-                            timer->cancel();
-                            if (err) {
-                                QueueTeardown(index, flow->ConnId(),
-                                              false);  // RST client
-                                return;
+                            // One dial that cannot be attached (a throw here
+                            // used to take down the WHOLE data plane, not
+                            // just this connection) costs only that
+                            // connection: the body is firewalled and a
+                            // failure falls through to the RST below.
+                            const bool body_ok = core::InvokeHandlerGuarded(
+                                stats->handler_errors, [&] {
+                                    if (dial_completion_probe_) {
+                                        dial_completion_probe_();
+                                    }
+                                    timer->cancel();
+                                    if (err) {
+                                        QueueTeardown(index, flow->ConnId(),
+                                                      false);  // RST client
+                                        return;
+                                    }
+                                    relay::TcpRelay::Hooks hooks;
+                                    hooks.on_finished =
+                                        [this, index](UInt64 conn_id,
+                                                      bool graceful) {
+                                            // batch306: mark the registry for
+                                            // one reclaim scan; an idle worker
+                                            // must not walk it (see
+                                            // SweepRegistry).
+                                            registry_dirty[index]->store(
+                                                true,
+                                                std::memory_order_relaxed);
+                                            // Upstream EOF -> CLOSE (FIN to
+                                            // client); errors/resets -> ABORT
+                                            // (RST).
+                                            QueueTeardown(index, conn_id,
+                                                          graceful);
+                                        };
+                                    auto relay =
+                                        std::make_shared<relay::TcpRelay>(
+                                            flow, std::move(*socket),
+                                            std::move(hooks));
+                                    {
+                                        std::lock_guard<std::mutex> lock(
+                                            registry_mutexes[index]);
+                                        relay_registry_[index].push_back(relay);
+                                        // Overwrite any stale entry for this
+                                        // id: a finished relay is only dropped
+                                        // by the next sweep, and the LIVE one
+                                        // must win the FIN.
+                                        relay_index_[index][relay->ConnId()] =
+                                            relay;
+                                    }
+                                    // pumps keep it alive afterwards
+                                    relay->Start();
+                                });
+                            if (!body_ok) {
+                                // No relay owns this flow: RST the client
+                                // instead of leaving it half-open forever.
+                                core::InvokeHandlerGuarded(
+                                    stats->handler_errors, [&] {
+                                        QueueTeardown(index, flow->ConnId(),
+                                                      false);
+                                    });
                             }
-                            relay::TcpRelay::Hooks hooks;
-                            hooks.on_finished =
-                                [this, index](UInt64 conn_id, bool graceful) {
-                                    // batch306: mark the registry for one
-                                    // reclaim scan; an idle worker must not
-                                    // walk it (see SweepRegistry).
-                                    registry_dirty[index]->store(
-                                        true, std::memory_order_relaxed);
-                                    // Upstream EOF -> CLOSE (FIN to client);
-                                    // errors/resets -> ABORT (RST).
-                                    QueueTeardown(index, conn_id, graceful);
-                                };
-                            auto relay = std::make_shared<relay::TcpRelay>(
-                                flow, std::move(*socket), std::move(hooks));
-                            {
-                                std::lock_guard<std::mutex> lock(
-                                    registry_mutexes[index]);
-                                relay_registry_[index].push_back(relay);
-                                // Overwrite any stale entry for this id: a
-                                // finished relay is only dropped by the next
-                                // sweep, and the LIVE one must win the FIN.
-                                relay_index_[index][relay->ConnId()] = relay;
-                            }
-                            relay->Start();  // pumps keep it alive afterwards
                         });
                 }
                 SweepRegistry(index);
@@ -3546,10 +3626,17 @@ namespace vgww {
                         periodic_ra_due.store(true);
                         last_ra = now;
                     }
-                    if (now - last_dump > std::chrono::seconds(60)) {
-                        // DHCPv6 leases ride the spec section 5.2 cadence: a
-                        // 60 s snapshot keeps a crash from losing a whole
-                        // window; the exit dump below covers a clean stop.
+                    const auto dump_interval = std::chrono::milliseconds(
+                        lease_dump_interval_ms_.load(
+                            std::memory_order_relaxed));
+                    if (now - last_dump >= dump_interval) {
+                        // batch99: BOTH lease tables ride the cadence. v4 used
+                        // to be dumped only on a clean Stop, so a crash or a
+                        // hard kill lost every v4 lease while v6 kept a 60 s
+                        // snapshot. DumpLeases counts its own write failures.
+                        if (dhcp_) {
+                            dhcp_->DumpLeases(lease_file, now);
+                        }
                         if (dhcp6_) {
                             dhcp6_->DumpLeases(LeaseFile6(), now);
                         }
@@ -3706,6 +3793,22 @@ namespace vgww {
             impl_->bridge_cfg_ = config;
         }
 
+        void Dataplane::SetDialCompletionProbeForTest(
+            std::function<void()> probe) {
+            if (impl_) {
+                impl_->dial_completion_probe_ = std::move(probe);
+            }
+        }
+
+        void Dataplane::SetLeaseDumpIntervalForTest(
+            std::chrono::milliseconds interval) {
+            if (impl_) {
+                const int64_t ms = interval.count() > 0 ? interval.count() : 1;
+                impl_->lease_dump_interval_ms_.store(ms,
+                                                     std::memory_order_relaxed);
+            }
+        }
+
         bridge::BridgeState Dataplane::GetBridgeState() const noexcept {
             if (!impl_) {
                 return bridge::BridgeState::kStopped;
@@ -3796,6 +3899,10 @@ namespace vgww {
 
         bool Dataplane::Start(std::string& error) {
             const bool ok = impl_->StartAll(error);
+            // batch101: the last stop's verdict is NOT cleared here. A live
+            // config apply is Stop->Start, and the operator must still be able
+            // to see that the previous stop lost its lease document. Only the
+            // next clean stop lowers the flag.
             impl_->SetLastError(ok ? std::string() : error);
             return ok;
         }
@@ -4075,6 +4182,12 @@ namespace vgww {
             out.accept_errors =
                 s.accept_errors.load(std::memory_order_relaxed);
             out.bind_failed = s.bind_failed.load(std::memory_order_relaxed);
+            out.handler_errors =
+                s.handler_errors.load(std::memory_order_relaxed);
+            out.loop_errors = s.loop_errors.load(std::memory_order_relaxed);
+            out.rearm_errors = s.rearm_errors.load(std::memory_order_relaxed);
+            out.escaped_handler_errors =
+                s.escaped_handler_errors.load(std::memory_order_relaxed);
             out.failed_ports = mgr.FailedPorts();
             return out;
         }
@@ -4084,6 +4197,26 @@ namespace vgww {
                 return 0;
             }
             return impl_->dhcp_->PoolExhaustedCount();
+        }
+
+        uint64_t Dataplane::DhcpDroppedLeaseCount() const noexcept {
+            if (!impl_ || !impl_->dhcp_) {
+                return 0;
+            }
+            return impl_->dhcp_->DroppedLeaseCount();
+        }
+
+        bool Dataplane::DhcpLeaseFileCorrupt() const noexcept {
+            return impl_ && impl_->dhcp_ &&
+                   impl_->dhcp_->LeaseFileCorrupt();
+        }
+
+        uint64_t Dataplane::DhcpParseRejectedCount() const noexcept {
+            return proto::ParseRejectedCount();
+        }
+
+        uint64_t Dataplane::Dhcp6ParseRejectedCount() const noexcept {
+            return proto::ParseRejected6Count();
         }
 
         uint64_t Dataplane::DhcpRateLimitResets() const noexcept {
@@ -4140,6 +4273,13 @@ namespace vgww {
                 return 0;
             }
             return impl_->dhcp_->PersistFailureCount();
+        }
+
+        bool Dataplane::DhcpPersistBlocked() const noexcept {
+            if (!impl_ || !impl_->dhcp_) {
+                return false;
+            }
+            return impl_->dhcp_->PersistBlocked();
         }
 
         // ------------------------------------------------------------------
@@ -4305,6 +4445,43 @@ namespace vgww {
                 return 0;
             }
             return impl_->dhcp6_->LeaseCount();
+        }
+
+        bool Dataplane::Dhcp6PersistBlocked() const noexcept {
+            if (!impl_ || !impl_->dhcp6_) {
+                return false;
+            }
+            return impl_->dhcp6_->PersistBlocked();
+        }
+
+        uint64_t Dataplane::Dhcp6PersistFailureCount() const noexcept {
+            if (!impl_ || !impl_->dhcp6_) {
+                return 0;
+            }
+            return impl_->dhcp6_->PersistFailureCount();
+        }
+
+        uint64_t Dataplane::Dhcp6PoolExhaustedCount() const noexcept {
+            if (!impl_ || !impl_->dhcp6_) {
+                return 0;
+            }
+            return impl_->dhcp6_->PoolExhaustedCount();
+        }
+
+        uint64_t Dataplane::Dhcp6DroppedLeaseCount() const noexcept {
+            if (!impl_ || !impl_->dhcp6_) {
+                return 0;
+            }
+            return impl_->dhcp6_->DroppedLeaseCount();
+        }
+
+        bool Dataplane::Dhcp6LeaseFileCorrupt() const noexcept {
+            return impl_ && impl_->dhcp6_ &&
+                   impl_->dhcp6_->LeaseFileCorrupt();
+        }
+
+        bool Dataplane::StopPersistFailed() const noexcept {
+            return impl_ && impl_->stop_persist_failed_;
         }
 
         size_t Dataplane::Dhcp6BindingCount() const noexcept {

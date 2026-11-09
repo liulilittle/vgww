@@ -884,6 +884,135 @@ namespace {
         std::remove(lease_path.c_str());
     }
 
+    /// batch99: the crash window. v6 already snapshotted every 60 s while v4
+    /// waited for a clean Stop, so an abrupt exit lost every v4 lease. With
+    /// the cadence seam shortened, the document must appear WHILE the plane
+    /// still runs (no Stop before the assertion).
+    void TestB99V4LeasesDumpedPeriodically() {
+        const vgww::core::Config config = MakeDhcpMainConfig();
+        const std::string lease_path = "periodic-leases.json";
+        std::remove(lease_path.c_str());
+
+        vgww::runtime::Dataplane dataplane(config, lease_path);
+        auto fake = std::make_unique<FakeDriverClient>();
+        FakeDriverClient* raw = fake.get();
+        dataplane.SetDriverClient(std::move(fake));
+        dataplane.SetLeaseDumpIntervalForTest(std::chrono::milliseconds(50));
+        std::string error;
+        CHECK(dataplane.Start(error));
+        CHECK(dataplane.DhcpActive());
+
+        raw->InjectFrame(MakeDhcpDiscover({0x02, 0x00, 0x00, 0x00, 0x00, 0x43},
+                                          0xAB990001u));
+        const auto deadline =
+            std::chrono::steady_clock::now() + std::chrono::seconds(5);
+        bool dumped = false;
+        while (std::chrono::steady_clock::now() < deadline && !dumped) {
+            std::ifstream in(lease_path, std::ios::binary);
+            if (in.good()) {
+                std::stringstream ss;
+                ss << in.rdbuf();
+                dumped = ss.str().find("02:00:00:00:00:43") !=
+                         std::string::npos;
+            }
+            if (!dumped) {
+                std::this_thread::sleep_for(std::chrono::milliseconds(50));
+            }
+        }
+        CHECK(dumped);  // written periodically, not only on Stop
+
+        std::string stop_error;
+        CHECK(dataplane.Stop(stop_error));
+        std::remove(lease_path.c_str());
+    }
+
+    /// batch101: a live config apply stops and restarts the plane. The stop's
+    /// dirty lease write must stay visible AFTER the restart (P50 cleared the
+    /// verdict on Start), and only a later clean stop may clear it.
+    void TestB102StopDirtyVerdictSurvivesRestart() {
+        const vgww::core::Config config = MakeDhcpMainConfig();
+        const std::string lease_path = "b102-stop-dirty.json";
+        std::remove(lease_path.c_str());
+        vgww::runtime::Dataplane dataplane(config, lease_path);
+        dataplane.SetDriverClient(std::make_unique<FakeDriverClient>());
+        std::string error;
+        CHECK(dataplane.Start(error));
+        CHECK(dataplane.DhcpActive());
+        {
+            std::ofstream out(lease_path);
+            out << "{\"version\":1,\"leases\":[]}";
+        }
+        const HANDLE held = ::CreateFileA(
+            lease_path.c_str(), GENERIC_READ,
+            FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr, OPEN_EXISTING,
+            FILE_ATTRIBUTE_NORMAL, nullptr);
+        CHECK(INVALID_HANDLE_VALUE != held);
+        std::string stop_error;
+        CHECK(dataplane.Stop(stop_error));
+        CHECK(dataplane.StopPersistFailed());
+        ::CloseHandle(held);
+
+        // The apply path stops then starts: the verdict must survive so the
+        // dashboard can show that the leases were lost on the way.
+        error.clear();
+        CHECK(dataplane.Start(error));
+        CHECK(dataplane.StopPersistFailed());  // still dirty after restart
+
+        // Only a clean stop clears it.
+        std::string clean_error;
+        CHECK(dataplane.Stop(clean_error));
+        CHECK(clean_error.empty());
+        CHECK(!dataplane.StopPersistFailed());
+        std::remove(lease_path.c_str());
+    }
+
+    /// batch100: teardown succeeded but the lease document could not be
+    /// written -> Stop() still returns true (the plane stopped), yet the loss
+    /// must be observable: non-empty error text plus a sticky flag that
+    /// survives the server teardown.
+    void TestB100StopReportsLeaseDumpFailure() {
+        const vgww::core::Config config = MakeDhcpMainConfig();
+        const std::string lease_path = "b100-stop-dump.json";
+        std::remove(lease_path.c_str());
+        {
+            vgww::runtime::Dataplane dataplane(config, lease_path);
+            dataplane.SetDriverClient(std::make_unique<FakeDriverClient>());
+            std::string error;
+            CHECK(dataplane.Start(error));
+            CHECK(dataplane.DhcpActive());
+            {
+                std::ofstream out(lease_path);
+                out << "{\"version\":1,\"leases\":[]}";
+            }
+            // No FILE_SHARE_DELETE: the atomic replace must fail at Stop.
+            const HANDLE held = ::CreateFileA(
+                lease_path.c_str(), GENERIC_READ,
+                FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr, OPEN_EXISTING,
+                FILE_ATTRIBUTE_NORMAL, nullptr);
+            CHECK(INVALID_HANDLE_VALUE != held);
+            std::string stop_error;
+            CHECK(dataplane.Stop(stop_error));  // teardown itself is fine
+            CHECK(!stop_error.empty());         // durability is not
+            CHECK(stop_error.find("lease dump failed on stop") !=
+                  std::string::npos);
+            CHECK(dataplane.StopPersistFailed());
+            ::CloseHandle(held);
+        }
+        // A clean run starts with no verdict and clears it by writing.
+        {
+            vgww::runtime::Dataplane dataplane(config, lease_path);
+            dataplane.SetDriverClient(std::make_unique<FakeDriverClient>());
+            std::string error;
+            CHECK(dataplane.Start(error));
+            CHECK(!dataplane.StopPersistFailed());
+            std::string stop_error;
+            CHECK(dataplane.Stop(stop_error));
+            CHECK(stop_error.empty());
+            CHECK(!dataplane.StopPersistFailed());
+        }
+        std::remove(lease_path.c_str());
+    }
+
     /// Stop() persists the lease table; a restart re-assembles the server.
     void TestLeasesDumpedOnStop() {
         const vgww::core::Config config = MakeDhcpMainConfig();
@@ -1134,6 +1263,9 @@ int main() {
     TestBypassDisablesDhcp();
     TestDhcpDiscoverGetsOffer();
     TestLeasesDumpedOnStop();
+    TestB99V4LeasesDumpedPeriodically();
+    TestB100StopReportsLeaseDumpFailure();
+    TestB102StopDirtyVerdictSurvivesRestart();
     TestDhcpDisabledAndCorruptLease();
     TestV6DisabledWhenIpv6Off();
     TestDhcp6SolicitViaDataplane();

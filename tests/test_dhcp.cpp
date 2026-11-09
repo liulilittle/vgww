@@ -6,6 +6,7 @@
 // ============================================================================
 #include "proto/dhcp.h"
 
+#include <atomic>
 #include <cstdio>
 #include <cstring>
 #include <filesystem>
@@ -566,6 +567,85 @@ void TestStaticBindingReservesPoolAddress() {
         CHECK(1 == dropped);  // the collided entry is counted, never silent
 
         std::remove(path.c_str());
+    }
+
+    // batch119: the dropped-entry counter must be reachable from the status
+    // surface; it used to be computed and discarded inside LoadLeases.
+    void TestB119DroppedLeaseCountExposed() {
+        vgww::core::Config config;
+        bool ok = false;
+        config.gateway.ipv4 = vgww::core::ParseIpv4("192.168.0.40", ok);
+        CHECK(ok);
+        config.gateway.mask = vgww::core::ParseIpv4("255.255.255.0", ok);
+        CHECK(ok);
+        config.dhcp.pool_start = vgww::core::ParseIpv4("192.168.0.100", ok);
+        CHECK(ok);
+        config.dhcp.pool_end = vgww::core::ParseIpv4("192.168.0.110", ok);
+        CHECK(ok);
+        config.dhcp.lease_seconds = 3600;
+
+        const std::string path = "test_dhcp_leases_b119.json";
+        {
+            std::ofstream out(path);
+            out << "{\"version\":1,\"leases\":["
+                   "{\"mac\":\"not-a-mac\",\"ip\":\"192.168.0.100\","
+                   "\"hostname\":\"bad\",\"expires_in_s\":3600},"
+                   "{\"mac\":\"AA:BB:CC:DD:EE:01\",\"ip\":\"192.168.0.101\","
+                   "\"hostname\":\"good\",\"expires_in_s\":3600}]}";
+        }
+        DhcpServer server(config);
+        size_t dropped = 0;
+        CHECK(server.LoadLeases(path, std::chrono::steady_clock::now(),
+                                &dropped) ==
+              DhcpServer::LoadOutcome::kRestored);
+        CHECK(1 == dropped);
+        CHECK(1 == server.DroppedLeaseCount());
+        CHECK(1 == server.LeaseCount());
+        std::remove(path.c_str());
+    }
+
+    // batch121: strict-parse refusals must be countable from the status
+    // surface; the counter used to exist only for tests.
+    void TestB121ParseRejectsAreCounted() {
+        DhcpView view{};
+        std::vector<uint8_t> garbage(32, 0);
+        const uint64_t before = ParseRejectedCount();
+        CHECK(!ParseDhcpFrame(garbage.data(), garbage.size(), view));
+        CHECK(before + 1 == ParseRejectedCount());
+    }
+
+    // batch120: a corrupt lease document is preserved aside, but the loss of
+    // every persisted mapping must also be visible (not just stderr).
+    void TestB120LeaseFileCorruptIsFlagged() {
+        vgww::core::Config config;
+        bool ok = false;
+        config.gateway.ipv4 = vgww::core::ParseIpv4("192.168.0.40", ok);
+        CHECK(ok);
+        config.gateway.mask = vgww::core::ParseIpv4("255.255.255.0", ok);
+        CHECK(ok);
+        config.dhcp.pool_start = vgww::core::ParseIpv4("192.168.0.100", ok);
+        CHECK(ok);
+        config.dhcp.pool_end = vgww::core::ParseIpv4("192.168.0.110", ok);
+        CHECK(ok);
+        config.dhcp.lease_seconds = 3600;
+
+        const std::string path = "test_dhcp_leases_b120.json";
+        {
+            std::ofstream out(path);
+            out << "this is not json";
+        }
+        DhcpServer server(config);
+        size_t dropped = 0;
+        CHECK(server.LoadLeases(path, std::chrono::steady_clock::now(),
+                                &dropped) ==
+              DhcpServer::LoadOutcome::kCorrupt);
+        CHECK(server.LeaseFileCorrupt());
+        {
+            std::ifstream aside(path + ".corrupt");
+            CHECK(aside.good());  // evidence preserved, loss flagged
+        }
+        std::remove(path.c_str());
+        std::remove((path + ".corrupt").c_str());
     }
 
     void TestLeaseLoadSkipsIllegal() {
@@ -1573,6 +1653,211 @@ void TestLeaseHostnameLearnt() {
         std::remove(path.c_str());
     }
 
+    // batch82: the v4 lease writer now rides the shared durable writer. A
+    // device-flush failure must be a failure: the previous snapshot stays
+    // intact and the failure is counted (it used to be a per-protocol copy).
+    void TestLeaseDumpFlushFailureKeepsPreviousSnapshot() {
+        vgww::core::Config config;
+        config.gateway.ipv4 = kGatewayIp;
+        config.dhcp.pool_start = kPoolStart;
+        config.dhcp.pool_end = kPoolEnd;
+        DhcpServer server(config);
+        const WireMac mac{0x91, 1, 1, 1, 1, 1};
+        const auto t0 = std::chrono::steady_clock::now();
+        CHECK(server.Acquire(mac, t0, DhcpServer::OfferStage::kAck) != 0);
+
+        const std::string path = "b-flush-dhcp-leases.json";
+        std::remove(path.c_str());
+        CHECK(server.DumpLeases(path, t0));
+        std::string original;
+        {
+            std::ifstream first(path, std::ios::binary);
+            original.assign(std::istreambuf_iterator<char>(first),
+                            std::istreambuf_iterator<char>());
+        }
+        CHECK(!original.empty());
+
+        vgww::core::SetFileFlushHookForTest(
+            [](std::intptr_t) { return false; });
+        const uint64_t before = server.PersistFailureCount();
+        const bool saved =
+            server.DumpLeases(path, t0 + std::chrono::seconds(5));
+        vgww::core::SetFileFlushHookForTest(nullptr);
+        CHECK(!saved);
+        CHECK(server.PersistFailureCount() == before + 1);
+        {
+            // The previous snapshot is still what the file holds.
+            std::ifstream again(path, std::ios::binary);
+            CHECK(std::string((std::istreambuf_iterator<char>(again)),
+                              std::istreambuf_iterator<char>()) == original);
+        }
+
+        // A recovered device writes again (the file must not be held open:
+        // Windows refuses to replace a destination with an open handle).
+        CHECK(server.DumpLeases(path, t0 + std::chrono::seconds(6)));
+        std::remove(path.c_str());
+    }
+
+    // batch82: a corrupt file must be preserved, not silently overwritten by
+    // the next dump - otherwise the evidence of the loss is gone forever.
+    void TestCorruptLeaseFilePreserved() {
+        vgww::core::Config config;
+        config.gateway.ipv4 = kGatewayIp;
+        config.dhcp.pool_start = kPoolStart;
+        config.dhcp.pool_end = kPoolEnd;
+        DhcpServer server(config);
+
+        const std::string path = "b-corrupt-dhcp-leases.json";
+        const std::string aside = path + ".corrupt";
+        std::remove(path.c_str());
+        std::remove(aside.c_str());
+        const std::string garbage = "{\"version\":1,\"leases\":[{\"mac\":";
+        {
+            std::ofstream out(path, std::ios::binary);
+            out << garbage;
+        }
+        CHECK(server.LoadLeases(path, std::chrono::steady_clock::now(),
+                                nullptr) ==
+              DhcpServer::LoadOutcome::kCorrupt);
+        std::ifstream kept(aside, std::ios::binary);
+        CHECK(kept.good());
+        CHECK(std::string((std::istreambuf_iterator<char>(kept)),
+                          std::istreambuf_iterator<char>()) == garbage);
+        std::ifstream gone(path, std::ios::binary);
+        CHECK(!gone.good());
+        std::remove(aside.c_str());
+    }
+
+    // batch85: a scanner holding the lease file for a moment is NOT
+    // corruption. The loader retries; when it still cannot open the file it
+    // reports kUnreadable and refuses to overwrite it (a later dump would
+    // destroy a perfectly valid snapshot).
+    void TestLeaseLoadTransientLockIsNotCorrupt() {
+        vgww::core::Config config;
+        config.gateway.ipv4 = kGatewayIp;
+        config.dhcp.pool_start = kPoolStart;
+        config.dhcp.pool_end = kPoolEnd;
+        const auto t0 = std::chrono::steady_clock::now();
+        const std::string path = "b-lock-dhcp-leases.json";
+        std::remove(path.c_str());
+        {
+            DhcpServer writer(config);
+            const WireMac mac{0x95, 1, 1, 1, 1, 1};
+            CHECK(writer.Acquire(mac, t0, DhcpServer::OfferStage::kAck) != 0);
+            CHECK(writer.DumpLeases(path, t0));
+        }
+
+        DhcpServer server(config);
+        std::atomic<int> calls{0};
+        vgww::core::SetConfigOpenFailureHookForTest(
+            [&calls](const std::string&) -> unsigned long {
+                return (calls.fetch_add(1) + 1) <= 2 ? 32u : 0u;
+            });
+        size_t dropped = 0;
+        const auto outcome = server.LoadLeases(path, t0, &dropped);
+        vgww::core::SetConfigOpenFailureHookForTest(
+            std::function<unsigned long(const std::string&)>());
+        CHECK(outcome == DhcpServer::LoadOutcome::kRestored);
+        CHECK(calls.load() == 3);
+        CHECK(server.LeaseCount() == 1);
+        std::remove(path.c_str());
+    }
+
+    void TestLeaseLoadUnreadablePausesDump() {
+        vgww::core::Config config;
+        config.gateway.ipv4 = kGatewayIp;
+        config.dhcp.pool_start = kPoolStart;
+        config.dhcp.pool_end = kPoolEnd;
+        const auto t0 = std::chrono::steady_clock::now();
+        const std::string path = "b-lock2-dhcp-leases.json";
+        std::remove(path.c_str());
+        {
+            DhcpServer writer(config);
+            const WireMac mac{0x96, 1, 1, 1, 1, 1};
+            CHECK(writer.Acquire(mac, t0, DhcpServer::OfferStage::kAck) != 0);
+            CHECK(writer.DumpLeases(path, t0));
+        }
+        std::string original;
+        {
+            std::ifstream in(path, std::ios::binary);
+            original.assign(std::istreambuf_iterator<char>(in),
+                            std::istreambuf_iterator<char>());
+        }
+
+        DhcpServer server(config);
+        vgww::core::SetConfigOpenFailureHookForTest(
+            [](const std::string&) -> unsigned long { return 32u; });
+        const auto outcome = server.LoadLeases(path, t0, nullptr);
+        CHECK(outcome == DhcpServer::LoadOutcome::kUnreadable);
+        CHECK(server.LeaseCount() == 0);
+
+        // While the file stays unreadable the dump must refuse (counted) and
+        // leave the bytes untouched - the recovery retry fails too.
+        const uint64_t failures = server.PersistFailureCount();
+        CHECK(!server.DumpLeases(path, t0 + std::chrono::seconds(60)));
+        CHECK(server.PersistFailureCount() == failures + 1);
+        {
+            std::ifstream in(path, std::ios::binary);
+            CHECK(std::string((std::istreambuf_iterator<char>(in)),
+                              std::istreambuf_iterator<char>()) == original);
+        }
+        vgww::core::SetConfigOpenFailureHookForTest(
+            std::function<unsigned long(const std::string&)>());
+
+        // Once the lock is gone a fresh server restores the file.
+        DhcpServer fresh(config);
+        CHECK(fresh.LoadLeases(path, t0, nullptr) ==
+              DhcpServer::LoadOutcome::kRestored);
+        std::remove(path.c_str());
+    }
+
+    // batch87: a blocked lease writer recovers on the next dump once the file
+    // can be read again: the on-disk leases are merged (live leases win on
+    // address conflicts), the block clears, and no restart is needed.
+    void TestLeaseDumpRecoversFromBlocked() {
+        vgww::core::Config config;
+        config.gateway.ipv4 = kGatewayIp;
+        config.dhcp.pool_start = kPoolStart;
+        config.dhcp.pool_end = kPoolEnd;
+        const auto t0 = std::chrono::steady_clock::now();
+        const std::string path = "b-recover-dhcp-leases.json";
+        std::remove(path.c_str());
+        {
+            DhcpServer writer(config);
+            const WireMac mac{0x97, 1, 1, 1, 1, 1};
+            CHECK(writer.Acquire(mac, t0, DhcpServer::OfferStage::kAck) != 0);
+            CHECK(writer.DumpLeases(path, t0));
+        }
+
+        DhcpServer server(config);
+        vgww::core::SetConfigOpenFailureHookForTest(
+            [](const std::string&) -> unsigned long { return 32u; });
+        CHECK(server.LoadLeases(path, t0, nullptr) ==
+              DhcpServer::LoadOutcome::kUnreadable);
+        vgww::core::SetConfigOpenFailureHookForTest(
+            std::function<unsigned long(const std::string&)>());
+        CHECK(server.PersistBlocked());
+        CHECK(server.LeaseCount() == 0);
+
+        const WireMac live_a{0x98, 2, 2, 2, 2, 2};
+        const WireMac live_b{0x99, 3, 3, 3, 3, 3};
+        CHECK(server.Acquire(live_a, t0, DhcpServer::OfferStage::kAck) != 0);
+        CHECK(server.Acquire(live_b, t0, DhcpServer::OfferStage::kAck) != 0);
+        const size_t live = server.LeaseCount();
+        CHECK(live == 2);
+
+        CHECK(server.DumpLeases(path, t0 + std::chrono::seconds(60)));
+        CHECK(!server.PersistBlocked());
+        CHECK(server.LeaseCount() >= live);
+        const size_t merged = server.LeaseCount();
+
+        DhcpServer reloaded(config);
+        CHECK(reloaded.LoadLeases(path, t0, nullptr) ==
+              DhcpServer::LoadOutcome::kRestored);
+        CHECK(reloaded.LeaseCount() == merged);
+        std::remove(path.c_str());
+    }
+
     void TestLeaseSaveFailureReported() {
         vgww::core::Config config;
         config.gateway.ipv4 = kGatewayIp;
@@ -2435,6 +2720,9 @@ int main() {
     TestLeaseHostnameLearnt();
     TestLeaseRemainingTimeRoundTrip();
     TestB134LeaseLoadRejectsDuplicateAddress();
+    TestB119DroppedLeaseCountExposed();
+    TestB121ParseRejectsAreCounted();
+    TestB120LeaseFileCorruptIsFlagged();
     TestLeaseLoadSkipsIllegal();
     TestLegacyLeaseMissingExpiresRestored();
     TestPoolSkipsNetworkAndBroadcast();
@@ -2452,6 +2740,11 @@ int main() {
     TestDeclineForeignMacIgnored();
     TestLeaseFileHasVersion();
     TestLeaseSaveFailureReported();
+    TestLeaseDumpFlushFailureKeepsPreviousSnapshot();
+    TestCorruptLeaseFilePreserved();
+    TestLeaseLoadTransientLockIsNotCorrupt();
+    TestLeaseLoadUnreadablePausesDump();
+    TestLeaseDumpRecoversFromBlocked();
     TestPoolExhaustionCounted();
     TestReleaseWrongServerIdIgnored();
     TestParseOptionStreamBoundaries();

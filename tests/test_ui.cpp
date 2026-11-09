@@ -12,6 +12,8 @@
 
 #include "core/config.h"
 #include "core/memory.h"
+#include "proto/dhcp.h"
+#include "proto/dhcp6.h"
 #include "ui/app.h"
 #include "ui/console_log.h"
 #include "ui/controls.h"
@@ -37,6 +39,7 @@
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
+#include <cstdint>
 #include <cstring>
 #include <filesystem>
 #include <fstream>
@@ -44,6 +47,7 @@
 #include <memory>
 #include <new>
 #include <sstream>
+#include <stdexcept>
 #include <string>
 #include <thread>
 #include <utility>
@@ -21784,6 +21788,202 @@ static void TestB24AdapterBindingSnapshot() {
     CHECK(!source.Collect(2)->adapter_binding.bound);
 }
 
+static void TestB97UiBindingCommandsPersist() {
+    using namespace vgww::ui;
+    const std::string cfg_path = "test_ui_b97_bindings.json";
+    const std::string lease_path = "test_ui_b97_leases.json";
+    std::remove(cfg_path.c_str());
+    std::remove(lease_path.c_str());
+    vgww::core::Config cfg;
+    cfg.adapter = "Ethernet";
+    cfg.mode = vgww::core::Mode::kMain;
+    cfg.dhcp.enabled = true;
+    bool ok = false;
+    cfg.gateway.ipv4 = vgww::core::ParseIpv4("192.168.42.1", ok);
+    cfg.gateway.mask = vgww::core::ParseIpv4("255.255.255.0", ok);
+    cfg.gateway.mac = {0x30, 0xFC, 0x68, 0x88, 0xB4, 0x97};
+    cfg.dhcp.pool_start = vgww::core::ParseIpv4("192.168.42.100", ok);
+    cfg.dhcp.pool_end = vgww::core::ParseIpv4("192.168.42.200", ok);
+    cfg.dhcp.lease_seconds = 3600;
+    cfg.ipv6.enabled = true;
+    cfg.ipv6.prefix_len = 64;
+    cfg.ipv6.ula_prefix = {0xFD, 0x00, 0x11, 0x33, 0x44, 0x55, 0x66,
+                           0x77, 0, 0, 0, 0, 0, 0, 0, 0};
+    cfg.ipv6.dhcpv6.enabled = true;
+    cfg.ipv6.dhcpv6.pool_start = {0xFD, 0x00, 0x11, 0x33, 0x44, 0x55,
+                                  0x66, 0x77, 0, 0, 0, 0, 0, 0, 0x10, 0x00};
+    cfg.ipv6.dhcpv6.pool_end = {0xFD, 0x00, 0x11, 0x33, 0x44, 0x55,
+                                0x66, 0x77, 0, 0, 0, 0, 0, 0, 0x1F, 0xFF};
+    cfg.perf.workers = 2;
+    cfg.perf.ring_capacity = 64;
+    cfg.perf.max_conns = 64;
+    std::string err;
+    CHECK(cfg.SaveToFile(cfg_path, err));
+
+    vgww::runtime::Dataplane dataplane(cfg, lease_path);
+    dataplane.SetDriverClient(std::make_unique<B24AdapterDriver>());
+    CHECK(dataplane.Start(err));
+    CHECK(dataplane.DhcpActive());
+    CHECK(dataplane.Dhcp6Active());
+    DataplaneCommandExecutor executor(dataplane, cfg_path);
+
+    const auto load = [&](vgww::core::Config& out) {
+        std::string load_error;
+        const auto disk = vgww::core::Config::LoadFromFile(cfg_path,
+                                                          load_error);
+        if (disk) {
+            out = *disk;
+        }
+        return disk.has_value();
+    };
+
+    // Add: the runtime row AND the document must both carry it.
+    const CommandResult added = executor.Execute(Command{AddDhcpBindingCmd{
+        "02:00:00:00:97:11", "192.168.42.111", "ui-host", ""}});
+    CHECK(added.ok);
+    vgww::core::Config disk;
+    CHECK(load(disk));
+    {
+        bool parsed = false;
+        const uint32_t want = vgww::core::ParseIpv4("192.168.42.111", parsed);
+        int found = 0;
+        for (const auto& b : disk.dhcp.static_bindings) {
+            if (b.ip == want) {
+                ++found;
+                CHECK(b.hostname == "ui-host");
+            }
+        }
+        CHECK(1 == found);
+    }
+
+    // Edit (one command carrying the old MAC): old row gone, new row saved.
+    const CommandResult edited = executor.Execute(Command{AddDhcpBindingCmd{
+        "02:00:00:00:97:12", "192.168.42.112", "",
+        "02:00:00:00:97:11"}});
+    CHECK(edited.ok);
+    CHECK(load(disk));
+    CHECK(!disk.dhcp.static_bindings.empty());
+    {
+        vgww::core::MacAddress old_mac{};
+        CHECK(vgww::core::ParseMac("02:00:00:00:97:11", old_mac));
+        bool parsed = false;
+        const uint32_t want = vgww::core::ParseIpv4("192.168.42.112", parsed);
+        int old_rows = 0;
+        int new_rows = 0;
+        for (const auto& b : disk.dhcp.static_bindings) {
+            if (b.mac == old_mac) ++old_rows;
+            if (b.ip == want) ++new_rows;
+        }
+        CHECK(0 == old_rows);
+        CHECK(1 == new_rows);
+    }
+
+    // Delete: persisted row removed.
+    const CommandResult removed =
+        executor.Execute(Command{RemoveDhcpBindingCmd{"02:00:00:00:97:12"}});
+    CHECK(removed.ok);
+    CHECK(load(disk));
+    {
+        bool parsed = false;
+        const uint32_t gone = vgww::core::ParseIpv4("192.168.42.112", parsed);
+        for (const auto& b : disk.dhcp.static_bindings) {
+            CHECK(b.ip != gone);
+        }
+    }
+
+    // DHCPv6 add/remove travels the same path.
+    const CommandResult added6 = executor.Execute(Command{AddDhcp6BindingCmd{
+        "00:03:00:01:02:00:00:97:31", "fd00:1133:4455:6677::1100", "ui-v6",
+        ""}});
+    CHECK(added6.ok);
+    CHECK(load(disk));
+    {
+        std::vector<uint8_t> want;
+        CHECK(vgww::runtime::ParseDuidText("00:03:00:01:02:00:00:97:31",
+                                           want));
+        int found = 0;
+        for (const auto& b : disk.ipv6.dhcpv6.static_bindings) {
+            if (b.duid == want) {
+                ++found;
+                CHECK(b.hostname == "ui-v6");
+            }
+        }
+        CHECK(1 == found);
+    }
+    const CommandResult removed6 = executor.Execute(Command{
+        RemoveDhcp6BindingCmd{"00:03:00:01:02:00:00:97:31"}});
+    CHECK(removed6.ok);
+    CHECK(load(disk));
+    {
+        std::vector<uint8_t> gone;
+        CHECK(vgww::runtime::ParseDuidText("00:03:00:01:02:00:00:97:31",
+                                           gone));
+        for (const auto& b : disk.ipv6.dhcpv6.static_bindings) {
+            CHECK(b.duid != gone);
+        }
+    }
+
+    std::string stop_error;
+    CHECK(dataplane.Stop(stop_error));
+    std::remove(cfg_path.c_str());
+    std::remove(lease_path.c_str());
+}
+
+static void TestB98UiRuleCommandsReportPersistFailure() {
+    using namespace vgww::ui;
+    FixTextMetrics();
+    I18n& i18n = I18n::Instance();
+    const Lang saved_lang = i18n.Lang();
+    i18n.SetLang(Lang::En);
+    vgww::web::RuleStore& store = vgww::web::RuleStore::Instance();
+    store.Clear();
+    const std::string path = "test_ui_b98_rules.json";
+    const std::string rules = path + ".rules.json";
+    std::remove(path.c_str());
+    std::error_code ec;
+    std::filesystem::remove_all(rules, ec);
+    // RegisterApi attaches `<config>.rules.json` as the store's document, so
+    // attach that same path here; a missing file is a clean first run.
+    store.AttachFile(rules);
+    store.Clear();  // empty the store and publish it (clean baseline)
+    CHECK(store.PersistUpToDate());
+
+    vgww::core::Config cfg;
+    bool ok = false;
+    cfg.gateway.ipv4 = vgww::core::ParseIpv4("192.168.43.1", ok);
+    cfg.gateway.mask = vgww::core::ParseIpv4("255.255.255.0", ok);
+    vgww::core::ParseMac("30:fc:68:88:b4:98", cfg.gateway.mac);
+    vgww::runtime::Dataplane dataplane(cfg);
+    DataplaneCommandExecutor executor(dataplane, "");
+
+    // A DIRECTORY at the rules path makes every publish fail permanently.
+    std::filesystem::remove(rules, ec);
+    CHECK(std::filesystem::create_directory(rules, ec));
+    const CommandResult blocked =
+        executor.Execute(Command{AddBanCmd{"ip", "10.9.8.7"}});
+    CHECK(!blocked.ok);
+    CHECK(blocked.message.find(L"Save failed") != std::wstring::npos);
+    CHECK(!store.PersistUpToDate());
+    // The rule is live in memory; only durability failed (no fake success).
+    CHECK(1 == store.Bans().size());
+
+    // Removing the blocker lets the next mutation report real durability and
+    // flush the pending snapshot.
+    std::filesystem::remove_all(rules, ec);
+    const CommandResult saved =
+        executor.Execute(Command{AddBanCmd{"ip", "10.9.8.8"}});
+    CHECK(saved.ok);
+    CHECK(saved.message == i18n.T(Str::CmdBanAdded));
+    CHECK(store.PersistUpToDate());
+    CHECK(std::filesystem::exists(rules));
+
+    store.AttachFile("");
+    store.Clear();
+    i18n.SetLang(saved_lang);
+    std::remove(path.c_str());
+    std::filesystem::remove_all(rules, ec);
+}
+
 static void TestB24AdapterDiagnosticLine() {
     using namespace vgww::ui;
     FixTextMetrics();
@@ -30980,6 +31180,783 @@ static void TestB33zDhcpFaultsSurface() {
 }
 
 // ============================================================================
+// batch104: DHCPv6 pool exhaustion had no visible channel at all (the v4
+// counter was mirrored, the v6 sibling was not). Anchor: the accessor exists,
+// the leases page warns on the v6 views (per active tab), and the v4 hint does
+// not leak onto v6.
+// ============================================================================
+static void TestB104Dhcp6PoolExhaustionSurface() {
+    using namespace vgww::ui;
+    FixTextMetrics();
+    I18n::Instance().SetLang(Lang::ZhCN);
+
+    // (a) The facade accessor exists and degrades safely.
+    {
+        vgww::core::Config cfg;
+        cfg.adapter = "Ethernet";
+        cfg.mode = vgww::core::Mode::kMain;
+        cfg.dhcp.enabled = true;
+        cfg.ipv6.enabled = true;
+        cfg.ipv6.prefix_len = 64;
+        cfg.ipv6.ula_prefix = {0xFD, 0x00, 0x11, 0x44, 0x55, 0x66, 0x77,
+                               0x88, 0, 0, 0, 0, 0, 0, 0, 0};
+        cfg.ipv6.dhcpv6.enabled = true;
+        cfg.ipv6.dhcpv6.pool_start = {0xFD, 0x00, 0x11, 0x44, 0x55, 0x66,
+                                      0x77, 0x88, 0, 0, 0, 0, 0, 0, 0x10, 0x00};
+        cfg.ipv6.dhcpv6.pool_end = {0xFD, 0x00, 0x11, 0x44, 0x55, 0x66,
+                                    0x77, 0x88, 0, 0, 0, 0, 0, 0, 0x1F, 0xFF};
+        bool parsed = false;
+        cfg.gateway.ipv4 = vgww::core::ParseIpv4("192.168.47.1", parsed);
+        cfg.gateway.mask = vgww::core::ParseIpv4("255.255.255.0", parsed);
+        cfg.gateway.mac = {0x30, 0xFC, 0x68, 0x88, 0xB4, 0x77};
+        cfg.dhcp.pool_start = vgww::core::ParseIpv4("192.168.47.100", parsed);
+        cfg.dhcp.pool_end = vgww::core::ParseIpv4("192.168.47.200", parsed);
+        cfg.perf.workers = 2;
+        cfg.perf.ring_capacity = 256;
+        cfg.perf.max_conns = 64;
+        vgww::runtime::Dataplane dataplane(cfg);
+        dataplane.SetDriverClient(std::make_unique<B24AdapterDriver>());
+        std::string err;
+        CHECK(dataplane.Start(err));
+        CHECK(dataplane.Dhcp6Active());
+        CHECK(0 == dataplane.Dhcp6PoolExhaustedCount());
+        std::string stop_error;
+        CHECK(dataplane.Stop(stop_error));
+    }
+
+    // (b) The leases page warns on the v6 views only.
+    ShellFakeSource source;
+    RecordingExecutor executor;
+    UiController controller(source, executor);
+    std::string err;
+    CHECK(controller.Start(err));
+    UiSnapshot snap = MakeRulesSnapshot(1, 1);
+    UiApp app;
+    app.Compose(controller, snap);
+    app.root().Arrange({0.0f, 0.0f, 1280.0f, 800.0f});
+    app.router().Navigate("leases");
+    app.Update(snap);
+    app.root().Arrange({0.0f, 0.0f, 1280.0f, 800.0f});
+
+    auto* hint = dynamic_cast<Text*>(
+        FindById(app.root(), "leases.runtime_hint"));
+    auto* tabs = dynamic_cast<SegmentedControl*>(
+        FindById(app.root(), "leases.tabs"));
+    CHECK(hint != nullptr);
+    CHECK(tabs != nullptr);
+    if (hint == nullptr || tabs == nullptr) {
+        controller.Stop();
+        return;
+    }
+    const std::wstring neutral = hint->text();
+
+    UiSnapshot v6 = snap;
+    v6.seq = snap.seq + 1;
+    v6.dhcp6_pool_exhausted = 1;
+    tabs->SetIndex(1);  // v6 leases view (fires on_changed)
+    app.Update(v6);
+    app.root().Arrange({0.0f, 0.0f, 1280.0f, 800.0f});
+    CHECK(hint->text() == I18n::Instance().T(Str::LeasesPoolExhausted));
+    CHECK(hint->color() == ColorToken::Warning);
+
+    // The v4 view of the same snapshot stays neutral: the fault is v6-only.
+    UiSnapshot v6_v4tab = v6;
+    v6_v4tab.seq = v6.seq + 1;
+    tabs->SetIndex(0);  // v4 leases view
+    app.Update(v6_v4tab);
+    app.root().Arrange({0.0f, 0.0f, 1280.0f, 800.0f});
+    CHECK(hint->text() == neutral);
+
+    // And the v4 counter still warns on the v4 view.
+    UiSnapshot v4 = v6_v4tab;
+    v4.seq = v6_v4tab.seq + 1;
+    v4.dhcp_pool_exhausted = 1;
+    app.Update(v4);
+    app.root().Arrange({0.0f, 0.0f, 1280.0f, 800.0f});
+    CHECK(hint->text() == I18n::Instance().T(Str::LeasesPoolExhausted));
+    CHECK(hint->color() == ColorToken::Warning);
+
+    controller.Stop();
+    I18n::Instance().SetLang(Lang::ZhCN);
+}
+
+// ============================================================================
+// batch103: the v4 persist counter was mirrored, but a failed DHCPv6
+// snapshot and a dirty LAST stop had no UI surface at all (their servers are
+// torn down, so the counters vanish). Anchor: both reach the snapshot and the
+// leases page warns - and the v4 counter keeps its precedence order.
+// ============================================================================
+// batch115: rule-document write failures used to be stderr-only. The source
+// must carry the RuleStore counter and the firewall page must warn, so a
+// restart that loses in-memory rules is never silent.
+// batch118: invalid entries in the rule document used to be dropped with a
+// single stderr line. The snapshot must carry the count and the firewall page
+// must warn, so rules that silently never applied are visible.
+// batch119: dropped persisted-lease entries must reach the snapshot and the
+// leases page, not just stderr.
+// batch120: a corrupt lease document (preserved aside) must reach the
+// snapshot and the leases page, not just stderr.
+// batch121: strict-parse refusals must reach the snapshot and the leases page.
+// batch124: the native UI is the primary interface, so its privileged
+// commands must leave the same audit trail the Web routes do.
+// batch125: service start/stop and autostart toggles are privileged lifecycle
+// changes; they must leave the same audit trail as every other command.
+// batch126: the bounded console ring must not evict lines silently.
+static void TestB126ConsoleDroppedSurface() {
+    using namespace vgww::ui;
+    FixTextMetrics();
+    console_log::ClearForTest();
+    for (int i = 0; i < 2005; ++i) {
+        console_log::AppendForTest("line " + std::to_string(i));
+    }
+    CHECK(console_log::DroppedLineCount() == 5);
+    CHECK(console_log::LineCount() == 2000);
+
+    vgww::core::Config cfg;
+    cfg.adapter = "Ethernet";
+    cfg.mode = vgww::core::Mode::kMain;
+    cfg.dhcp.enabled = true;
+    bool parsed = false;
+    cfg.gateway.ipv4 = vgww::core::ParseIpv4("192.168.52.1", parsed);
+    cfg.gateway.mask = vgww::core::ParseIpv4("255.255.255.0", parsed);
+    cfg.gateway.mac = {0x30, 0xFC, 0x68, 0x88, 0xB4, 0x72};
+    cfg.dhcp.pool_start = vgww::core::ParseIpv4("192.168.52.100", parsed);
+    cfg.dhcp.pool_end = vgww::core::ParseIpv4("192.168.52.200", parsed);
+    {
+        vgww::runtime::Dataplane dataplane(cfg);
+        dataplane.SetDriverClient(std::make_unique<B24AdapterDriver>());
+        std::string err;
+        CHECK(dataplane.Start(err));
+        RealDataSource live_source(dataplane, cfg, UiRuntimeFlags{});
+        const auto snap = live_source.Collect(1);
+        CHECK(snap != nullptr);
+        if (snap) {
+            CHECK(snap->console_dropped == 5);
+        }
+        std::string stop_error;
+        dataplane.Stop(stop_error);
+    }
+    console_log::ClearForTest();
+
+    ShellFakeSource source;
+    RecordingExecutor executor;
+    UiController controller(source, executor);
+    std::string err;
+    CHECK(controller.Start(err));
+    UiSnapshot snap = MakeRulesSnapshot(1, 1);
+    snap.console_dropped = 1;
+    UiApp app;
+    app.Compose(controller, snap);
+    app.root().Arrange({0.0f, 0.0f, 1280.0f, 800.0f});
+    app.router().Navigate("console");
+    app.Update(snap);
+    app.root().Arrange({0.0f, 0.0f, 1280.0f, 800.0f});
+
+    auto* hint = dynamic_cast<Text*>(
+        FindById(app.root(), "console.dropped_hint"));
+    CHECK(hint != nullptr);
+    if (hint != nullptr) {
+        CHECK(hint->visible);
+    }
+    snap.console_dropped = 0;
+    app.Update(snap);
+    if (hint != nullptr) {
+        CHECK(!hint->visible);
+    }
+    controller.Stop();
+}
+
+static void TestB125LifecycleCommandsAreAudited() {
+    using namespace vgww::ui;
+    FixTextMetrics();
+    console_log::ClearForTest();
+
+    vgww::core::Config cfg;
+    cfg.adapter = "Ethernet";
+    cfg.mode = vgww::core::Mode::kMain;
+    cfg.dhcp.enabled = true;
+    bool parsed = false;
+    cfg.gateway.ipv4 = vgww::core::ParseIpv4("192.168.51.1", parsed);
+    cfg.gateway.mask = vgww::core::ParseIpv4("255.255.255.0", parsed);
+    cfg.gateway.mac = {0x30, 0xFC, 0x68, 0x88, 0xB4, 0x71};
+    cfg.dhcp.pool_start = vgww::core::ParseIpv4("192.168.51.100", parsed);
+    cfg.dhcp.pool_end = vgww::core::ParseIpv4("192.168.51.200", parsed);
+
+    vgww::runtime::Dataplane dataplane(cfg);
+    dataplane.SetDriverClient(std::make_unique<B24AdapterDriver>());
+    DataplaneCommandExecutor executor(
+        dataplane, "",
+        [](const SetAutostartCmd&) {
+            return CommandResult{true, L"ok"};
+        });
+    ShellFakeSource source;
+    UiController controller(source, executor);
+    std::string err;
+    CHECK(controller.Start(err));
+
+    CHECK(controller.Post(Command{StartServiceCmd{}}));
+    CHECK(controller.Post(Command{StopServiceCmd{}}));
+    CHECK(controller.Post(Command{SetAutostartCmd{true}}));
+    controller.Stop();
+
+    const auto lines = console_log::Snapshot();
+    const auto contains = [&lines](const std::string& needle) {
+        const std::wstring needle_w(needle.begin(), needle.end());
+        for (const auto& line : lines) {
+            if (line.find(needle_w) != std::wstring::npos) {
+                return true;
+            }
+        }
+        return false;
+    };
+    CHECK(contains("[audit] service started"));
+    CHECK(contains("[audit] service stopped"));
+    CHECK(contains("[audit] autostart set 1"));
+}
+
+static void TestB124NativeUiCommandsAreAudited() {
+    using namespace vgww::ui;
+    FixTextMetrics();
+    console_log::ClearForTest();
+
+    const std::string cfg_path = "test_ui_b124_cfg.json";
+    std::remove(cfg_path.c_str());
+    vgww::core::Config cfg;
+    cfg.adapter = "Ethernet";
+    cfg.mode = vgww::core::Mode::kMain;
+    cfg.dhcp.enabled = true;
+    bool parsed = false;
+    cfg.gateway.ipv4 = vgww::core::ParseIpv4("192.168.50.1", parsed);
+    cfg.gateway.mask = vgww::core::ParseIpv4("255.255.255.0", parsed);
+    cfg.gateway.mac = {0x30, 0xFC, 0x68, 0x88, 0xB4, 0x70};
+    cfg.dhcp.pool_start = vgww::core::ParseIpv4("192.168.50.100", parsed);
+    cfg.dhcp.pool_end = vgww::core::ParseIpv4("192.168.50.200", parsed);
+
+    vgww::runtime::Dataplane dataplane(cfg);
+    DataplaneCommandExecutor executor(dataplane, cfg_path);
+    ShellFakeSource source;
+    UiController controller(source, executor);
+    std::string err;
+    CHECK(controller.Start(err));
+
+    CHECK(controller.Post(Command{AddPortMapCmd{"tcp", 19002,
+                                                "192.168.50.10", 8080}}));
+    CHECK(controller.Post(Command{AddBanCmd{"mac", "aa:bb:cc:dd:ee:ff"}}));
+    CHECK(controller.Post(Command{RemoveBanCmd{0, 0}}));
+    SaveConfigCmd save;
+    save.config = cfg;
+    CHECK(controller.Post(Command{std::move(save)}));
+    controller.Stop();
+
+    const auto lines = console_log::Snapshot();
+    const auto contains = [&lines](const std::string& needle) {
+        const std::wstring needle_w(needle.begin(), needle.end());
+        for (const auto& line : lines) {
+            if (line.find(needle_w) != std::wstring::npos) {
+                return true;
+            }
+        }
+        return false;
+    };
+    CHECK(contains("[audit] portmap add"));
+    CHECK(contains("[audit] ban add"));
+    CHECK(contains("[audit] ban delete"));
+    CHECK(contains("[audit] config saved"));
+
+    std::remove(cfg_path.c_str());
+}
+
+static void TestB121ParseRejectsSurface() {
+    using namespace vgww::ui;
+    FixTextMetrics();
+    I18n::Instance().SetLang(Lang::ZhCN);
+
+    // Source: the global parse-reject counter reaches the snapshot.
+    {
+        vgww::core::Config cfg;
+        cfg.adapter = "Ethernet";
+        cfg.mode = vgww::core::Mode::kMain;
+        cfg.dhcp.enabled = true;
+        bool parsed = false;
+        cfg.gateway.ipv4 = vgww::core::ParseIpv4("192.168.0.40", parsed);
+        cfg.gateway.mask = vgww::core::ParseIpv4("255.255.255.0", parsed);
+        cfg.gateway.mac = {0x30, 0xFC, 0x68, 0x88, 0xB4, 0x6B};
+        cfg.dhcp.pool_start = vgww::core::ParseIpv4("192.168.0.100", parsed);
+        cfg.dhcp.pool_end = vgww::core::ParseIpv4("192.168.0.110", parsed);
+        cfg.perf.workers = 2;
+        cfg.perf.ring_capacity = 256;
+        cfg.perf.max_conns = 64;
+        cfg.perf.dial_timeout_ms = 400;
+        vgww::runtime::Dataplane dataplane(cfg);
+        dataplane.SetDriverClient(std::make_unique<B24AdapterDriver>());
+        std::string err;
+        CHECK(dataplane.Start(err));
+        vgww::proto::DhcpView view{};
+        std::vector<uint8_t> garbage(32, 0);
+        CHECK(!vgww::proto::ParseDhcpFrame(garbage.data(), garbage.size(),
+                                           view));
+        vgww::proto::Dhcp6View view6{};
+        CHECK(!vgww::proto::ParseDhcp6Frame(garbage.data(), garbage.size(),
+                                            view6));
+        RealDataSource live_source(dataplane, cfg, UiRuntimeFlags{});
+        const auto snap = live_source.Collect(1);
+        CHECK(snap != nullptr);
+        if (snap) {
+            CHECK(snap->dhcp_parse_rejected >= 1);
+            CHECK(snap->dhcp6_parse_rejected >= 1);
+        }
+        std::string stop_error;
+        dataplane.Stop(stop_error);
+    }
+
+    ShellFakeSource source;
+    RecordingExecutor executor;
+    UiController controller(source, executor);
+    std::string err;
+    CHECK(controller.Start(err));
+    UiSnapshot snap = MakeRulesSnapshot(1, 1);
+    snap.dhcp_parse_rejected = 3;
+    UiApp app;
+    app.Compose(controller, snap);
+    app.root().Arrange({0.0f, 0.0f, 1280.0f, 800.0f});
+    app.router().Navigate("leases");
+    app.Update(snap);
+    app.root().Arrange({0.0f, 0.0f, 1280.0f, 800.0f});
+
+    auto* hint = dynamic_cast<Text*>(
+        FindById(app.root(), "leases.parse_hint"));
+    CHECK(hint != nullptr);
+    if (hint != nullptr) {
+        CHECK(hint->visible);
+    }
+    snap.dhcp_parse_rejected = 0;
+    app.Update(snap);
+    if (hint != nullptr) {
+        CHECK(!hint->visible);
+    }
+    // The same hint serves the v6 counters on the V6 tab (batch122).
+    snap.dhcp6_parse_rejected = 1;
+    auto* tabs = dynamic_cast<SegmentedControl*>(
+        FindById(app.root(), "leases.tabs"));
+    CHECK(tabs != nullptr);
+    if (tabs != nullptr) {
+        tabs->SetIndex(1);  // V6
+    }
+    app.Update(snap);
+    if (hint != nullptr) {
+        CHECK(hint->visible);
+    }
+    snap.dhcp6_parse_rejected = 0;
+    app.Update(snap);
+    if (hint != nullptr) {
+        CHECK(!hint->visible);
+    }
+    controller.Stop();
+}
+
+static void TestB120CorruptLeasesSurface() {
+    using namespace vgww::ui;
+    FixTextMetrics();
+    I18n::Instance().SetLang(Lang::ZhCN);
+
+    const std::string lease_path = "test_ui_b120_leases.json";
+    std::remove(lease_path.c_str());
+    {
+        std::ofstream out(lease_path);
+        out << "this is not json";
+    }
+
+    vgww::core::Config cfg;
+    cfg.adapter = "Ethernet";
+    cfg.mode = vgww::core::Mode::kMain;
+    cfg.dhcp.enabled = true;
+    bool parsed = false;
+    cfg.gateway.ipv4 = vgww::core::ParseIpv4("192.168.0.40", parsed);
+    cfg.gateway.mask = vgww::core::ParseIpv4("255.255.255.0", parsed);
+    cfg.gateway.mac = {0x30, 0xFC, 0x68, 0x88, 0xB4, 0x6A};
+    cfg.dhcp.pool_start = vgww::core::ParseIpv4("192.168.0.100", parsed);
+    cfg.dhcp.pool_end = vgww::core::ParseIpv4("192.168.0.110", parsed);
+    cfg.dhcp.lease_seconds = 3600;
+    cfg.perf.workers = 2;
+    cfg.perf.ring_capacity = 256;
+    cfg.perf.max_conns = 64;
+    cfg.perf.dial_timeout_ms = 400;
+
+    {
+        vgww::runtime::Dataplane dataplane(cfg, lease_path);
+        dataplane.SetDriverClient(std::make_unique<B24AdapterDriver>());
+        std::string err;
+        CHECK(dataplane.Start(err));
+        CHECK(dataplane.DhcpLeaseFileCorrupt());
+        RealDataSource live_source(dataplane, cfg, UiRuntimeFlags{});
+        const auto snap = live_source.Collect(1);
+        CHECK(snap != nullptr);
+        if (snap) {
+            CHECK(snap->dhcp_leases_corrupt);
+        }
+        std::string stop_error;
+        dataplane.Stop(stop_error);
+    }
+
+    ShellFakeSource source;
+    RecordingExecutor executor;
+    UiController controller(source, executor);
+    std::string err;
+    CHECK(controller.Start(err));
+    UiSnapshot snap = MakeRulesSnapshot(1, 1);
+    snap.dhcp_leases_corrupt = true;
+    UiApp app;
+    app.Compose(controller, snap);
+    app.root().Arrange({0.0f, 0.0f, 1280.0f, 800.0f});
+    app.router().Navigate("leases");
+    app.Update(snap);
+    app.root().Arrange({0.0f, 0.0f, 1280.0f, 800.0f});
+
+    auto* hint = dynamic_cast<Text*>(
+        FindById(app.root(), "leases.corrupt_hint"));
+    CHECK(hint != nullptr);
+    if (hint != nullptr) {
+        CHECK(hint->visible);
+    }
+    snap.dhcp_leases_corrupt = false;
+    app.Update(snap);
+    if (hint != nullptr) {
+        CHECK(!hint->visible);
+    }
+    controller.Stop();
+    std::remove(lease_path.c_str());
+    std::remove((lease_path + ".corrupt").c_str());
+}
+
+static void TestB119DroppedLeasesSurface() {
+    using namespace vgww::ui;
+    FixTextMetrics();
+    I18n::Instance().SetLang(Lang::ZhCN);
+
+    const std::string lease_path = "test_ui_b119_leases.json";
+    std::remove(lease_path.c_str());
+    {
+        std::ofstream out(lease_path);
+        out << "{\"version\":1,\"leases\":["
+               "{\"mac\":\"not-a-mac\",\"ip\":\"192.168.0.100\","
+               "\"hostname\":\"bad\",\"expires_in_s\":3600},"
+               "{\"mac\":\"AA:BB:CC:DD:EE:01\",\"ip\":\"192.168.0.101\","
+               "\"hostname\":\"good\",\"expires_in_s\":3600}]}";
+    }
+
+    vgww::core::Config cfg;
+    cfg.adapter = "Ethernet";
+    cfg.mode = vgww::core::Mode::kMain;
+    cfg.dhcp.enabled = true;
+    bool parsed = false;
+    cfg.gateway.ipv4 = vgww::core::ParseIpv4("192.168.0.40", parsed);
+    cfg.gateway.mask = vgww::core::ParseIpv4("255.255.255.0", parsed);
+    cfg.gateway.mac = {0x30, 0xFC, 0x68, 0x88, 0xB4, 0x69};
+    cfg.dhcp.pool_start = vgww::core::ParseIpv4("192.168.0.100", parsed);
+    cfg.dhcp.pool_end = vgww::core::ParseIpv4("192.168.0.110", parsed);
+    cfg.dhcp.lease_seconds = 3600;
+    cfg.perf.workers = 2;
+    cfg.perf.ring_capacity = 256;
+    cfg.perf.max_conns = 64;
+    cfg.perf.dial_timeout_ms = 400;
+
+    {
+        vgww::runtime::Dataplane dataplane(cfg, lease_path);
+        dataplane.SetDriverClient(std::make_unique<B24AdapterDriver>());
+        std::string err;
+        CHECK(dataplane.Start(err));
+        CHECK(dataplane.DhcpDroppedLeaseCount() == 1);
+        RealDataSource live_source(dataplane, cfg, UiRuntimeFlags{});
+        const auto snap = live_source.Collect(1);
+        CHECK(snap != nullptr);
+        if (snap) {
+            CHECK(snap->dhcp_leases_dropped == 1);
+        }
+        std::string stop_error;
+        dataplane.Stop(stop_error);
+    }
+
+    ShellFakeSource source;
+    RecordingExecutor executor;
+    UiController controller(source, executor);
+    std::string err;
+    CHECK(controller.Start(err));
+    UiSnapshot snap = MakeRulesSnapshot(1, 1);
+    snap.dhcp_leases_dropped = 1;
+    UiApp app;
+    app.Compose(controller, snap);
+    app.root().Arrange({0.0f, 0.0f, 1280.0f, 800.0f});
+    app.router().Navigate("leases");
+    app.Update(snap);
+    app.root().Arrange({0.0f, 0.0f, 1280.0f, 800.0f});
+
+    auto* hint = dynamic_cast<Text*>(
+        FindById(app.root(), "leases.dropped_hint"));
+    CHECK(hint != nullptr);
+    if (hint != nullptr) {
+        CHECK(hint->visible);
+    }
+    snap.dhcp_leases_dropped = 0;
+    app.Update(snap);
+    if (hint != nullptr) {
+        CHECK(!hint->visible);
+    }
+    controller.Stop();
+    std::remove(lease_path.c_str());
+}
+
+static void TestB118RulesDiscardedSurface() {
+    using namespace vgww::ui;
+    FixTextMetrics();
+    I18n::Instance().SetLang(Lang::ZhCN);
+
+    const std::string rules = "test_ui_b118_rules.json";
+    std::remove(rules.c_str());
+    {
+        std::ofstream out(rules);
+        out << "{\"portmaps\":[{\"proto\":\"udp\",\"wan_port\":9999,"
+               "\"lan_ip\":\"192.168.0.10\",\"lan_port\":9999}],"
+               "\"bans\":[{\"kind\":\"mac\",\"value\":"
+               "\"aa:bb:cc:dd:ee:ff\",\"id\":1}]}";
+    }
+    auto& store = vgww::web::RuleStore::Instance();
+    store.AttachFile("");
+    std::string attach_err;
+    CHECK(store.AttachFileChecked(rules, attach_err));
+    CHECK(1 == store.DiscardedOnLastLoad());
+
+    {
+        vgww::core::Config cfg;
+        cfg.adapter = "Ethernet";
+        cfg.mode = vgww::core::Mode::kMain;
+        bool parsed = false;
+        cfg.gateway.ipv4 = vgww::core::ParseIpv4("192.168.48.1", parsed);
+        cfg.gateway.mask = vgww::core::ParseIpv4("255.255.255.0", parsed);
+        cfg.gateway.mac = {0x30, 0xFC, 0x68, 0x88, 0xB4, 0x68};
+        vgww::runtime::Dataplane dataplane(cfg);
+        dataplane.SetDriverClient(std::make_unique<B24AdapterDriver>());
+        std::string err;
+        CHECK(dataplane.Start(err));
+        RealDataSource live_source(dataplane, cfg, UiRuntimeFlags{});
+        const auto snap = live_source.Collect(1);
+        CHECK(snap != nullptr);
+        if (snap) {
+            CHECK(snap->rules_discarded == 1);
+        }
+        std::string stop_error;
+        dataplane.Stop(stop_error);
+    }
+
+    ShellFakeSource source;
+    RecordingExecutor executor;
+    UiController controller(source, executor);
+    std::string err;
+    CHECK(controller.Start(err));
+    UiSnapshot snap = MakeRulesSnapshot(1, 1);
+    snap.rules_discarded = 1;
+    UiApp app;
+    app.Compose(controller, snap);
+    app.root().Arrange({0.0f, 0.0f, 1280.0f, 800.0f});
+    app.router().Navigate("firewall");
+    app.Update(snap);
+    app.root().Arrange({0.0f, 0.0f, 1280.0f, 800.0f});
+
+    auto* hint = dynamic_cast<Text*>(
+        FindById(app.root(), "firewall.rules_discarded_hint"));
+    CHECK(hint != nullptr);
+    if (hint != nullptr) {
+        CHECK(hint->visible);
+    }
+    snap.rules_discarded = 0;
+    app.Update(snap);
+    if (hint != nullptr) {
+        CHECK(!hint->visible);
+    }
+    controller.Stop();
+
+    store.AttachFile("");
+    std::remove(rules.c_str());
+}
+
+static void TestB115RulesPersistFailureSurface() {
+    using namespace vgww::ui;
+    FixTextMetrics();
+    I18n::Instance().SetLang(Lang::ZhCN);
+
+    const std::string dir = "test_ui_b115_rules_dir";
+    std::filesystem::remove_all(dir);
+    std::filesystem::create_directory(dir);
+    auto& store = vgww::web::RuleStore::Instance();
+    store.AttachFile(dir);  // a directory cannot be written as a document
+    store.Clear();
+    vgww::web::BanEntry ban;
+    ban.kind = "mac";
+    ban.value = "aa:bb:cc:dd:ee:ff";
+    CHECK(store.AddBanChecked(std::move(ban)));
+    CHECK(store.PersistFailureCount() > 0);
+
+    {
+        vgww::core::Config cfg;
+        cfg.adapter = "Ethernet";
+        cfg.mode = vgww::core::Mode::kMain;
+        cfg.dhcp.enabled = true;
+        bool parsed = false;
+        cfg.gateway.ipv4 = vgww::core::ParseIpv4("192.168.47.1", parsed);
+        cfg.gateway.mask = vgww::core::ParseIpv4("255.255.255.0", parsed);
+        cfg.gateway.mac = {0x30, 0xFC, 0x68, 0x88, 0xB4, 0x67};
+        cfg.dhcp.pool_start = vgww::core::ParseIpv4("192.168.47.100", parsed);
+        cfg.dhcp.pool_end = vgww::core::ParseIpv4("192.168.47.200", parsed);
+        cfg.perf.workers = 2;
+        cfg.perf.ring_capacity = 256;
+        cfg.perf.max_conns = 64;
+        cfg.perf.dial_timeout_ms = 400;
+        vgww::runtime::Dataplane dataplane(cfg);
+        dataplane.SetDriverClient(std::make_unique<B24AdapterDriver>());
+        std::string err;
+        CHECK(dataplane.Start(err));
+        RealDataSource live_source(dataplane, cfg, UiRuntimeFlags{});
+        const auto snap = live_source.Collect(1);
+        CHECK(snap != nullptr);
+        if (snap) {
+            CHECK(snap->rules_persist_failures > 0);
+        }
+        std::string stop_error;
+        dataplane.Stop(stop_error);
+    }
+
+    ShellFakeSource source;
+    RecordingExecutor executor;
+    UiController controller(source, executor);
+    std::string err;
+    CHECK(controller.Start(err));
+    UiSnapshot snap = MakeRulesSnapshot(1, 1);
+    snap.rules_persist_failures = 7;
+    UiApp app;
+    app.Compose(controller, snap);
+    app.root().Arrange({0.0f, 0.0f, 1280.0f, 800.0f});
+    app.router().Navigate("firewall");
+    app.Update(snap);
+    app.root().Arrange({0.0f, 0.0f, 1280.0f, 800.0f});
+
+    auto* hint = dynamic_cast<Text*>(
+        FindById(app.root(), "firewall.rules_persist_hint"));
+    CHECK(hint != nullptr);
+    if (hint != nullptr) {
+        CHECK(hint->visible);
+    }
+    snap.rules_persist_failures = 0;
+    app.Update(snap);
+    if (hint != nullptr) {
+        CHECK(!hint->visible);
+    }
+    controller.Stop();
+
+    store.AttachFile("");
+    std::filesystem::remove_all(dir);
+}
+
+static void TestB103LeasePersistVerdictSurface() {
+    using namespace vgww::ui;
+    FixTextMetrics();
+    I18n::Instance().SetLang(Lang::ZhCN);
+
+    // (a) The source maps a dirty stop into the snapshot verdict.
+    {
+        vgww::core::Config cfg;
+        cfg.adapter = "Ethernet";
+        cfg.mode = vgww::core::Mode::kMain;
+        cfg.dhcp.enabled = true;
+        bool parsed = false;
+        cfg.gateway.ipv4 = vgww::core::ParseIpv4("192.168.46.1", parsed);
+        cfg.gateway.mask = vgww::core::ParseIpv4("255.255.255.0", parsed);
+        cfg.gateway.mac = {0x30, 0xFC, 0x68, 0x88, 0xB4, 0x66};
+        cfg.dhcp.pool_start = vgww::core::ParseIpv4("192.168.46.100", parsed);
+        cfg.dhcp.pool_end = vgww::core::ParseIpv4("192.168.46.200", parsed);
+        cfg.perf.workers = 2;
+        cfg.perf.ring_capacity = 256;
+        cfg.perf.max_conns = 64;
+        cfg.perf.dial_timeout_ms = 400;
+
+        const std::string lease_path = "test_ui_b103_leases.json";
+        std::remove(lease_path.c_str());
+        vgww::runtime::Dataplane dataplane(cfg, lease_path);
+        dataplane.SetDriverClient(std::make_unique<B24AdapterDriver>());
+        std::string err;
+        CHECK(dataplane.Start(err));
+        {
+            std::ofstream out(lease_path);
+            out << "{\"version\":1,\"leases\":[]}";
+        }
+        const HANDLE held = ::CreateFileA(
+            lease_path.c_str(), GENERIC_READ,
+            FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr, OPEN_EXISTING,
+            FILE_ATTRIBUTE_NORMAL, nullptr);
+        CHECK(INVALID_HANDLE_VALUE != held);
+        std::string stop_error;
+        CHECK(dataplane.Stop(stop_error));
+        CHECK(dataplane.StopPersistFailed());
+        ::CloseHandle(held);
+
+        RealDataSource live_source(dataplane, cfg, UiRuntimeFlags{});
+        const auto snap = live_source.Collect(1);
+        CHECK(snap != nullptr);
+        if (snap) {
+            CHECK(snap->lease_persist_failed);
+        }
+        std::remove(lease_path.c_str());
+    }
+
+    // (b) The leases page warns for that verdict, and the v4 counter keeps
+    //     its existing precedence.
+    ShellFakeSource source;
+    RecordingExecutor executor;
+    UiController controller(source, executor);
+    std::string err;
+    CHECK(controller.Start(err));
+    UiSnapshot snap = MakeRulesSnapshot(1, 1);
+    UiApp app;
+    app.Compose(controller, snap);
+    app.root().Arrange({0.0f, 0.0f, 1280.0f, 800.0f});
+    app.router().Navigate("leases");
+    app.Update(snap);
+    app.root().Arrange({0.0f, 0.0f, 1280.0f, 800.0f});
+
+    auto* hint = dynamic_cast<Text*>(
+        FindById(app.root(), "leases.runtime_hint"));
+    CHECK(hint != nullptr);
+    if (hint == nullptr) {
+        controller.Stop();
+        return;
+    }
+    const std::wstring neutral = hint->text();
+    CHECK(hint->color() == ColorToken::TextDim);
+
+    UiSnapshot dirty = snap;
+    dirty.seq = snap.seq + 1;
+    dirty.lease_persist_failed = true;
+    app.Update(dirty);
+    app.root().Arrange({0.0f, 0.0f, 1280.0f, 800.0f});
+    CHECK(hint->text() == I18n::Instance().T(Str::LeasesPersistFailed));
+    CHECK(hint->color() == ColorToken::Warning);
+
+    UiSnapshot pool = dirty;
+    pool.seq = dirty.seq + 1;
+    pool.dhcp_pool_exhausted = 2;
+    app.Update(pool);
+    app.root().Arrange({0.0f, 0.0f, 1280.0f, 800.0f});
+    CHECK(hint->text() == I18n::Instance().T(Str::LeasesPoolExhausted));
+
+    UiSnapshot healthy = snap;
+    healthy.seq = pool.seq + 1;
+    app.Update(healthy);
+    app.root().Arrange({0.0f, 0.0f, 1280.0f, 800.0f});
+    CHECK(hint->text() == neutral);
+
+    controller.Stop();
+    I18n::Instance().SetLang(Lang::ZhCN);
+}
+
+// ============================================================================
 // batch34a (port-map drops were the one counter the UI never mirrored): the
 // snapshot header literally documented `portmap_send_dropped is not mirrored`,
 // so a port-map relay whose WAN->LAN queue hit its hard cap dropped packets
@@ -33611,8 +34588,49 @@ static void TestB267EvalConditionRectAndMetric() {
     }
 }
 
+/// An OS-facing WndProc whose body throws must not unwind through user32's
+/// DispatchMessage frame (undefined behaviour): RunGuardedWndProc swallows and
+/// counts it, answers with DefWindowProc, and the object keeps dispatching.
+void TestWndProcThrowIsContained() {
+    using namespace vgww::ui;
+    VgwwWindow window;  // headless: no Create()
+    int ticks = 0;
+    window.on_snapshot_tick = [&ticks] {
+        ++ticks;
+        throw std::runtime_error("snapshot tick exploded");
+    };
+    const uint64_t before = window.HandlerErrors();
+    window.RunSnapshotTimerTickForTest();
+    CHECK(1 == ticks);                       // the tick ran and threw
+    CHECK(window.HandlerErrors() == before + 1);
+    // The window object survived the throw and still dispatches ticks.
+    window.on_snapshot_tick = [&ticks] { ++ticks; };
+    window.RunSnapshotTimerTickForTest();
+    CHECK(2 == ticks);
+    CHECK(window.HandlerErrors() == before + 1);
+}
+
+/// The reader thread folds captured chunks inside a noexcept (std::thread)
+/// body: a throw there must cost that chunk, never the process.
+void TestConsoleReaderThrowIsContained() {
+    using namespace vgww::ui;
+    console_log::ClearForTest();
+    console_log::SetReaderProbeForTest(
+        [] { throw std::runtime_error("chunk fold exploded"); });
+    const std::uint64_t before = console_log::ReaderErrorCountForTest();
+    console_log::HandleCapturedChunkForTest("gone\n");
+    CHECK(console_log::ReaderErrorCountForTest() == before + 1);
+    CHECK(0 == console_log::LineCount());   // the chunk was dropped whole
+    console_log::SetReaderProbeForTest(nullptr);
+    console_log::HandleCapturedChunkForTest("kept\n");
+    CHECK(console_log::LineCount() >= 1);   // the reader survived
+    console_log::ClearForTest();
+}
+
 int main() {
 
+    TestWndProcThrowIsContained();
+    TestConsoleReaderThrowIsContained();
     TestB79SparklineOpsBoundedByDataNotWidth();
     TestB113PasteAcceptsUnicodeButStillStripsControls();
     TestB115UndoRedoStacksStayBoundedUnderCycling();
@@ -33990,6 +35008,18 @@ int main() {
     TestB24SaveShowsRestartConfirm();
     TestB24AdapterDiagnosticLine();
     TestB24AdapterBindingSnapshot();
+    TestB97UiBindingCommandsPersist();
+    TestB98UiRuleCommandsReportPersistFailure();
+    TestB103LeasePersistVerdictSurface();
+    TestB115RulesPersistFailureSurface();
+    TestB118RulesDiscardedSurface();
+    TestB119DroppedLeasesSurface();
+    TestB120CorruptLeasesSurface();
+    TestB121ParseRejectsSurface();
+    TestB124NativeUiCommandsAreAudited();
+    TestB125LifecycleCommandsAreAudited();
+    TestB126ConsoleDroppedSurface();
+    TestB104Dhcp6PoolExhaustionSurface();
     TestB24AdapterWarningBanner();
     TestB24AdapterPicker();
     // batch26 (2026-10-20): friendly interaction fixes.

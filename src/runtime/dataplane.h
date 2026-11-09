@@ -26,7 +26,9 @@
 
 #include <array>
 #include <atomic>
+#include <chrono>
 #include <cstddef>
+#include <functional>
 #include <memory>
 #include <string>
 #include <vector>
@@ -62,6 +64,19 @@ namespace vgww {
             /// Test seam: injects an in-memory driver client BEFORE Start().
             /// Production leaves this unset - Start() opens NdisrdClient.
             void SetDriverClient(std::unique_ptr<driver::IDriverClient> client);
+
+            /// Test seam: runs `probe` at the top of every upstream dial
+            /// completion, so a test can make that one body throw and prove
+            /// the exception costs THAT dial (RST) instead of escaping into
+            /// the worker thread boundary and taking the whole data plane
+            /// down. Production leaves it null. Call BEFORE Start().
+            void SetDialCompletionProbeForTest(std::function<void()> probe);
+
+            /// batch99 test seam: shorten the periodic lease-snapshot cadence
+            /// (production default 60 s). Both DHCPv4 and DHCPv6 ride it.
+            /// Values below 1 ms are clamped to 1 ms.
+            void SetLeaseDumpIntervalForTest(std::chrono::milliseconds interval);
+
 
             // ------------------------------------------------------------------
             // L2 bridge (S3-Task3). Temporary wiring: Task 4 binds these to
@@ -197,6 +212,10 @@ namespace vgww {
                 std::atomic<uint64_t> rate_limited{0};     ///< dropped by rate cap
                 std::atomic<uint64_t> rx_vlan_frames{0};   ///< tagged frames accepted (tag stripped)
                 std::atomic<uint64_t> thread_errors{0};    ///< escaped thread exceptions
+                /// Completion bodies that threw and were swallowed at their
+                /// own boundary (one dial/connection lost, the thread lives).
+                /// Distinct from thread_errors: these never reached a thread.
+                std::atomic<uint64_t> handler_errors{0};
                 std::atomic<uint64_t> icmp_tag_exhausted{0}; ///< relay tag pool full
                 std::atomic<uint64_t> tx_vlan_frames{0};   ///< downlink frames re-tagged
                 std::atomic<uint64_t> portmap_send_dropped{0}; ///< WAN->LAN queue over its hard cap (C5)
@@ -319,6 +338,14 @@ namespace vgww {
                 uint64_t dial_failed = 0;
                 uint64_t accept_errors = 0;
                 uint64_t bind_failed = 0;
+                /// Firewall counters: swallowed completion/iteration/re-arm
+                /// failures. Non-zero means forwarding work was lost while
+                /// the process survived - the WebUI surfaces these so the
+                /// loss is never silent.
+                uint64_t handler_errors = 0;
+                uint64_t loop_errors = 0;
+                uint64_t rearm_errors = 0;
+                uint64_t escaped_handler_errors = 0;
                 /// Ports that failed to bind (newest last, capped).
                 std::vector<uint16_t> failed_ports;
             };
@@ -332,6 +359,37 @@ namespace vgww {
             /// survive a restart. 0 when no server is assembled.
             uint64_t DhcpPoolExhaustedCount() const noexcept;
             uint64_t DhcpPersistFailureCount() const noexcept;
+            /// batch119: cumulative lease entries dropped at load (malformed /
+            /// expired / outside LAN / reserved / duplicate address). 0 when
+            /// no v4 server is assembled.
+            uint64_t DhcpDroppedLeaseCount() const noexcept;
+            /// batch120: v4 lease document was corrupt and preserved aside;
+            /// the persisted mappings did not survive.
+            bool DhcpLeaseFileCorrupt() const noexcept;
+            /// batch121: cumulative DHCPv4 frames refused by strict parse
+            /// validation (global, independent of server assembly).
+            uint64_t DhcpParseRejectedCount() const noexcept;
+            /// batch122: DHCPv6 sibling of DhcpParseRejectedCount.
+            uint64_t Dhcp6ParseRejectedCount() const noexcept;
+            /// batch100: true when the last Stop() finished teardown but could
+            /// not write a lease document (v4 and/or v6). Stop() still returns
+            /// true - the plane did stop - but the mappings it owned are lost,
+            /// and this flag survives the server teardown for the operator.
+            bool StopPersistFailed() const noexcept;
+            /// batch100: v6 sibling of DhcpPersistFailureCount (status surface).
+            uint64_t Dhcp6PersistFailureCount() const noexcept;
+            /// batch104: v6 sibling of DhcpPoolExhaustedCount - a Solicit
+            /// found no free pool address. 0 when no v6 server is assembled.
+            uint64_t Dhcp6PoolExhaustedCount() const noexcept;
+            /// batch119: v6 sibling of DhcpDroppedLeaseCount.
+            uint64_t Dhcp6DroppedLeaseCount() const noexcept;
+            /// batch120: v6 sibling of DhcpLeaseFileCorrupt.
+            bool Dhcp6LeaseFileCorrupt() const noexcept;
+            /// batch86: lease-file persistence is paused because the file
+            /// could not be read (a transient lock must not be answered by
+            /// overwriting the possibly-valid document). False when no server
+            /// is assembled.
+            bool DhcpPersistBlocked() const noexcept;
             /// batch34j: times the DHCPv4 anti-storm rate map was cleared
             /// wholesale (protection lost for every client, briefly).
             uint64_t DhcpRateLimitResets() const noexcept;
@@ -413,6 +471,9 @@ namespace vgww {
 
             /// Number of active v6 leases (0 when not assembled).
             size_t Dhcp6LeaseCount() const noexcept;
+
+            /// batch86: see DhcpPersistBlocked (v6 lease file).
+            bool Dhcp6PersistBlocked() const noexcept;
 
             /// batch127: O(1) count of v6 static bindings (0 when not
             /// assembled). The status surface needs only the size, so it must

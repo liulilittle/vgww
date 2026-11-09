@@ -34,8 +34,10 @@ namespace vgww {
               hooks_(std::move(hooks)) {}
 
         void TcpRelay::Start() {
-            PumpFlowToSocket();
-            PumpSocketToFlow();
+            if (!RunCompletion([this] { PumpFlowToSocket(); })) {
+                return;  // the read pump could not be armed: relay torn down
+            }
+            RunCompletion([this] { PumpSocketToFlow(); });
         }
 
         void TcpRelay::PumpFlowToSocket() {
@@ -44,21 +46,25 @@ namespace vgww {
             const xtcp::mimt::Result r = flow_->AsyncRead(
                 down_buf_.data(), static_cast<UInt32>(down_buf_.size()),
                 [self](xtcp::mimt::Result ec, UInt32 n) {
-                    if (xtcp::mimt::Result::kOk != ec || 0 == n) {
-                        // Client side closed/reset - nothing to FIN.
-                        self->Finish(false);
-                        return;
-                    }
-                    asio::async_write(
-                        self->socket_,
-                        asio::buffer(self->down_buf_.data(), n),
-                        [self](const std::error_code& err, size_t) {
-                            if (err) {
-                                self->Finish(IsEof(err));
-                                return;
-                            }
-                            self->PumpFlowToSocket();
-                        });
+                    self->RunCompletion([&] {
+                        if (xtcp::mimt::Result::kOk != ec || 0 == n) {
+                            // Client side closed/reset - nothing to FIN.
+                            self->Finish(false);
+                            return;
+                        }
+                        asio::async_write(
+                            self->socket_,
+                            asio::buffer(self->down_buf_.data(), n),
+                            [self](const std::error_code& err, size_t) {
+                                self->RunCompletion([&] {
+                                    if (err) {
+                                        self->Finish(IsEof(err));
+                                        return;
+                                    }
+                                    self->PumpFlowToSocket();
+                                });
+                            });
+                    });
                 });
             if (xtcp::mimt::Result::kOk != r) {
                 // Synchronous refusal: no completion was queued, so without
@@ -72,13 +78,15 @@ namespace vgww {
             socket_.async_read_some(
                 asio::buffer(up_buf_.data(), up_buf_.size()),
                 [self](const std::error_code& err, size_t n) {
-                    if (err) {
-                        // Upstream EOF is a clean end: the owner must CLOSE
-                        // (FIN) the client connection, not RST it.
-                        self->Finish(IsEof(err));
-                        return;
-                    }
-                    self->WriteToFlow(static_cast<UInt32>(n));
+                    self->RunCompletion([&] {
+                        if (err) {
+                            // Upstream EOF is a clean end: the owner must CLOSE
+                            // (FIN) the client connection, not RST it.
+                            self->Finish(IsEof(err));
+                            return;
+                        }
+                        self->WriteToFlow(static_cast<UInt32>(n));
+                    });
                 });
         }
 
@@ -88,32 +96,34 @@ namespace vgww {
             const xtcp::mimt::Result r = flow_->AsyncWrite(
                 up_buf_.data(), len,
                 [self](xtcp::mimt::Result ec, UInt32) {
-                    if (xtcp::mimt::Result::kWouldBlock == ec) {
-                        // Sink window full (client reading slowly): transient.
-                        // Hold the chunk for retry and keep the socket read
-                        // PAUSED so a new arrival cannot overwrite the
-                        // buffer underneath the bytes we still owe the flow.
-                        self->retry_pending_ = true;
-                        self->RetryPendingWrite();
-                        return;
-                    }
-                    if (xtcp::mimt::Result::kOk != ec) {
-                        self->Finish(false);  // client side gone
-                        return;
-                    }
-                    // This write drained. If an earlier chunk is still held
-                    // for retry (the flow was full when it arrived), reissue
-                    // it NOW that the queue has slack - the socket read has
-                    // stayed paused, so up_buf_ still holds those bytes.
-                    // Waiting out the 20 ms backoff would risk a new read
-                    // overwriting the buffer and losing the chunk, then
-                    // duplicating the newer bytes in its place.
-                    if (self->retry_pending_) {
-                        self->retry_pending_ = false;
-                        self->WriteToFlow(self->pending_up_len_);
-                    } else {
-                        self->PumpSocketToFlow();
-                    }
+                    self->RunCompletion([&] {
+                        if (xtcp::mimt::Result::kWouldBlock == ec) {
+                            // Sink window full (client reading slowly): transient.
+                            // Hold the chunk for retry and keep the socket read
+                            // PAUSED so a new arrival cannot overwrite the
+                            // buffer underneath the bytes we still owe the flow.
+                            self->retry_pending_ = true;
+                            self->RetryPendingWrite();
+                            return;
+                        }
+                        if (xtcp::mimt::Result::kOk != ec) {
+                            self->Finish(false);  // client side gone
+                            return;
+                        }
+                        // This write drained. If an earlier chunk is still held
+                        // for retry (the flow was full when it arrived), reissue
+                        // it NOW that the queue has slack - the socket read has
+                        // stayed paused, so up_buf_ still holds those bytes.
+                        // Waiting out the 20 ms backoff would risk a new read
+                        // overwriting the buffer and losing the chunk, then
+                        // duplicating the newer bytes in its place.
+                        if (self->retry_pending_) {
+                            self->retry_pending_ = false;
+                            self->WriteToFlow(self->pending_up_len_);
+                        } else {
+                            self->PumpSocketToFlow();
+                        }
+                    });
                 });
             if (xtcp::mimt::Result::kOk != r) {
                 if (xtcp::mimt::Result::kInFlight == r) {
@@ -133,13 +143,15 @@ namespace vgww {
             write_retry_timer_.expires_after(std::chrono::milliseconds(20));
             write_retry_timer_.async_wait(
                 [this, self](const std::error_code& err) {
-                    // The kOk-drain path may already have reissued the held
-                    // chunk; only retry while it is still outstanding and
-                    // never reissue twice.
-                    if (!err && !finished_ && retry_pending_) {
-                        retry_pending_ = false;
-                        WriteToFlow(pending_up_len_);
-                    }
+                    self->RunCompletion([&] {
+                        // The kOk-drain path may already have reissued the held
+                        // chunk; only retry while it is still outstanding and
+                        // never reissue twice.
+                        if (!err && !self->finished_ && self->retry_pending_) {
+                            self->retry_pending_ = false;
+                            self->WriteToFlow(self->pending_up_len_);
+                        }
+                    });
                 });
         }
 

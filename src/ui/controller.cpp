@@ -7,6 +7,7 @@
 
 #include "ui/controller.h"
 
+#include "ui/console_log.h"
 #include "ui/i18n.h"
 #include "ui/pages/page_util.h"  // batch31 P0-1: the ONE UTF-8 Widen
 
@@ -59,6 +60,23 @@ namespace vgww {
                 result.ok = false;
                 result.message = std::move(message);
                 return result;
+            }
+
+            /// batch98: a rule-store change that could not reach disk must not
+            /// be toasted as a plain success (the HTTP routes already report
+            /// persisted:false; the native UI was still claiming "added").
+            /// RuleStore::FlushPersist runs inside the mutation, so this
+            /// verdict is current. The change is live in memory either way.
+            CommandResult OkIfRulesPersisted(Str key) {
+                const I18n& i18n = I18n::Instance();
+                if (!web::RuleStore::Instance().PersistUpToDate()) {
+                    return Fail(i18n.FormatCopy(
+                        Str::SaveWriteFailedFmt,
+                        {Widen("the rule file could not be written; the "
+                               "change is live but will be lost after a "
+                               "restart")}));
+                }
+                return Ok(i18n.Copy(key));
             }
 
             /// Full 8-group text or a compressed form; InetPtonW is the
@@ -149,7 +167,11 @@ namespace vgww {
                 if (!store.AddPortMap(std::move(rule))) {
                     return Fail(I18n::Instance().Copy(Str::CmdWanPortTaken));
                 }
-                return Ok(I18n::Instance().Copy(Str::CmdPortmapAdded));
+                console_log::AppendAuditLine(
+                    "portmap add " + cmd.proto + ":" +
+                    std::to_string(cmd.wan_port) + " -> " + cmd.lan_ip +
+                    ":" + std::to_string(cmd.lan_port));
+                return OkIfRulesPersisted(Str::CmdPortmapAdded);
             }
 
             CommandResult DoRemovePortMap(const RemovePortMapCmd& cmd) {
@@ -162,18 +184,40 @@ namespace vgww {
                 // cannot fix a stale index.
                 web::RuleStore& store = web::RuleStore::Instance();
                 if (0 != cmd.id) {
-                    if (!store.RemovePortMapById(cmd.id)) {
+                    // P82: a removal refused because the tombstone store is
+                    // full is a persistence failure, not a missing rule - the
+                    // UI must not toast "out of range" for a rule that is
+                    // still in force.
+                    bool refused = false;
+                    if (!store.RemovePortMapById(cmd.id, refused)) {
+                        if (refused) {
+                            return Fail(I18n::Instance().FormatCopy(
+                                Str::SaveWriteFailedFmt,
+                                {Widen("the rule tombstone store is full; the "
+                                       "rule was not removed")}));
+                        }
                         return Fail(I18n::Instance().Copy(
                             Str::CmdIndexOutOfRange));
                     }
-                    return Ok(I18n::Instance().Copy(Str::CmdPortmapRemoved));
+                    console_log::AppendAuditLine("portmap delete id=" +
+                                                 std::to_string(cmd.id));
+                    return OkIfRulesPersisted(Str::CmdPortmapRemoved);
                 }
                 // batch89: range check and erase under ONE lock. Kept for
                 // callers that only have a position (tests, legacy commands).
-                if (!store.RemovePortMapChecked(cmd.index)) {
+                bool refused = false;
+                if (!store.RemovePortMapChecked(cmd.index, refused)) {
+                    if (refused) {
+                        return Fail(I18n::Instance().FormatCopy(
+                            Str::SaveWriteFailedFmt,
+                            {Widen("the rule tombstone store is full; the rule "
+                                   "was not removed")}));
+                    }
                     return Fail(I18n::Instance().Copy(Str::CmdIndexOutOfRange));
                 }
-                return Ok(I18n::Instance().Copy(Str::CmdPortmapRemoved));
+                console_log::AppendAuditLine("portmap delete index=" +
+                                             std::to_string(cmd.index));
+                return OkIfRulesPersisted(Str::CmdPortmapRemoved);
             }
 
             CommandResult DoAddBan(const AddBanCmd& cmd) {
@@ -201,24 +245,46 @@ namespace vgww {
                 if (!store.AddBanChecked(std::move(ban))) {
                     return Fail(I18n::Instance().Copy(Str::CmdBanLimit));
                 }
-                return Ok(I18n::Instance().Copy(Str::CmdBanAdded));
+                console_log::AppendAuditLine("ban add " + cmd.kind + " " +
+                                             cmd.value);
+                return OkIfRulesPersisted(Str::CmdBanAdded);
             }
 
             CommandResult DoRemoveBan(const RemoveBanCmd& cmd) {
                 // batch138: id first, positional index only as a legacy path.
                 web::RuleStore& store = web::RuleStore::Instance();
                 if (0 != cmd.id) {
-                    if (!store.RemoveBanById(cmd.id)) {
+                    // P82: tombstone-full is a persistence failure (see
+                    // DoRemovePortMap).
+                    bool refused = false;
+                    if (!store.RemoveBanById(cmd.id, refused)) {
+                        if (refused) {
+                            return Fail(I18n::Instance().FormatCopy(
+                                Str::SaveWriteFailedFmt,
+                                {Widen("the rule tombstone store is full; the "
+                                       "ban was not removed")}));
+                        }
                         return Fail(I18n::Instance().Copy(
                             Str::CmdIndexOutOfRange));
                     }
-                    return Ok(I18n::Instance().Copy(Str::CmdBanRemoved));
+                    console_log::AppendAuditLine("ban delete id=" +
+                                                 std::to_string(cmd.id));
+                    return OkIfRulesPersisted(Str::CmdBanRemoved);
                 }
                 // batch89: same one-lock shape as the port-map path above.
-                if (!store.RemoveBanChecked(cmd.index)) {
+                bool refused = false;
+                if (!store.RemoveBanChecked(cmd.index, refused)) {
+                    if (refused) {
+                        return Fail(I18n::Instance().FormatCopy(
+                            Str::SaveWriteFailedFmt,
+                            {Widen("the rule tombstone store is full; the ban "
+                                   "was not removed")}));
+                    }
                     return Fail(I18n::Instance().Copy(Str::CmdIndexOutOfRange));
                 }
-                return Ok(I18n::Instance().Copy(Str::CmdBanRemoved));
+                console_log::AppendAuditLine("ban delete index=" +
+                                             std::to_string(cmd.index));
+                return OkIfRulesPersisted(Str::CmdBanRemoved);
             }
 
             CommandResult DoSetRateLimit(const SetRateLimitCmd& cmd) {
@@ -242,7 +308,12 @@ namespace vgww {
                             cmd.replace_mac, std::move(rule))) {
                         return Fail(I18n::Instance().Copy(Str::CmdRateLimitLimit));
                     }
-                    return Ok(I18n::Instance().Copy(Str::CmdRateLimitUpdated));
+                    console_log::AppendAuditLine(
+                        "ratelimit set " + cmd.mac + " up=" +
+                        std::to_string(cmd.up_kbps) + " down=" +
+                        std::to_string(cmd.down_kbps) + " replace=" +
+                        cmd.replace_mac);
+                    return OkIfRulesPersisted(Str::CmdRateLimitUpdated);
                 }
                 // batch89: upsert + cap under ONE lock (see SetRateLimitChecked).
                 // The old path scanned RateLimits() out here to guess whether
@@ -252,17 +323,91 @@ namespace vgww {
                         std::move(rule))) {
                     return Fail(I18n::Instance().Copy(Str::CmdRateLimitLimit));
                 }
-                return Ok(I18n::Instance().Copy(Str::CmdRateLimitUpdated));
+                console_log::AppendAuditLine(
+                    "ratelimit set " + cmd.mac + " up=" +
+                    std::to_string(cmd.up_kbps) + " down=" +
+                    std::to_string(cmd.down_kbps));
+                return OkIfRulesPersisted(Str::CmdRateLimitUpdated);
             }
 
             CommandResult DoRemoveRateLimit(const RemoveRateLimitCmd& cmd) {
                 if (!web::RuleStore::Instance().RemoveRateLimit(cmd.mac)) {
                     return Fail(I18n::Instance().Copy(Str::CmdRateLimitMissing));
                 }
-                return Ok(I18n::Instance().Copy(Str::CmdRateLimitRemoved));
+                console_log::AppendAuditLine("ratelimit delete " + cmd.mac);
+                return OkIfRulesPersisted(Str::CmdRateLimitRemoved);
+            }
+
+            /// batch97: mirror a binding command into the config document, so
+            /// a restart keeps what the page shows (the HTTP routes persist
+            /// through the same core helpers). An empty path means "no
+            /// document configured" and is a no-op, not a failure.
+            bool PersistBindV4(const std::string& config_path,
+                               const std::string& mac_text,
+                               const std::string& ip_text,
+                               const std::string& hostname,
+                               const std::string& replace_mac,
+                               std::string& error) {
+                if (config_path.empty()) {
+                    return true;
+                }
+                vgww::core::MacAddress mac{};
+                if (!vgww::core::ParseMac(mac_text, mac)) {
+                    error = "invalid mac";
+                    return false;
+                }
+                if (!replace_mac.empty()) {
+                    vgww::core::MacAddress old{};
+                    if (vgww::core::ParseMac(replace_mac, old)) {
+                        std::string ignored;
+                        (void)vgww::core::DeleteDhcpBinding(config_path, old,
+                                                            ignored);
+                    }
+                }
+                bool parsed = false;
+                const uint32_t ip = vgww::core::ParseIpv4(ip_text, parsed);
+                if (!parsed) {
+                    error = "invalid ip";
+                    return false;
+                }
+                return vgww::core::UpsertDhcpBinding(config_path, mac, ip,
+                                                     hostname, error);
+            }
+
+            bool PersistBindV6(const std::string& config_path,
+                               const std::string& duid_text,
+                               const std::string& ip_text,
+                               const std::string& hostname,
+                               const std::string& replace_duid,
+                               std::string& error) {
+                if (config_path.empty()) {
+                    return true;
+                }
+                std::vector<uint8_t> duid;
+                if (!runtime::ParseDuidText(duid_text, duid) || duid.empty()) {
+                    error = "invalid duid";
+                    return false;
+                }
+                if (!replace_duid.empty()) {
+                    std::vector<uint8_t> old;
+                    if (runtime::ParseDuidText(replace_duid, old) &&
+                        !old.empty()) {
+                        std::string ignored;
+                        (void)vgww::core::DeleteDhcp6Binding(config_path, old,
+                                                             ignored);
+                    }
+                }
+                std::array<uint8_t, 16> ip{};
+                if (!vgww::core::ParseIpv6(ip_text, ip)) {
+                    error = "invalid ipv6";
+                    return false;
+                }
+                return vgww::core::UpsertDhcp6Binding(config_path, duid, ip,
+                                                      hostname, error);
             }
 
             CommandResult DoAddDhcpBinding(runtime::Dataplane& dataplane,
+                                           const std::string& config_path,
                                            const AddDhcpBindingCmd& cmd) {
                 vgww::core::MacAddress mac{};
                 if (!vgww::core::ParseMac(cmd.mac, mac)) {
@@ -286,11 +431,22 @@ namespace vgww {
                 if (!applied) {
                     return Fail(I18n::Instance().Copy(Str::CmdDhcpBindingRejected));
                 }
+                // batch97: the runtime change is live; also keep it across a
+                // restart (P43 parity with the HTTP route).
+                std::string persist_error;
+                if (!PersistBindV4(config_path, cmd.mac, cmd.ip, cmd.hostname,
+                                   cmd.replace_mac, persist_error)) {
+                    return Fail(I18n::Instance().FormatCopy(
+                        Str::SaveWriteFailedFmt, {Widen(persist_error)}));
+                }
+                console_log::AppendAuditLine("dhcp binding add " + cmd.mac +
+                                             " -> " + cmd.ip);
                 return Ok(I18n::Instance().Copy(Str::CmdDhcpBindingAdded));
             }
 
-            CommandResult DoRemoveDhcpBinding(runtime::Dataplane& dataplane,
-                                              const RemoveDhcpBindingCmd& cmd) {
+            CommandResult DoRemoveDhcpBinding(
+                runtime::Dataplane& dataplane, const std::string& config_path,
+                const RemoveDhcpBindingCmd& cmd) {
                 vgww::core::MacAddress mac{};
                 if (!vgww::core::ParseMac(cmd.mac, mac)) {
                     return Fail(I18n::Instance().Copy(Str::CmdMacInvalid));
@@ -301,10 +457,21 @@ namespace vgww {
                 if (!dataplane.RemoveDhcpBinding(cmd.mac)) {
                     return Fail(I18n::Instance().Copy(Str::CmdDhcpBindingMissing));
                 }
+                // batch97: drop the persisted row too (delete of an absent row
+                // still succeeds: the requested state holds).
+                std::string persist_error;
+                if (!config_path.empty() &&
+                    !vgww::core::DeleteDhcpBinding(config_path, mac,
+                                                   persist_error)) {
+                    return Fail(I18n::Instance().FormatCopy(
+                        Str::SaveWriteFailedFmt, {Widen(persist_error)}));
+                }
+                console_log::AppendAuditLine("dhcp binding delete " + cmd.mac);
                 return Ok(I18n::Instance().Copy(Str::CmdDhcpBindingRemoved));
             }
 
             CommandResult DoAddDhcp6Binding(runtime::Dataplane& dataplane,
+                                            const std::string& config_path,
                                             const AddDhcp6BindingCmd& cmd) {
                 if (cmd.duid.empty()) {
                     return Fail(I18n::Instance().Copy(Str::CmdDuidEmpty));
@@ -323,11 +490,20 @@ namespace vgww {
                 if (!applied) {
                     return Fail(I18n::Instance().Copy(Str::CmdDhcp6BindingRejected));
                 }
+                // batch97: persist the v6 row as well.
+                std::string persist_error;
+                if (!PersistBindV6(config_path, cmd.duid, cmd.ip, cmd.hostname,
+                                   cmd.replace_duid, persist_error)) {
+                    return Fail(I18n::Instance().FormatCopy(
+                        Str::SaveWriteFailedFmt, {Widen(persist_error)}));
+                }
+                console_log::AppendAuditLine("dhcp6 binding add " + cmd.duid +
+                                             " -> " + cmd.ip);
                 return Ok(I18n::Instance().Copy(Str::CmdDhcpBindingAdded));
             }
 
             CommandResult DoRemoveDhcp6Binding(
-                runtime::Dataplane& dataplane,
+                runtime::Dataplane& dataplane, const std::string& config_path,
                 const RemoveDhcp6BindingCmd& cmd) {
                 if (cmd.duid.empty()) {
                     return Fail(I18n::Instance().Copy(Str::CmdDuidEmpty));
@@ -338,6 +514,19 @@ namespace vgww {
                 if (!dataplane.RemoveDhcp6Binding(cmd.duid)) {
                     return Fail(I18n::Instance().Copy(Str::CmdDhcp6BindingMissing));
                 }
+                // batch97: drop the persisted v6 row too.
+                std::string persist_error;
+                if (!config_path.empty()) {
+                    std::vector<uint8_t> duid;
+                    if (runtime::ParseDuidText(cmd.duid, duid) && !duid.empty() &&
+                        !vgww::core::DeleteDhcp6Binding(config_path, duid,
+                                                        persist_error)) {
+                        return Fail(I18n::Instance().FormatCopy(
+                            Str::SaveWriteFailedFmt, {Widen(persist_error)}));
+                    }
+                }
+                console_log::AppendAuditLine("dhcp6 binding delete " +
+                                             cmd.duid);
                 return Ok(I18n::Instance().Copy(Str::CmdDhcpBindingRemoved));
             }
 
@@ -359,7 +548,8 @@ namespace vgww {
                 if (config_path.empty()) {
                     return Fail(i18n.Copy(Str::SaveNoConfigPath));
                 }
-                if (!cmd.config.SaveToFile(config_path, error)) {
+                if (!cmd.config.SaveToFilePreservingBindings(config_path,
+                                                             error)) {
                     return Fail(i18n.FormatCopy(Str::SaveWriteFailedFmt,
                                             {Widen(error)}));
                 }
@@ -370,8 +560,10 @@ namespace vgww {
                                         ? i18n.Copy(Str::SaveAppliedNoLive)
                                         : live_error);
                     }
+                    console_log::AppendAuditLine("config saved (applied)");
                     return Ok(i18n.Copy(Str::SaveApplied));
                 }
+                console_log::AppendAuditLine("config saved (applies on restart)");
                 return Ok(i18n.Copy(Str::SaveAppliedRestart));
             }
 
@@ -404,7 +596,13 @@ namespace vgww {
                 if (!hook) {
                     return Fail(I18n::Instance().Copy(Str::CmdAutostartUnwired));
                 }
-                return hook(cmd);
+                const CommandResult result = hook(cmd);
+                if (result.ok) {
+                    console_log::AppendAuditLine(
+                        std::string("autostart set ") +
+                        (cmd.enabled ? "1" : "0"));
+                }
+                return result;
             }
 
             // batch25a: dashboard one-click lifecycle. Stop() is a clean,
@@ -419,6 +617,7 @@ namespace vgww {
                 if (!dataplane.Start(error)) {
                     return Fail(Widen(error));
                 }
+                console_log::AppendAuditLine("service started");
                 return Ok(I18n::Instance().Copy(Str::CmdServiceStarted));
             }
 
@@ -430,6 +629,7 @@ namespace vgww {
                 if (!dataplane.Stop(error)) {
                     return Fail(Widen(error));
                 }
+                console_log::AppendAuditLine("service stopped");
                 return Ok(I18n::Instance().Copy(Str::CmdServiceStopped));
             }
 
@@ -444,6 +644,7 @@ namespace vgww {
                 if (!dataplane.Start(error)) {
                     return Fail(Widen(error));
                 }
+                console_log::AppendAuditLine("service rechecked");
                 return Ok(I18n::Instance().Copy(Str::CmdServiceRechecked));
             }
 
@@ -588,8 +789,32 @@ namespace vgww {
                 dataplane_.DhcpPoolExhaustedCount();
             snapshot->dhcp_persist_failures =
                 dataplane_.DhcpPersistFailureCount();
+            // batch103: v6 snapshot failures and a dirty LAST stop have no
+            // live counter to read (the server is torn down), so carry the
+            // combined verdict for the leases page.
+            snapshot->lease_persist_failed =
+                dataplane_.StopPersistFailed() ||
+                dataplane_.Dhcp6PersistFailureCount() > 0;
+            snapshot->dhcp6_pool_exhausted = dataplane_.Dhcp6PoolExhaustedCount();
+            snapshot->dhcp_leases_dropped = dataplane_.DhcpDroppedLeaseCount();
+            snapshot->dhcp6_leases_dropped =
+                dataplane_.Dhcp6DroppedLeaseCount();
+            snapshot->dhcp_leases_corrupt = dataplane_.DhcpLeaseFileCorrupt();
+            snapshot->dhcp6_leases_corrupt =
+                dataplane_.Dhcp6LeaseFileCorrupt();
+            snapshot->dhcp_parse_rejected = dataplane_.DhcpParseRejectedCount();
+            snapshot->dhcp6_parse_rejected =
+                dataplane_.Dhcp6ParseRejectedCount();
+            snapshot->console_dropped = console_log::DroppedLineCount();
             LoadCounters(dataplane_.GetStats(), snapshot->counters);
             snapshot->rules_rev = web::RuleStore::Instance().Rev();
+            // batch115: rule write failures used to be stderr-only; carry the
+            // counter so the firewall page can warn before a restart loses
+            // in-memory changes.
+            snapshot->rules_persist_failures =
+                web::RuleStore::Instance().PersistFailureCount();
+            snapshot->rules_discarded =
+                web::RuleStore::Instance().DiscardedOnLastLoad();
             snapshot->throughput = dataplane_.ThroughputBps();
             snapshot->system = dataplane_.GetSystem();
             snapshot->clients = dataplane_.ClientRates();
@@ -650,16 +875,20 @@ namespace vgww {
                     } else if constexpr (std::is_same_v<T, RemoveRateLimitCmd>) {
                         return DoRemoveRateLimit(concrete);
                     } else if constexpr (std::is_same_v<T, AddDhcpBindingCmd>) {
-                        return DoAddDhcpBinding(dataplane_, concrete);
+                        return DoAddDhcpBinding(dataplane_, config_path_,
+                                                concrete);
                     } else if constexpr (std::is_same_v<T,
                                                         RemoveDhcpBindingCmd>) {
-                        return DoRemoveDhcpBinding(dataplane_, concrete);
+                        return DoRemoveDhcpBinding(dataplane_, config_path_,
+                                                   concrete);
                     } else if constexpr (std::is_same_v<T,
                                                         AddDhcp6BindingCmd>) {
-                        return DoAddDhcp6Binding(dataplane_, concrete);
+                        return DoAddDhcp6Binding(dataplane_, config_path_,
+                                                 concrete);
                     } else if constexpr (std::is_same_v<
                                              T, RemoveDhcp6BindingCmd>) {
-                        return DoRemoveDhcp6Binding(dataplane_, concrete);
+                        return DoRemoveDhcp6Binding(dataplane_, config_path_,
+                                                    concrete);
                     } else if constexpr (std::is_same_v<T, SaveConfigCmd>) {
                         auto result = DoSaveConfig(config_path_, concrete,
                                                    apply_live_);
