@@ -2365,12 +2365,17 @@ namespace vgww {
             if (wpath.empty() || waside.empty()) {
                 return false;
             }
-            // MoveFileExW refuses to move a directory, so a directory at the
-            // destination simply keeps failing for the caller instead of being
-            // silently renamed aside (proven by removing a belt-and-braces
-            // FILE_ATTRIBUTE_DIRECTORY check: no test changed outcome). POSIX
-            // rename WOULD move a directory, hence the is_regular_file gate in
-            // that branch.
+            // MoveFileExW refuses to move a directory on the platforms this
+            // gate was validated on, but not everywhere (a newer Windows
+            // accepts it). Moving an operator's directory aside would take its
+            // other contents with it, and the established contract is that a
+            // directory at the document path is a PERMANENT write failure (the
+            // mutation must report persisted:false), so refuse explicitly.
+            const DWORD attrs = ::GetFileAttributesW(wpath.c_str());
+            if (INVALID_FILE_ATTRIBUTES == attrs ||
+                0 != (attrs & FILE_ATTRIBUTE_DIRECTORY)) {
+                return false;
+            }
             // Replace the previous aside copy: the latest unreadable file is
             // the one worth keeping, and the pile must stay bounded to one.
             ::DeleteFileW(waside.c_str());
