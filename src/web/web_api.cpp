@@ -693,10 +693,10 @@ namespace vgww {
             // interleave its own read-modify-write; WriteFileAtomicDurable
             // takes the same named mutex again, which is recursive for the
             // same thread (batch95/106 - no new core variant).
-            // PROBE M3: outer lock removed
-            {
-                core::ConfigFileLock file_lock(path, false);
-                (void)file_lock;
+            core::ConfigFileLock file_lock(path);
+            if (!file_lock.locked()) {
+                persist_failures_.fetch_add(1, std::memory_order_relaxed);
+                return;
             }
             for (;;) {
                 auto snapshot = std::atomic_load(&pending_snapshot_);
