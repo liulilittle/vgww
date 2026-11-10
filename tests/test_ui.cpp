@@ -31997,6 +31997,76 @@ static void TestB127LanguageSwitchIsAudited() {
     std::remove(cfg_path.c_str());
 }
 
+// P109: a language switch that fails (no config path, unreadable config,
+// write error) used to leave no audit line - only the toast. The ring is the
+// operator's durable record, so a refused preference change must land there.
+static void TestP109LanguageFailureIsAudited() {
+    using namespace vgww::ui;
+    FixTextMetrics();
+    console_log::ClearForTest();
+
+    vgww::core::Config cfg;
+    cfg.adapter = "Ethernet";
+    cfg.mode = vgww::core::Mode::kMain;
+    bool parsed = false;
+    cfg.gateway.ipv4 = vgww::core::ParseIpv4("192.168.58.1", parsed);
+    cfg.gateway.mask = vgww::core::ParseIpv4("255.255.255.0", parsed);
+    cfg.gateway.mac = {0x30, 0xFC, 0x68, 0x88, 0xB4, 0xA7};
+    vgww::runtime::Dataplane dataplane(cfg);
+
+    const auto saw = [](const std::wstring& needle) {
+        for (const auto& line : console_log::Snapshot()) {
+            if (line.find(L"[audit]") != std::wstring::npos &&
+                line.find(needle) != std::wstring::npos) {
+                return true;
+            }
+        }
+        return false;
+    };
+
+    // Empty config path: refused before any write.
+    console_log::ClearForTest();
+    DataplaneCommandExecutor no_path(dataplane, "");
+    const CommandResult no_path_result =
+        no_path.Execute(Command{SetLanguageCmd{"en"}});
+    CHECK(!no_path_result.ok);
+    CHECK(saw(L"language set en failed (no config path)"));
+
+    // A directory at the config path makes LoadFromFile fail.
+    const std::string cfg_path = "test_ui_p109_lang.json";
+    std::error_code ec;
+    std::filesystem::remove(cfg_path, ec);
+    CHECK(std::filesystem::create_directory(cfg_path, ec));
+    console_log::ClearForTest();
+    DataplaneCommandExecutor bad_load(dataplane, cfg_path);
+    const CommandResult load_failed =
+        bad_load.Execute(Command{SetLanguageCmd{"en"}});
+    CHECK(!load_failed.ok);
+    CHECK(saw(L"language set en failed (load error)"));
+
+    // A write error: the config loads, the save cannot land. A directory at
+    // the path makes LoadFromFile fail first, so use a path whose parent is a
+    // file - the load fails too, but the SAVE branch is the one under test
+    // only when the document loads. Use a read-only file instead: it loads
+    // (read permission intact) and the atomic replace fails on write.
+    std::filesystem::remove_all(cfg_path, ec);
+    std::string err;
+    CHECK(cfg.SaveToFile(cfg_path, err));
+    // A read-only file loads but cannot be replaced (the atomic write opens a
+    // temp file next to it, then replaces the read-only destination).
+    ::SetFileAttributesA(cfg_path.c_str(), FILE_ATTRIBUTE_READONLY);
+    console_log::ClearForTest();
+    DataplaneCommandExecutor save_failed(dataplane, cfg_path);
+    const CommandResult write_failed =
+        save_failed.Execute(Command{SetLanguageCmd{"en"}});
+    ::SetFileAttributesA(cfg_path.c_str(), FILE_ATTRIBUTE_NORMAL);
+    CHECK(!write_failed.ok);
+    CHECK(saw(L"language set en failed (save error)"));
+
+    std::filesystem::remove_all(cfg_path, ec);
+    console_log::ClearForTest();
+}
+
 static void TestB124NativeUiCommandsAreAudited() {
     using namespace vgww::ui;
     FixTextMetrics();
@@ -35716,6 +35786,7 @@ int main() {
     TestB124NativeUiCommandsAreAudited();
     TestB125LifecycleCommandsAreAudited();
     TestB127LanguageSwitchIsAudited();
+    TestP109LanguageFailureIsAudited();
     TestB126ConsoleDroppedSurface();
     TestB104Dhcp6PoolExhaustionSurface();
     TestB24AdapterWarningBanner();

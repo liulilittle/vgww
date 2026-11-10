@@ -653,17 +653,26 @@ namespace vgww {
                 // language-save outcome is toasted, so it must be localized.
                 const I18n& i18n = I18n::Instance();
                 if (config_path.empty()) {
+                    console_log::AppendAuditLine(
+                        "language set " + cmd.code +
+                        " failed (no config path)");
                     return Fail(i18n.Copy(Str::SaveNoConfigPath));
                 }
                 std::string error;
                 std::optional<vgww::core::Config> config =
                     vgww::core::Config::LoadFromFile(config_path, error);
                 if (!config) {
+                    console_log::AppendAuditLine(
+                        "language set " + cmd.code +
+                        " failed (load error)");
                     return Fail(i18n.FormatCopy(Str::SaveWriteFailedFmt,
                                             {Widen(error)}));
                 }
                 config->ui_language = cmd.code;
                 if (!config->SaveToFile(config_path, error)) {
+                    console_log::AppendAuditLine(
+                        "language set " + cmd.code +
+                        " failed (save error)");
                     return Fail(i18n.FormatCopy(Str::SaveWriteFailedFmt,
                                             {Widen(error)}));
                 }
