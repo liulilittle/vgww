@@ -3925,15 +3925,16 @@ namespace vgww {
                                           }
                                           v6.push_back(std::move(entry));
                                       }
-                                      if (dropped > 0) {
-                                          return Response::Error(
-                                              409,
-                                              "binding cap reached: " +
-                                                  std::to_string(dropped) +
-                                                  " disk binding(s) not "
-                                                  "merged; remove entries on "
-                                                  "the bindings page");
-                                      }
+                                       if (dropped > 0) {
+                                           audit("config save refused (binding cap reached)");
+                                           return Response::Error(
+                                               409,
+                                               "binding cap reached: " +
+                                                   std::to_string(dropped) +
+                                                   " disk binding(s) not "
+                                                   "merged; remove entries on "
+                                                   "the bindings page");
+                                       }
                                       body = submitted.dump();
                                   }
                               }                              std::string write_error;
