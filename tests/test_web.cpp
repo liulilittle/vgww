@@ -2609,6 +2609,85 @@ static void TestP102WebBindingPersistFailureIsAudited() {
     std::filesystem::remove_all(path, ec);
     std::remove(lease_path);
 }
+
+// P104: a failed rule delete used to leave no audit line - only the HTTP
+// 404/500. The ring is the operator's durable record, so a refused or missing
+// delete must be visible there too.
+static void TestP104RuleDeleteFailureIsAudited() {
+    using namespace vgww::core;
+    const char* path = "p104-rules.json";
+    const std::string rules = std::string(path) + ".rules.json";
+    std::remove(path);
+    std::error_code ec;
+    std::filesystem::remove_all(rules, ec);
+    vgww::web::RuleStore::Instance().AttachFile(rules);
+    vgww::web::RuleStore::Instance().Clear();
+
+    Config cfg;
+    cfg.web.port = 18136;
+    cfg.web.token = "tok";
+    bool ok = false;
+    cfg.gateway.ipv4 = ParseIpv4("192.168.54.1", ok);
+    cfg.gateway.mask = ParseIpv4("255.255.255.0", ok);
+    MacAddress mac{};
+    ParseMac("30:fc:68:88:b4:a4", mac);
+    cfg.gateway.mac = mac;
+    std::string err;
+    CHECK(cfg.SaveToFile(path, err));
+
+    vgww::runtime::Dataplane dp(cfg);
+    HttpServer api;
+    std::vector<std::string> audit_lines;
+    vgww::web::RegisterApi(
+        api, dp, cfg, path, "tok", {}, [] { return true; },
+        [](bool) { return false; },
+        [&audit_lines](const std::string& line) {
+            audit_lines.push_back(line);
+        });
+    constexpr uint16_t kPort = 18136;
+    CHECK(api.Start("127.0.0.1", kPort, err));
+
+    std::string body;
+    // Deleting a rule that does not exist is a 404, not a silent success.
+    CHECK(HttpDeleteWithToken("/api/portmap?id=999999", kPort, "tok",
+                              body) == 404);
+    bool saw_portmap_failed = false;
+    for (const auto& line : audit_lines) {
+        if (line.find("portmap delete id=999999 failed") != std::string::npos) {
+            saw_portmap_failed = true;
+        }
+    }
+    CHECK(saw_portmap_failed);
+
+    audit_lines.clear();
+    CHECK(HttpDeleteWithToken("/api/bans?id=999999", kPort, "tok",
+                              body) == 404);
+    bool saw_ban_failed = false;
+    for (const auto& line : audit_lines) {
+        if (line.find("ban delete id=999999 failed") != std::string::npos) {
+            saw_ban_failed = true;
+        }
+    }
+    CHECK(saw_ban_failed);
+
+    audit_lines.clear();
+    CHECK(HttpDeleteWithToken("/api/ratelimit?mac=aa:bb:cc:dd:ee:ff",
+                              kPort, "tok", body) == 404);
+    bool saw_ratelimit_failed = false;
+    for (const auto& line : audit_lines) {
+        if (line.find("ratelimit delete") != std::string::npos &&
+            line.find("failed") != std::string::npos) {
+            saw_ratelimit_failed = true;
+        }
+    }
+    CHECK(saw_ratelimit_failed);
+
+    api.Stop();
+    vgww::web::RuleStore::Instance().AttachFile("");
+    vgww::web::RuleStore::Instance().Clear();
+    std::remove(path);
+    std::filesystem::remove_all(rules, ec);
+}
 //
 // A persisted rule file is the ONLY record of the operator's port forwards.
 // If loading it fails, the process must not silently behave as if the file
@@ -8812,6 +8891,7 @@ int main(int argc, char** argv) {
     TestP93AutostartAuditCarriesActualState();
     TestP95ConfigSaveFailureIsAudited();
     TestP102WebBindingPersistFailureIsAudited();
+    TestP104RuleDeleteFailureIsAudited();
     TestB126WebConsoleReportsDropped();
     TestB127StatusContractKeys();
     TestB113NoApplierDoesNotStampAttempt();

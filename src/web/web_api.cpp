@@ -3037,6 +3037,10 @@ namespace vgww {
                     // (404) - the caller must not read it as "already gone".
                     bool refused = false;
                     if (!store.RemovePortMapById(id, refused)) {
+                        audit(std::string("portmap delete id=") +
+                              std::to_string(id) +
+                              (refused ? " failed (tombstone store full)"
+                                       : " failed (no such id)"));
                         return Response::Error(
                             refused ? 500 : 404,
                             refused ? "rule tombstone store is full"
@@ -3139,6 +3143,10 @@ namespace vgww {
                     // P82: tombstone-full is a 500, not a 404.
                     bool refused = false;
                     if (!store.RemoveBanById(id, refused)) {
+                        audit(std::string("ban delete id=") +
+                              std::to_string(id) +
+                              (refused ? " failed (tombstone store full)"
+                                       : " failed (no such id)"));
                         return Response::Error(
                             refused ? 500 : 404,
                             refused ? "rule tombstone store is full"
@@ -3312,6 +3320,9 @@ namespace vgww {
                 // refused because the tombstone store is full is a 500.
                 bool refused = false;
                 if (!RuleStore::Instance().RemoveRateLimit(mac, refused)) {
+                    audit("ratelimit delete " + mac +
+                          (refused ? " failed (tombstone store full)"
+                                   : " failed (no such index)"));
                     return Response::Error(
                         refused ? 500 : 404,
                         refused ? "rule tombstone store is full"
