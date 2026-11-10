@@ -2514,7 +2514,7 @@ static void TestP102WebBindingPersistFailureIsAudited() {
     cfg.ipv6.dhcpv6.pool_start = {0xFD, 0x00, 0x11, 0x33, 0x44, 0x55,
     0x66, 0x77, 0, 0, 0, 0, 0, 0, 0x10, 0x00};
     cfg.ipv6.dhcpv6.pool_end = {0xFD, 0x00, 0x11, 0x33, 0x44, 0x55,
-    0x66, 0x77, 0, 0, 0, 0, 0, 0, 0x1F, 0xFF};
+        0x66, 0x77, 0, 0, 0, 0, 0, 0, 0x1F, 0xFF};
     cfg.perf.workers = 2;
     cfg.perf.ring_capacity = 64;
     cfg.perf.max_conns = 64;
@@ -2607,6 +2607,126 @@ static void TestP102WebBindingPersistFailureIsAudited() {
     std::string stop_error;
     CHECK(dp.Stop(stop_error));
     std::filesystem::remove_all(path, ec);
+    std::remove(lease_path);
+}
+
+// P107: the binding routes answered 404/409 without an audit line - only the
+// HTTP status. A refused or missing binding change is a privileged-change
+// outcome; the operator's durable record must carry it too.
+static void TestP107WebBindingRefusalIsAudited() {
+    using namespace vgww::core;
+    const char* path = "p107-binding.json";
+    const char* lease_path = "p107_leases.json";
+    std::remove(path);
+    std::remove(lease_path);
+    Config cfg;
+    cfg.adapter = "P107NIC";
+    cfg.mode = Mode::kMain;
+    cfg.dhcp.enabled = true;
+    cfg.web.port = 18138;
+    cfg.web.token = "tok";
+    bool ok = false;
+    cfg.gateway.ipv4 = ParseIpv4("192.168.53.1", ok);
+    cfg.gateway.mask = ParseIpv4("255.255.255.0", ok);
+    cfg.gateway.mac = {0x30, 0xFC, 0x68, 0x88, 0xB4, 0xA3};
+    cfg.dhcp.pool_start = ParseIpv4("192.168.53.100", ok);
+    cfg.dhcp.pool_end = ParseIpv4("192.168.53.200", ok);
+    cfg.dhcp.lease_seconds = 3600;
+    cfg.ipv6.enabled = true;
+    cfg.ipv6.prefix_len = 64;
+    cfg.ipv6.ula_prefix = {0xFD, 0x00, 0x11, 0x33, 0x44, 0x55, 0x66,
+    0x77, 0, 0, 0, 0, 0, 0, 0, 0};
+    cfg.ipv6.dhcpv6.enabled = true;
+    cfg.ipv6.dhcpv6.pool_start = {0xFD, 0x00, 0x11, 0x33, 0x44, 0x55,
+    0x66, 0x77, 0, 0, 0, 0, 0, 0, 0x10, 0x00};
+    cfg.ipv6.dhcpv6.pool_end = {0xFD, 0x00, 0x11, 0x33, 0x44, 0x55,
+        0x66, 0x77, 0, 0, 0, 0, 0, 0, 0x1F, 0xFF};
+    cfg.perf.workers = 2;
+    cfg.perf.ring_capacity = 64;
+    cfg.perf.max_conns = 64;
+    std::string err;
+    CHECK(cfg.SaveToFile(path, err));
+
+    vgww::runtime::Dataplane dp(cfg, lease_path);
+    dp.SetDriverClient(std::make_unique<WebFakeDriver>());
+    std::string start_error;
+    CHECK(dp.Start(start_error));
+    CHECK(dp.DhcpActive());
+    CHECK(dp.Dhcp6Active());
+
+    HttpServer api;
+    std::vector<std::string> audit_lines;
+    vgww::web::RegisterApi(
+        api, dp, cfg, path, "tok", {}, [] { return true; },
+        [](bool) { return false; },
+        [&audit_lines](const std::string& line) {
+            audit_lines.push_back(line);
+        });
+    constexpr uint16_t kPort = 18138;
+    CHECK(api.Start("127.0.0.1", kPort, err));
+
+    std::string body;
+    // A binding that does not exist is a 404, not a silent success.
+    CHECK(HttpDeleteWithToken("/api/dhcp/bindings?mac=02:00:00:00:a3:11",
+                              kPort, "tok", body) == 404);
+    bool saw_v4_delete_refused = false;
+    for (const auto& line : audit_lines) {
+        if (line.find("dhcp binding delete 02:00:00:00:a3:11") !=
+                std::string::npos &&
+            line.find("failed (no such binding)") != std::string::npos) {
+            saw_v4_delete_refused = true;
+        }
+    }
+    CHECK(saw_v4_delete_refused);
+
+    audit_lines.clear();
+    CHECK(HttpDeleteWithToken(
+              "/api/dhcp6/bindings?duid=00:03:00:01:02:00:00:a3:11",
+              kPort, "tok", body) == 404);
+    bool saw_v6_delete_refused = false;
+    for (const auto& line : audit_lines) {
+        if (line.find("dhcp6 binding delete") != std::string::npos &&
+            line.find("failed (no such binding)") != std::string::npos) {
+            saw_v6_delete_refused = true;
+        }
+    }
+    CHECK(saw_v6_delete_refused);
+
+    // Stop the plane: the same routes now answer 409 "service not running".
+    api.Stop();
+    std::string stop_error;
+    CHECK(dp.Stop(stop_error));
+    CHECK(!dp.DhcpActive());
+    CHECK(!dp.Dhcp6Active());
+    audit_lines.clear();
+    CHECK(api.Start("127.0.0.1", kPort, err));
+    CHECK(HttpPost(kPort, "/api/dhcp/bindings", "tok",
+                   R"({"mac":"02:00:00:00:a3:11","ip":"192.168.53.111"})",
+                   body) == 409);
+    bool saw_v4_stopped = false;
+    for (const auto& line : audit_lines) {
+        if (line.find("dhcp binding add failed (service not running)") !=
+            std::string::npos) {
+            saw_v4_stopped = true;
+        }
+    }
+    CHECK(saw_v4_stopped);
+
+    audit_lines.clear();
+    CHECK(HttpPost(kPort, "/api/dhcp6/bindings", "tok",
+                   R"({"duid":"00:03:00:01:02:00:00:a3:11","ip":"fd00:1133:4455:6677::1100"})",
+                   body) == 409);
+    bool saw_v6_stopped = false;
+    for (const auto& line : audit_lines) {
+        if (line.find("dhcp6 binding add failed (service not running)") !=
+            std::string::npos) {
+            saw_v6_stopped = true;
+        }
+    }
+    CHECK(saw_v6_stopped);
+
+    api.Stop();
+    std::remove(path);
     std::remove(lease_path);
 }
 
@@ -8892,6 +9012,7 @@ int main(int argc, char** argv) {
     TestP95ConfigSaveFailureIsAudited();
     TestP102WebBindingPersistFailureIsAudited();
     TestP104RuleDeleteFailureIsAudited();
+    TestP107WebBindingRefusalIsAudited();
     TestB126WebConsoleReportsDropped();
     TestB127StatusContractKeys();
     TestB113NoApplierDoesNotStampAttempt();

@@ -24862,6 +24862,49 @@ static void TestB277RuleExecutorBranches() {
 // friendly-name cap (and the exact-24 case), and the two malformed-brace
 // shapes that must fall through to the length cap instead of inventing a
 // name. Every case is driven through the real status line.
+// P107: the delete-failure audit lines were covered (P105), but a REFUSED add
+// (duplicate WAN endpoint, firewall limit) left no audit record at all - only
+// the toast. The refusal is a privileged-change outcome; the operator's durable
+// record must carry it too.
+static void TestP107UiAddRefusalIsAudited() {
+    using namespace vgww::ui;
+    FixTextMetrics();
+    console_log::ClearForTest();
+    vgww::web::RuleStore& store = vgww::web::RuleStore::Instance();
+    store.Clear();
+
+    vgww::core::Config cfg;
+    bool ok = false;
+    cfg.gateway.ipv4 = vgww::core::ParseIpv4("192.168.57.1", ok);
+    cfg.gateway.mask = vgww::core::ParseIpv4("255.255.255.0", ok);
+    vgww::core::ParseMac("30:fc:68:88:b4:a6", cfg.gateway.mac);
+    vgww::runtime::Dataplane dataplane(cfg);  // not started: no threads
+    DataplaneCommandExecutor executor(dataplane, "");
+
+    CHECK(executor
+              .Execute(Command{AddPortMapCmd{"tcp", 8080, "192.168.57.5", 80}})
+              .ok);
+    CHECK(store.PortMapCount() == 1);
+
+    console_log::ClearForTest();
+    const CommandResult refused = executor.Execute(
+        Command{AddPortMapCmd{"tcp", 8080, "192.168.57.6", 81}});
+    CHECK(!refused.ok);
+    bool saw_portmap_refused = false;
+    for (const auto& line : console_log::Snapshot()) {
+        if (line.find(L"[audit]") != std::wstring::npos &&
+            line.find(L"portmap add tcp:8080") != std::wstring::npos &&
+            line.find(L"failed (wan port already mapped)") !=
+                std::wstring::npos) {
+            saw_portmap_refused = true;
+        }
+    }
+    CHECK(saw_portmap_refused);
+
+    store.Clear();
+    console_log::ClearForTest();
+}
+
 static void TestB276ShortAdapterNameBoundaries() {
     using namespace vgww::ui;
     FixTextMetrics();
@@ -35601,6 +35644,7 @@ int main() {
     TestP96UiConfigSaveFailureIsAudited();
     TestP100UiBindingPersistFailureIsAudited();
     TestP105UiRuleDeleteFailureIsAudited();
+    TestP107UiAddRefusalIsAudited();
     TestP89DirtyStopIsNotReportedClean();
     TestP90RecheckSurfacesDirtyStop();
     TestB103LeasePersistVerdictSurface();

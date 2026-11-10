@@ -165,11 +165,19 @@ namespace vgww {
                 for (const auto& existing : existing_rules) {
                     if (existing.proto == cmd.proto &&
                         existing.wan_port == cmd.wan_port) {
+                        console_log::AppendAuditLine(
+                            "portmap add " + cmd.proto + ":" +
+                            std::to_string(cmd.wan_port) +
+                            " failed (wan port already mapped)");
                         return Fail(I18n::Instance().Copy(Str::CmdWanPortTaken));
                     }
                 }
                 if (store.PortMapCount() >=
                     vgww::core::limits::kMaxPortMaps) {
+                    console_log::AppendAuditLine(
+                        "portmap add " + cmd.proto + ":" +
+                        std::to_string(cmd.wan_port) +
+                        " failed (port mapping limit reached)");
                     return Fail(I18n::Instance().Copy(Str::CmdPortmapLimit));
                 }
                 web::PortMappingRule rule;
@@ -181,6 +189,10 @@ namespace vgww {
                 // concurrent web + UI writers; a race loser reports a clear
                 // conflict instead of silently shadowing the earlier rule.
                 if (!store.AddPortMap(std::move(rule))) {
+                    console_log::AppendAuditLine(
+                        "portmap add " + cmd.proto + ":" +
+                        std::to_string(cmd.wan_port) +
+                        " failed (wan port already mapped)");
                     return Fail(I18n::Instance().Copy(Str::CmdWanPortTaken));
                 }
                 AuditRuleChange(
@@ -269,6 +281,9 @@ namespace vgww {
                 // Bans().size() here and then called the void AddBan, so a
                 // concurrent web writer could overrun the cap between the two.
                 if (!store.AddBanChecked(std::move(ban))) {
+                    console_log::AppendAuditLine(
+                        "ban add " + cmd.kind + " " + cmd.value +
+                        " failed (firewall rule limit reached)");
                     return Fail(I18n::Instance().Copy(Str::CmdBanLimit));
                 }
                 AuditRuleChange("ban add " + cmd.kind + " " +
@@ -342,6 +357,12 @@ namespace vgww {
                 if (!cmd.replace_mac.empty()) {
                     if (!web::RuleStore::Instance().ReplaceRateLimitChecked(
                             cmd.replace_mac, std::move(rule))) {
+                        console_log::AppendAuditLine(
+                            "ratelimit set " + cmd.mac + " up=" +
+                            std::to_string(cmd.up_kbps) + " down=" +
+                            std::to_string(cmd.down_kbps) + " replace=" +
+                            cmd.replace_mac +
+                            " failed (rate-limit rule limit reached)");
                         return Fail(I18n::Instance().Copy(Str::CmdRateLimitLimit));
                     }
                     AuditRuleChange(
@@ -357,6 +378,11 @@ namespace vgww {
                 // inside its own lock - and the two could disagree.
                 if (!web::RuleStore::Instance().SetRateLimitChecked(
                         std::move(rule))) {
+                    console_log::AppendAuditLine(
+                        "ratelimit set " + cmd.mac + " up=" +
+                        std::to_string(cmd.up_kbps) + " down=" +
+                        std::to_string(cmd.down_kbps) +
+                        " failed (rate-limit rule limit reached)");
                     return Fail(I18n::Instance().Copy(Str::CmdRateLimitLimit));
                 }
                 AuditRuleChange(

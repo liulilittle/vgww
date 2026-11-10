@@ -3012,6 +3012,7 @@ namespace vgww {
                                           rule.lan_ip + ":" +
                                           std::to_string(rule.lan_port);
                 if (!RuleStore::Instance().AddPortMap(std::move(rule))) {
+                    audit(line + " failed (wan endpoint already mapped)");
                     return Response::Error(400, "wan endpoint already mapped");
                 }
                 AuditRuleChange(audit, line);
@@ -3125,6 +3126,7 @@ namespace vgww {
                 // overrun the cap between this read and the insert.
                 const std::string line = "ban add " + ban.kind + " " + ban.value;
                 if (!RuleStore::Instance().AddBanChecked(std::move(ban))) {
+                    audit(line + " failed (firewall rule limit reached)");
                     return Response::Error(400, "too many bans");
                 }
                 AuditRuleChange(audit, line);
@@ -3278,6 +3280,7 @@ namespace vgww {
                         " replace=" + replace_mac;
                     if (!RuleStore::Instance().ReplaceRateLimitChecked(
                             CanonicalMac(old_parsed), std::move(rule))) {
+                        audit(line + " failed (rate-limit rule limit reached)");
                         return Response::Error(400, "too many ratelimits");
                     }
                     AuditRuleChange(audit, line);
@@ -3292,6 +3295,7 @@ namespace vgww {
                     std::to_string(rule.uplink_kbps) + " down=" +
                     std::to_string(rule.downlink_kbps);
                 if (!RuleStore::Instance().SetRateLimitChecked(std::move(rule))) {
+                    audit(line + " failed (rate-limit rule limit reached)");
                     return Response::Error(400, "too many ratelimits");
                 }
                 AuditRuleChange(audit, line);
@@ -3382,20 +3386,25 @@ namespace vgww {
                              // say "service not running" instead of the old
                              // misleading "invalid mac/ip" (the values were
                              // valid - the runtime was not there).
-                             if (!dataplane.DhcpActive()) {
-                                 return Response::Error(409,
-                                                        "service not running");
-                             }
-                             std::string mac, ip, hostname;
-                             if (!JsonGetString(request.body, "mac", mac) ||
-                                 !JsonGetString(request.body, "ip", ip)) {
-                                 return Response::Error(400, "mac and ip required");
-                             }
-                             JsonGetString(request.body, "hostname", hostname);
-                             core::MacAddress wanted{};
-                             if (!core::ParseMac(mac, wanted)) {
-                                 return Response::Error(400, "invalid mac");
-                             }
+                              if (!dataplane.DhcpActive()) {
+                                  audit("dhcp binding add failed (service not "
+                                        "running)");
+                                  return Response::Error(409,
+                                                         "service not running");
+                              }
+                              std::string mac, ip, hostname;
+                              if (!JsonGetString(request.body, "mac", mac) ||
+                                  !JsonGetString(request.body, "ip", ip)) {
+                                  audit("dhcp binding add rejected (mac and ip "
+                                        "required)");
+                                  return Response::Error(400, "mac and ip required");
+                              }
+                              JsonGetString(request.body, "hostname", hostname);
+                              core::MacAddress wanted{};
+                              if (!core::ParseMac(mac, wanted)) {
+                                  audit("dhcp binding add rejected (invalid mac)");
+                                  return Response::Error(400, "invalid mac");
+                              }
                              // A duplicate MAC is a conflict, not a silent
                              // upsert: retargeting an existing client is the
                              // kind of plausible-but-broken success the UI
@@ -3433,17 +3442,23 @@ namespace vgww {
 
             server.Route("DELETE", "/api/dhcp/bindings",
                          [&dataplane, config_path, audit](const Request& request) {
-                             if (!dataplane.DhcpActive()) {
-                                 return Response::Error(409,
-                                                        "service not running");
-                             }
-                             const auto it = request.query.find("mac");
-                             if (request.query.end() == it) {
-                                 return Response::Error(400, "mac required");
-                             }
-                             if (!dataplane.RemoveDhcpBinding(it->second)) {
-                                 return Response::Error(404, "binding not found");
-                             }
+                              if (!dataplane.DhcpActive()) {
+                                  audit("dhcp binding delete failed (service not "
+                                        "running)");
+                                  return Response::Error(409,
+                                                         "service not running");
+                              }
+                              const auto it = request.query.find("mac");
+                              if (request.query.end() == it) {
+                                  audit("dhcp binding delete rejected (mac "
+                                        "required)");
+                                  return Response::Error(400, "mac required");
+                              }
+                              if (!dataplane.RemoveDhcpBinding(it->second)) {
+                                  audit("dhcp binding delete " + it->second +
+                                        " failed (no such binding)");
+                                  return Response::Error(404, "binding not found");
+                              }
                              const bool persisted = PersistDhcpBindingV4(
                                  config_path, it->second, std::string(),
                                  std::string(), true);
@@ -3508,16 +3523,20 @@ namespace vgww {
 
             server.Route("POST", "/api/dhcp6/bindings",
                          [&dataplane, config_path, audit](const Request& request) {
-                             if (!dataplane.Dhcp6Active()) {
-                                 return Response::Error(409,
-                                                        "service not running");
-                             }
-                             std::string duid, ip, hostname;
-                             if (!JsonGetString(request.body, "duid", duid) ||
-                                 !JsonGetString(request.body, "ip", ip)) {
-                                 return Response::Error(400,
-                                                        "duid and ip required");
-                             }
+                              if (!dataplane.Dhcp6Active()) {
+                                  audit("dhcp6 binding add failed (service not "
+                                        "running)");
+                                  return Response::Error(409,
+                                                         "service not running");
+                              }
+                              std::string duid, ip, hostname;
+                              if (!JsonGetString(request.body, "duid", duid) ||
+                                  !JsonGetString(request.body, "ip", ip)) {
+                                  audit("dhcp6 binding add rejected (duid and ip "
+                                        "required)");
+                                  return Response::Error(400,
+                                                         "duid and ip required");
+                              }
                              JsonGetString(request.body, "hostname", hostname);
                              // batch142: compare DUIDs by VALUE. The old check
                              // compared the POSTed text with the canonical text
@@ -3563,17 +3582,23 @@ namespace vgww {
 
             server.Route("DELETE", "/api/dhcp6/bindings",
                          [&dataplane, config_path, audit](const Request& request) {
-                             if (!dataplane.Dhcp6Active()) {
-                                 return Response::Error(409,
-                                                        "service not running");
-                             }
-                             const auto it = request.query.find("duid");
-                             if (request.query.end() == it) {
-                                 return Response::Error(400, "duid required");
-                             }
-                             if (!dataplane.RemoveDhcp6Binding(it->second)) {
-                                 return Response::Error(404, "binding not found");
-                             }
+                              if (!dataplane.Dhcp6Active()) {
+                                  audit("dhcp6 binding delete failed (service not "
+                                        "running)");
+                                  return Response::Error(409,
+                                                         "service not running");
+                              }
+                              const auto it = request.query.find("duid");
+                              if (request.query.end() == it) {
+                                  audit("dhcp6 binding delete rejected (duid "
+                                        "required)");
+                                  return Response::Error(400, "duid required");
+                              }
+                              if (!dataplane.RemoveDhcp6Binding(it->second)) {
+                                  audit("dhcp6 binding delete " + it->second +
+                                        " failed (no such binding)");
+                                  return Response::Error(404, "binding not found");
+                              }
                              const bool persisted = PersistDhcpBindingV6(
                                  config_path, it->second, std::string(),
                                  std::string(), true);
