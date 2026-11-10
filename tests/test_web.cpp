@@ -1322,7 +1322,81 @@ static void TestB123PrivilegedChangesAreAudited() {
     std::remove(rules.c_str());
 }
 
-// batch122 (Web surface): DHCPv6 parse refusals must be visible too.
+// P92: the audit line for a rule mutation used to be written before the
+// durability verdict was known, so a publish that failed still left a plain
+// success record while the route answered persisted:false. The audit trail
+// must carry the same verdict.
+static void TestP92WebAuditLineCarriesPersistFailure() {
+    using namespace vgww::core;
+    const char* path = "p92-audit.json";
+    const std::string rules = std::string(path) + ".rules.json";
+    std::remove(path);
+    std::error_code ec;
+    std::filesystem::remove_all(rules, ec);
+    // A DIRECTORY at the rules path makes every write fail permanently.
+    CHECK(std::filesystem::create_directory(rules, ec));
+
+    Config cfg;
+    cfg.web.port = 18124;
+    bool ok = false;
+    cfg.gateway.ipv4 = ParseIpv4("192.168.0.44", ok);
+    cfg.gateway.mask = ParseIpv4("255.255.255.0", ok);
+    MacAddress mac{};
+    ParseMac("30:fc:68:88:b4:ac", mac);
+    cfg.gateway.mac = mac;
+    std::string err;
+    CHECK(cfg.SaveToFile(path, err));
+
+    vgww::runtime::Dataplane dp(cfg);
+    HttpServer api;
+    std::vector<std::string> audit_lines;
+    vgww::web::RegisterApi(
+        api, dp, cfg, path, "boot-secret", {}, {}, {},
+        [&audit_lines](const std::string& line) {
+            audit_lines.push_back(line);
+        });
+    constexpr uint16_t kPort = 18124;
+    std::string start_err;
+    CHECK(api.Start("127.0.0.1", kPort, start_err));
+
+    std::string resp;
+    CHECK(HttpPost(kPort, "/api/bans", "boot-secret",
+                   R"({"kind":"ip","value":"10.9.8.7"})", resp) == 200);
+    CHECK(resp.find("\"persisted\":false") != std::string::npos);
+
+
+    const auto find_ban_add = [&audit_lines]() -> const std::string* {
+        for (const auto& line : audit_lines) {
+            if (line.find("ban add") != std::string::npos) {
+                return &line;
+            }
+        }
+        return nullptr;
+    };
+    const std::string* ban_add = find_ban_add();
+    CHECK(nullptr != ban_add);
+    if (nullptr != ban_add) {
+        CHECK(ban_add->find("NOT saved") != std::string::npos);
+    }
+
+    // Removing the blocker lets the next mutation audit a real success.
+    std::filesystem::remove_all(rules, ec);
+    audit_lines.clear();
+    CHECK(HttpPost(kPort, "/api/bans", "boot-secret",
+                   R"({"kind":"ip","value":"10.9.8.8"})", resp) == 200);
+    CHECK(resp.find("\"persisted\":true") != std::string::npos);
+    const std::string* clean = find_ban_add();
+    CHECK(nullptr != clean);
+    if (nullptr != clean) {
+        CHECK(clean->find("NOT saved") == std::string::npos);
+    }
+
+    api.Stop();
+    vgww::web::RuleStore::Instance().AttachFile("");
+    vgww::web::RuleStore::Instance().Clear();
+    std::remove(path);
+    std::filesystem::remove_all(rules, ec);
+}
 static void TestB122WebStatusReportsParseRejects6() {
     using namespace vgww::core;
     const char* path = "b122-status.json";
@@ -8430,6 +8504,7 @@ int main(int argc, char** argv) {
     TestB121WebStatusReportsParseRejects();
     TestB122WebStatusReportsParseRejects6();
     TestB123PrivilegedChangesAreAudited();
+    TestP92WebAuditLineCarriesPersistFailure();
     TestB126WebConsoleReportsDropped();
     TestB127StatusContractKeys();
     TestB113NoApplierDoesNotStampAttempt();

@@ -864,9 +864,30 @@ namespace vgww {
             Response OkWithPersist() {
                 return Response::Json(
                     std::string("{\"ok\":true,\"persisted\":") +
-                    (RuleStore::Instance().PersistUpToDate() ? "true"
-                                                             : "false") +
-                    "}");
+                        (RuleStore::Instance().PersistUpToDate() ? "true"
+                                                                 : "false") +
+                        "}");
+            }
+
+            /// P92: the audit line for a rule mutation used to be written
+            /// before the durability verdict was known, so a publish that
+            /// failed still left a plain success record while the route
+            /// answered persisted:false (and the native UI command reported
+            /// the loss). A failed publish must leave a matching audit
+            /// record: append (NOT saved) when the store is not up to date.
+            /// Binding routes use their own explicit persisted verdict.
+            /// `audit` is the per-route callback (not in this namespace).
+            void AuditWithPersist(const AuditLog& audit,
+                                  const std::string& line, bool persisted) {
+                if (audit) {
+                    audit(line + (persisted ? "" : " (NOT saved)"));
+                }
+            }
+
+            void AuditRuleChange(const AuditLog& audit,
+                                 const std::string& line) {
+                AuditWithPersist(audit, line,
+                                 RuleStore::Instance().PersistUpToDate());
             }
 
         }  // namespace
@@ -2973,12 +2994,14 @@ namespace vgww {
                 if (RuleStore::Instance().PortMapCount() >= ::vgww::core::limits::kMaxPortMaps) {
                     return Response::Error(400, "too many portmaps");
                 }
-                audit("portmap add " + rule.proto + ":" +
-                      std::to_string(rule.wan_port) + " -> " + rule.lan_ip +
-                      ":" + std::to_string(rule.lan_port));
+                const std::string line = "portmap add " + rule.proto + ":" +
+                                          std::to_string(rule.wan_port) + " -> " +
+                                          rule.lan_ip + ":" +
+                                          std::to_string(rule.lan_port);
                 if (!RuleStore::Instance().AddPortMap(std::move(rule))) {
                     return Response::Error(400, "wan endpoint already mapped");
                 }
+                AuditRuleChange(audit, line);
                 return OkWithPersist();
             });
 
@@ -3006,7 +3029,7 @@ namespace vgww {
                             refused ? "rule tombstone store is full"
                                     : "no such id");
                     }
-                    audit("portmap delete id=" + std::to_string(id));
+                    AuditRuleChange(audit, "portmap delete id=" + std::to_string(id));
                     return OkWithPersist();
                 }
                 const auto it = request.query.find("index");
@@ -3030,7 +3053,8 @@ namespace vgww {
                         refused ? "rule tombstone store is full"
                                 : "no such index");
                 }
-                audit("portmap delete index=" + std::to_string(index));
+                AuditRuleChange(audit, "portmap delete index=" +
+                                std::to_string(index));
                 return OkWithPersist();
             });
 
@@ -3082,10 +3106,11 @@ namespace vgww {
                 // (AddBanChecked). The old route read Bans().size() out here,
                 // so a concurrent UI/web writer could pass its own check and
                 // overrun the cap between this read and the insert.
-                audit("ban add " + ban.kind + " " + ban.value);
+                const std::string line = "ban add " + ban.kind + " " + ban.value;
                 if (!RuleStore::Instance().AddBanChecked(std::move(ban))) {
                     return Response::Error(400, "too many bans");
                 }
+                AuditRuleChange(audit, line);
                 return OkWithPersist();
             });
 
@@ -3106,7 +3131,7 @@ namespace vgww {
                             refused ? "rule tombstone store is full"
                                     : "no such id");
                     }
-                    audit("ban delete id=" + std::to_string(id));
+                    AuditRuleChange(audit, "ban delete id=" + std::to_string(id));
                     return OkWithPersist();
                 }
                 const auto it = request.query.find("index");
@@ -3135,7 +3160,7 @@ namespace vgww {
                         refused ? "rule tombstone store is full"
                                 : "no such index");
                 }
-                audit("ban delete index=" + std::to_string(index));
+                AuditRuleChange(audit, "ban delete index=" + std::to_string(index));
                 return OkWithPersist();
             });
 
@@ -3225,26 +3250,30 @@ namespace vgww {
                     if (!core::ParseMac(replace_mac, old_parsed)) {
                         return Response::Error(400, "invalid replace_mac");
                     }
-                    audit("ratelimit set " + rule.mac + " up=" +
-                          std::to_string(rule.uplink_kbps) + " down=" +
-                          std::to_string(rule.downlink_kbps) + " replace=" +
-                          replace_mac);
+                    const std::string line =
+                        "ratelimit set " + rule.mac + " up=" +
+                        std::to_string(rule.uplink_kbps) + " down=" +
+                        std::to_string(rule.downlink_kbps) +
+                        " replace=" + replace_mac;
                     if (!RuleStore::Instance().ReplaceRateLimitChecked(
                             CanonicalMac(old_parsed), std::move(rule))) {
                         return Response::Error(400, "too many ratelimits");
                     }
+                    AuditRuleChange(audit, line);
                     return OkWithPersist();
                 }
                 // batch89: the upsert decision, the cap test and the insert all
                 // happen inside ONE lock, so replacing an existing MAC is never
                 // mistaken for growth (it does not need cap headroom) and two
                 // concurrent inserters cannot both slip past the cap.
-                audit("ratelimit set " + rule.mac + " up=" +
-                      std::to_string(rule.uplink_kbps) + " down=" +
-                      std::to_string(rule.downlink_kbps));
+                const std::string line =
+                    "ratelimit set " + rule.mac + " up=" +
+                    std::to_string(rule.uplink_kbps) + " down=" +
+                    std::to_string(rule.downlink_kbps);
                 if (!RuleStore::Instance().SetRateLimitChecked(std::move(rule))) {
                     return Response::Error(400, "too many ratelimits");
                 }
+                AuditRuleChange(audit, line);
                 return OkWithPersist();
             });
 
@@ -3275,7 +3304,7 @@ namespace vgww {
                         refused ? "rule tombstone store is full"
                                 : "no such index");
                 }
-                audit("ratelimit delete " + mac);
+                AuditRuleChange(audit, "ratelimit delete " + mac);
                 return OkWithPersist();
             });
 
@@ -3370,9 +3399,11 @@ namespace vgww {
                              }
                              // batch93: the runtime change is live; also record
                              // it in the config so a restart keeps it.
-                             audit("dhcp binding add " + mac + " -> " + ip);
                              const bool persisted = PersistDhcpBindingV4(
                                  config_path, mac, ip, hostname, false);
+                             AuditWithPersist(audit,
+                                 "dhcp binding add " + mac + " -> " + ip,
+                                 persisted);
                              return OkWithPersistFlag(persisted);
                         });
 
@@ -3389,10 +3420,12 @@ namespace vgww {
                              if (!dataplane.RemoveDhcpBinding(it->second)) {
                                  return Response::Error(404, "binding not found");
                              }
-                             audit("dhcp binding delete " + it->second);
                              const bool persisted = PersistDhcpBindingV4(
                                  config_path, it->second, std::string(),
                                  std::string(), true);
+                             AuditWithPersist(audit, "dhcp binding delete " +
+                                                  it->second,
+                                              persisted);
                              return OkWithPersistFlag(persisted);
                         });
 
@@ -3496,9 +3529,11 @@ namespace vgww {
                                  return Response::Error(
                                      400, "invalid duid/ip or hostname too long");
                              }
-                             audit("dhcp6 binding add " + duid + " -> " + ip);
                              const bool persisted = PersistDhcpBindingV6(
                                  config_path, duid, ip, hostname, false);
+                             AuditWithPersist(audit,
+                                 "dhcp6 binding add " + duid + " -> " + ip,
+                                 persisted);
                              return OkWithPersistFlag(persisted);
                         });
 
@@ -3515,10 +3550,12 @@ namespace vgww {
                              if (!dataplane.RemoveDhcp6Binding(it->second)) {
                                  return Response::Error(404, "binding not found");
                              }
-                             audit("dhcp6 binding delete " + it->second);
                              const bool persisted = PersistDhcpBindingV6(
                                  config_path, it->second, std::string(),
                                  std::string(), true);
+                             AuditWithPersist(audit, "dhcp6 binding delete " +
+                                                  it->second,
+                                              persisted);
                              return OkWithPersistFlag(persisted);
                         });
 
