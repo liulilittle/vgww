@@ -2769,6 +2769,42 @@ static void TestP107WebBindingRefusalIsAudited() {
     }
     CHECK(saw_v6_missing_fields);
 
+    // A duplicate MAC is a conflict, not a silent upsert: the refusal must be
+    // audited too (the store keys on the PARSED bytes, so any legal spelling
+    // of the same address is a conflict).
+    CHECK(HttpPost(kPort, "/api/dhcp/bindings", "tok",
+                   R"({"mac":"02:00:00:00:a3:11","ip":"192.168.53.111"})",
+                   body) == 200);
+    audit_lines.clear();
+    CHECK(HttpPost(kPort, "/api/dhcp/bindings", "tok",
+                   R"({"mac":"02-00-00-00-a3-11","ip":"192.168.53.112"})",
+                   body) == 400);
+    bool saw_v4_duplicate = false;
+    for (const auto& line : audit_lines) {
+        if (line.find("dhcp binding add 02-00-00-00-a3-11") !=
+                std::string::npos &&
+            line.find("failed (binding exists)") != std::string::npos) {
+            saw_v4_duplicate = true;
+        }
+    }
+    CHECK(saw_v4_duplicate);
+
+    CHECK(HttpPost(kPort, "/api/dhcp6/bindings", "tok",
+                   R"({"duid":"00:03:00:01:02:00:00:a3:11","ip":"fd00:1133:4455:6677::1100"})",
+                   body) == 200);
+    audit_lines.clear();
+    CHECK(HttpPost(kPort, "/api/dhcp6/bindings", "tok",
+                   R"({"duid":"00030001020000a311","ip":"fd00:1133:4455:6677::1101"})",
+                   body) == 400);
+    bool saw_v6_duplicate = false;
+    for (const auto& line : audit_lines) {
+        if (line.find("dhcp6 binding add") != std::string::npos &&
+            line.find("failed (binding exists)") != std::string::npos) {
+            saw_v6_duplicate = true;
+        }
+    }
+    CHECK(saw_v6_duplicate);
+
     // Stop the plane: the same routes now answer 409 "service not running".
     api.Stop();
     std::string stop_error;

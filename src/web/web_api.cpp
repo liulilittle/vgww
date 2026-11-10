@@ -3412,24 +3412,34 @@ namespace vgww {
                              const auto existing = dataplane.GetDhcpBindings();
                              for (const auto& binding : existing) {
                                  core::MacAddress bound{};
-                                 if (core::ParseMac(binding.mac, bound) &&
-                                     bound == wanted) {
-                                     return Response::Error(400, "binding exists");
-                                 }
+                                  if (core::ParseMac(binding.mac, bound) &&
+                                      bound == wanted) {
+                                      audit("dhcp binding add " + mac +
+                                            " -> " + ip +
+                                            " failed (binding exists)");
+                                      return Response::Error(400, "binding exists");
+                                  }
                              }
                              // Cap the store like every other rule list so a
                              // scripted POST flood cannot grow it unbounded.
-                             if (existing.size() >=
-                                 ::vgww::core::limits::kMaxStaticBindings) {
-                                 return Response::Error(400, "too many bindings");
-                             }
-                             if (!dataplane.SetDhcpBinding(mac, ip, hostname)) {
-                                 // batch111: the store now also rejects a
-                                 // hostname longer than a DHCP option value,
-                                 // so name it instead of blaming only mac/ip.
-                                 return Response::Error(
-                                     400, "invalid mac/ip or hostname too long");
-                             }
+                              if (existing.size() >=
+                                  ::vgww::core::limits::kMaxStaticBindings) {
+                                  audit("dhcp binding add " + mac +
+                                        " -> " + ip +
+                                        " failed (too many bindings)");
+                                  return Response::Error(400, "too many bindings");
+                              }
+                              if (!dataplane.SetDhcpBinding(mac, ip, hostname)) {
+                                  // batch111: the store now also rejects a
+                                  // hostname longer than a DHCP option value,
+                                  // so name it instead of blaming only mac/ip.
+                                  audit("dhcp binding add " + mac +
+                                        " -> " + ip +
+                                        " failed (invalid mac/ip or hostname "
+                                        "too long)");
+                                  return Response::Error(
+                                      400, "invalid mac/ip or hostname too long");
+                              }
                              // batch93: the runtime change is live; also record
                              // it in the config so a restart keeps it.
                              const bool persisted = PersistDhcpBindingV4(
@@ -3558,21 +3568,31 @@ namespace vgww {
                                  dataplane.GetDhcp6Bindings();
                              for (const auto& binding : existing) {
                                  std::vector<uint8_t> bound_duid;
-                                 if (runtime::ParseDuidText(binding.duid,
-                                                            bound_duid) &&
-                                     bound_duid == wanted_duid) {
-                                     return Response::Error(400,
-                                                            "binding exists");
-                                 }
+                                  if (runtime::ParseDuidText(binding.duid,
+                                                             bound_duid) &&
+                                      bound_duid == wanted_duid) {
+                                      audit("dhcp6 binding add " + duid +
+                                            " -> " + ip +
+                                            " failed (binding exists)");
+                                      return Response::Error(400,
+                                                             "binding exists");
+                                  }
                              }
-                             if (existing.size() >=
-                                 ::vgww::core::limits::kMaxStaticBindings6) {
-                                 return Response::Error(400, "too many bindings");
-                             }
-                             if (!dataplane.SetDhcp6Binding(duid, ip, hostname)) {
-                                 return Response::Error(
-                                     400, "invalid duid/ip or hostname too long");
-                             }
+                              if (existing.size() >=
+                                  ::vgww::core::limits::kMaxStaticBindings6) {
+                                  audit("dhcp6 binding add " + duid +
+                                        " -> " + ip +
+                                        " failed (too many bindings)");
+                                  return Response::Error(400, "too many bindings");
+                              }
+                              if (!dataplane.SetDhcp6Binding(duid, ip, hostname)) {
+                                  audit("dhcp6 binding add " + duid +
+                                        " -> " + ip +
+                                        " failed (invalid duid/ip or hostname "
+                                        "too long)");
+                                  return Response::Error(
+                                      400, "invalid duid/ip or hostname too long");
+                              }
                              const bool persisted = PersistDhcpBindingV6(
                                  config_path, duid, ip, hostname, false);
                              AuditWithPersist(audit,
