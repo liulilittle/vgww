@@ -452,6 +452,8 @@ namespace vgww {
                 std::string persist_error;
                 if (!PersistBindV4(config_path, cmd.mac, cmd.ip, cmd.hostname,
                                    cmd.replace_mac, persist_error)) {
+                    console_log::AppendAuditLine(
+                        "dhcp binding add failed (write error)");
                     return Fail(I18n::Instance().FormatCopy(
                         Str::SaveWriteFailedFmt, {Widen(persist_error)}));
                 }
@@ -479,6 +481,8 @@ namespace vgww {
                 if (!config_path.empty() &&
                     !vgww::core::DeleteDhcpBinding(config_path, mac,
                                                    persist_error)) {
+                    console_log::AppendAuditLine(
+                        "dhcp binding delete failed (write error)");
                     return Fail(I18n::Instance().FormatCopy(
                         Str::SaveWriteFailedFmt, {Widen(persist_error)}));
                 }
@@ -510,6 +514,8 @@ namespace vgww {
                 std::string persist_error;
                 if (!PersistBindV6(config_path, cmd.duid, cmd.ip, cmd.hostname,
                                    cmd.replace_duid, persist_error)) {
+                    console_log::AppendAuditLine(
+                        "dhcp6 binding add failed (write error)");
                     return Fail(I18n::Instance().FormatCopy(
                         Str::SaveWriteFailedFmt, {Widen(persist_error)}));
                 }
@@ -537,6 +543,8 @@ namespace vgww {
                     if (runtime::ParseDuidText(cmd.duid, duid) && !duid.empty() &&
                         !vgww::core::DeleteDhcp6Binding(config_path, duid,
                                                         persist_error)) {
+                        console_log::AppendAuditLine(
+                            "dhcp6 binding delete failed (write error)");
                         return Fail(I18n::Instance().FormatCopy(
                             Str::SaveWriteFailedFmt, {Widen(persist_error)}));
                     }

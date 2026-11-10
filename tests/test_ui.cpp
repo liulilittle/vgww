@@ -22068,6 +22068,71 @@ static void TestB97UiBindingCommandsPersist() {
     std::remove(lease_path.c_str());
 }
 
+// P100: a failed binding persist used to leave no audit line - only the toast.
+// The runtime change is live in that path, so the audit line is the only
+// durable record that the row will be lost on restart.
+static void TestP100UiBindingPersistFailureIsAudited() {
+    using namespace vgww::ui;
+    FixTextMetrics();
+    console_log::ClearForTest();
+    const std::string cfg_path = "test_ui_p100_bindings.json";
+    const std::string lease_path = "test_ui_p100_leases.json";
+    std::remove(cfg_path.c_str());
+    std::remove(lease_path.c_str());
+    vgww::core::Config cfg;
+    cfg.adapter = "Ethernet";
+    cfg.mode = vgww::core::Mode::kMain;
+    cfg.dhcp.enabled = true;
+    bool ok = false;
+    cfg.gateway.ipv4 = vgww::core::ParseIpv4("192.168.50.1", ok);
+    cfg.gateway.mask = vgww::core::ParseIpv4("255.255.255.0", ok);
+    cfg.gateway.mac = {0x30, 0xFC, 0x68, 0x88, 0xB4, 0xA0};
+    cfg.dhcp.pool_start = vgww::core::ParseIpv4("192.168.50.100", ok);
+    cfg.dhcp.pool_end = vgww::core::ParseIpv4("192.168.50.200", ok);
+    cfg.dhcp.lease_seconds = 3600;
+    cfg.ipv6.enabled = true;
+    cfg.ipv6.prefix_len = 64;
+    cfg.ipv6.ula_prefix = {0xFD, 0x00, 0x11, 0x33, 0x44, 0x55, 0x66,
+    0x77, 0, 0, 0, 0, 0, 0, 0, 0};
+    cfg.ipv6.dhcpv6.enabled = true;
+    cfg.ipv6.dhcpv6.pool_start = {0xFD, 0x00, 0x11, 0x33, 0x44, 0x55,
+    0x66, 0x77, 0, 0, 0, 0, 0, 0, 0x10, 0x00};
+    cfg.ipv6.dhcpv6.pool_end = {0xFD, 0x00, 0x11, 0x33, 0x44, 0x55,
+    0x66, 0x77, 0, 0, 0, 0, 0, 0, 0x1F, 0xFF};
+    cfg.perf.ring_capacity = 64;
+    cfg.perf.max_conns = 64;
+    std::string err;
+    CHECK(cfg.SaveToFile(cfg_path, err));
+
+    vgww::runtime::Dataplane dataplane(cfg, lease_path);
+    dataplane.SetDriverClient(std::make_unique<B24AdapterDriver>());
+    CHECK(dataplane.Start(err));
+    DataplaneCommandExecutor executor(dataplane, cfg_path);
+
+    // A directory at the config path makes the persist fail after the runtime
+    // change is applied.
+    std::error_code ec;
+    std::filesystem::remove(cfg_path, ec);
+    CHECK(std::filesystem::create_directory(cfg_path, ec));
+    const CommandResult added =
+        executor.Execute(Command{AddDhcpBindingCmd{
+            "02:00:00:00:a0:11", "192.168.50.111", "ui-host", ""}});
+    CHECK(!added.ok);
+    bool saw_failed = false;
+    for (const auto& line : console_log::Snapshot()) {
+        if (line.find(L"[audit]") != std::wstring::npos &&
+            line.find(L"dhcp binding add failed") != std::wstring::npos) {
+            saw_failed = true;
+        }
+    }
+    CHECK(saw_failed);
+
+    std::string stop_error;
+    CHECK(dataplane.Stop(stop_error));
+    std::filesystem::remove_all(cfg_path, ec);
+    std::remove(lease_path.c_str());
+}
+
 static void TestB98UiRuleCommandsReportPersistFailure() {
     using namespace vgww::ui;
     FixTextMetrics();
@@ -35387,6 +35452,7 @@ int main() {
     TestP91AuditLineCarriesPersistFailure();
     TestP94RepairOutcomeIsAudited();
     TestP96UiConfigSaveFailureIsAudited();
+    TestP100UiBindingPersistFailureIsAudited();
     TestP89DirtyStopIsNotReportedClean();
     TestP90RecheckSurfacesDirtyStop();
     TestB103LeasePersistVerdictSurface();
