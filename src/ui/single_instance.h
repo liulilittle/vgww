@@ -221,8 +221,10 @@ namespace vgww {
             return false;
         }
 
-        /// True when any argument marks this launch as a TEST launch (the gate
-        /// must be bypassed).
+        /// True when any argument marks this launch as a TEST launch. P87:
+        /// since batch37h this predicate is NOT used for the single-instance
+        /// gate (that gate is bypassed only by a headless run, see main.cpp);
+        /// it currently gates the driver device-access re-grant at startup.
         inline bool IsTestLaunch(
             const std::vector<std::string>& args) noexcept {
             for (const std::string& a : args) {

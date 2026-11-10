@@ -234,9 +234,12 @@ namespace {
         // single-instance gate. Only a headless run (no window) may bypass it;
         // --ui-debug-port/--ui-page used to bypass too, which let a debug
         // instance and a normal launch coexist as two visible apps.
-        const bool headless_run =
-            std::find(args.begin(), args.end(), std::string("--headless")) !=
-            args.end();
+        // P87: --web-only is ALSO headless (no window to activate), so it
+        // must bypass the gate too; otherwise a --web-only WebUI beside the
+        // normal launch would be refused as a second instance and never
+        // start. This mirrors options.headless = has("--headless") ||
+        // options.web_only.
+        const bool headless_run = options.headless;
         if (!headless_run) {
             const vgww::ui::InstanceClaim claim =
                 vgww::ui::ClaimSingleInstance();
