@@ -2506,6 +2506,15 @@ static void TestP102WebBindingPersistFailureIsAudited() {
     cfg.dhcp.pool_start = ParseIpv4("192.168.52.100", ok);
     cfg.dhcp.pool_end = ParseIpv4("192.168.52.200", ok);
     cfg.dhcp.lease_seconds = 3600;
+    cfg.ipv6.enabled = true;
+    cfg.ipv6.prefix_len = 64;
+    cfg.ipv6.ula_prefix = {0xFD, 0x00, 0x11, 0x33, 0x44, 0x55, 0x66,
+    0x77, 0, 0, 0, 0, 0, 0, 0, 0};
+    cfg.ipv6.dhcpv6.enabled = true;
+    cfg.ipv6.dhcpv6.pool_start = {0xFD, 0x00, 0x11, 0x33, 0x44, 0x55,
+    0x66, 0x77, 0, 0, 0, 0, 0, 0, 0x10, 0x00};
+    cfg.ipv6.dhcpv6.pool_end = {0xFD, 0x00, 0x11, 0x33, 0x44, 0x55,
+    0x66, 0x77, 0, 0, 0, 0, 0, 0, 0x1F, 0xFF};
     cfg.perf.workers = 2;
     cfg.perf.ring_capacity = 64;
     cfg.perf.max_conns = 64;
@@ -2517,6 +2526,7 @@ static void TestP102WebBindingPersistFailureIsAudited() {
     std::string start_error;
     CHECK(dp.Start(start_error));
     CHECK(dp.DhcpActive());
+    CHECK(dp.Dhcp6Active());
 
     HttpServer api;
     std::vector<std::string> audit_lines;
@@ -2547,6 +2557,51 @@ static void TestP102WebBindingPersistFailureIsAudited() {
         }
     }
     CHECK(saw_failed);
+
+    // v4 delete: the runtime removal is live, the persisted row cannot be
+    // dropped - the audit line is the only durable record.
+    audit_lines.clear();
+    CHECK(HttpDeleteWithToken("/api/dhcp/bindings?mac=02:00:00:00:a2:11",
+                              kPort, "tok", body) == 200);
+    CHECK(body.find("\"persisted\":false") != std::string::npos);
+    bool saw_delete_failed = false;
+    for (const auto& line : audit_lines) {
+        if (line.find("dhcp binding delete") != std::string::npos &&
+            line.find("NOT saved") != std::string::npos) {
+            saw_delete_failed = true;
+        }
+    }
+    CHECK(saw_delete_failed);
+
+    // v6 add: same defect class on the DHCPv6 row.
+    audit_lines.clear();
+    CHECK(HttpPost(kPort, "/api/dhcp6/bindings", "tok",
+                   R"({"duid":"00:03:00:01:02:00:00:a2:11","ip":"fd00:1133:4455:6677::1100"})",
+                   body) == 200);
+    CHECK(body.find("\"persisted\":false") != std::string::npos);
+    bool saw_v6_failed = false;
+    for (const auto& line : audit_lines) {
+        if (line.find("dhcp6 binding add") != std::string::npos &&
+            line.find("NOT saved") != std::string::npos) {
+            saw_v6_failed = true;
+        }
+    }
+    CHECK(saw_v6_failed);
+
+    // v6 delete: the last of the four persist-failure paths.
+    audit_lines.clear();
+    CHECK(HttpDeleteWithToken(
+              "/api/dhcp6/bindings?duid=00:03:00:01:02:00:00:a2:11",
+              kPort, "tok", body) == 200);
+    CHECK(body.find("\"persisted\":false") != std::string::npos);
+    bool saw_v6_delete_failed = false;
+    for (const auto& line : audit_lines) {
+        if (line.find("dhcp6 binding delete") != std::string::npos &&
+            line.find("NOT saved") != std::string::npos) {
+            saw_v6_delete_failed = true;
+        }
+    }
+    CHECK(saw_v6_delete_failed);
 
     api.Stop();
     std::string stop_error;
