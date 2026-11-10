@@ -22245,6 +22245,35 @@ static void TestP105UiRuleDeleteFailureIsAudited() {
     }
     CHECK(saw_ratelimit_failed);
 
+    // index deletion: a stale position is a failure, not a silent no-op.
+    console_log::ClearForTest();
+    const CommandResult portmap_index =
+        executor.Execute(Command{RemovePortMapCmd{0, 999999}});
+    CHECK(!portmap_index.ok);
+    bool saw_portmap_index_failed = false;
+    for (const auto& line : console_log::Snapshot()) {
+        if (line.find(L"[audit]") != std::wstring::npos &&
+            line.find(L"portmap delete index=999999 failed") !=
+                std::wstring::npos) {
+            saw_portmap_index_failed = true;
+        }
+    }
+    CHECK(saw_portmap_index_failed);
+
+    console_log::ClearForTest();
+    const CommandResult ban_index =
+        executor.Execute(Command{RemoveBanCmd{0, 999999}});
+    CHECK(!ban_index.ok);
+    bool saw_ban_index_failed = false;
+    for (const auto& line : console_log::Snapshot()) {
+        if (line.find(L"[audit]") != std::wstring::npos &&
+            line.find(L"ban delete index=999999 failed") !=
+                std::wstring::npos) {
+            saw_ban_index_failed = true;
+        }
+    }
+    CHECK(saw_ban_index_failed);
+
     store.AttachFile("");
     store.Clear();
     std::remove(path.c_str());
