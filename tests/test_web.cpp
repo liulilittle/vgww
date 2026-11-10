@@ -3117,6 +3117,59 @@ static void TestP104RuleDeleteFailureIsAudited() {
     }
     CHECK(saw_ban_index_failed);
 
+    // Input-validation refusals: a malformed request is not a state refusal,
+    // but it is still a privileged-change attempt the operator's record must
+    // carry (a flood of malformed POSTs is exactly what a post-mortem needs).
+    audit_lines.clear();
+    CHECK(HttpPost(kPort, "/api/portmap", "tok",
+                   R"({"proto":"tcp","wan_port":8080,"lan_ip":"not-an-ip","lan_port":80})",
+                   body) == 400);
+    bool saw_bad_ip = false;
+    for (const auto& line : audit_lines) {
+        if (line.find("portmap add rejected (invalid ip address)") !=
+            std::string::npos) {
+            saw_bad_ip = true;
+        }
+    }
+    CHECK(saw_bad_ip);
+
+    audit_lines.clear();
+    CHECK(HttpPost(kPort, "/api/bans", "tok",
+                   R"({"kind":"domain","value":"example"})", body) == 400);
+    bool saw_bad_kind = false;
+    for (const auto& line : audit_lines) {
+        if (line.find("ban add rejected (kind must be ip or mac)") !=
+            std::string::npos) {
+            saw_bad_kind = true;
+        }
+    }
+    CHECK(saw_bad_kind);
+
+    audit_lines.clear();
+    CHECK(HttpPost(kPort, "/api/ratelimit", "tok",
+                   R"({"mac":"aa:bb:cc:dd:ee:ff","uplink_kbps":0,"downlink_kbps":0})",
+                   body) == 400);
+    bool saw_bad_rate = false;
+    for (const auto& line : audit_lines) {
+        if (line.find("ratelimit set rejected (at least one direction > 0)") !=
+            std::string::npos) {
+            saw_bad_rate = true;
+        }
+    }
+    CHECK(saw_bad_rate);
+
+    audit_lines.clear();
+    CHECK(HttpDeleteWithToken("/api/portmap?id=abc", kPort, "tok", body) ==
+          400);
+    bool saw_bad_id = false;
+    for (const auto& line : audit_lines) {
+        if (line.find("portmap delete rejected (invalid id)") !=
+            std::string::npos) {
+            saw_bad_id = true;
+        }
+    }
+    CHECK(saw_bad_id);
+
     api.Stop();
     vgww::web::RuleStore::Instance().AttachFile("");
     vgww::web::RuleStore::Instance().Clear();

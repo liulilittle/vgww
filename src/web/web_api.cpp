@@ -2950,6 +2950,7 @@ namespace vgww {
                         400, "only tcp port-forwarding is supported");
                 }
                 if (!JsonGetString(request.body, "lan_ip", value)) {
+                    audit("portmap add rejected (lan_ip required)");
                     return Response::Error(400, "lan_ip required");
                 }
                 // The data plane dials host sockets via sscanf_s "%u.%u.%u.%u"
@@ -2960,6 +2961,7 @@ namespace vgww {
                     bool ok = false;
                     const uint32_t parsed = vgww::core::ParseIpv4(value, ok);
                     if (!ok) {
+                        audit("portmap add rejected (invalid ip address)");
                         return Response::Error(400, "invalid ip address");
                     }
                     // batch140: store the CANONICAL spelling, exactly like the
@@ -2975,17 +2977,20 @@ namespace vgww {
                 uint32_t number = 0;
                 if (JsonGetNumber(request.body, "wan_port", number)) {
                     if (number < 1 || number > 65535) {
+                        audit("portmap add rejected (port out of range)");
                         return Response::Error(400, "port out of range");
                     }
                     rule.wan_port = static_cast<uint16_t>(number);
                 }
                 if (JsonGetNumber(request.body, "lan_port", number)) {
                     if (number < 1 || number > 65535) {
+                        audit("portmap add rejected (port out of range)");
                         return Response::Error(400, "port out of range");
                     }
                     rule.lan_port = static_cast<uint16_t>(number);
                 }
                 if (0 == rule.wan_port || 0 == rule.lan_port) {
+                    audit("portmap add rejected (ports must be non-zero)");
                     return Response::Error(400, "ports must be non-zero");
                 }
                 // ApplyRules keys acceptors by "proto:wan_port": a duplicate
@@ -3037,6 +3042,7 @@ namespace vgww {
                     request.query.end() != by_id) {
                     uint64_t id = 0;
                     if (!ParseListIndex(by_id->second, id) || 0 == id) {
+                        audit("portmap delete rejected (invalid id)");
                         return Response::Error(400, "invalid id");
                     }
                     // P82: a removal refused because the tombstone store is
@@ -3058,6 +3064,7 @@ namespace vgww {
                 }
                 const auto it = request.query.find("index");
                 if (request.query.end() == it) {
+                    audit("portmap delete rejected (index or id required)");
                     return Response::Error(400, "index or id required");
                 }
                 size_t index = 0;
@@ -3065,6 +3072,7 @@ namespace vgww {
                 // *end" guard accepted an EMPTY value (consumed nothing, index
                 // 0) and a leading '+', so "?index=" deleted the first rule.
                 if (!ParseListIndex(it->second, index)) {
+                    audit("portmap delete rejected (invalid index)");
                     return Response::Error(400, "invalid index");
                 }
                 // batch34d: one lock does the range check AND the erase. The
@@ -3105,11 +3113,13 @@ namespace vgww {
                 BanEntry ban;
                 if (!JsonGetString(request.body, "kind", ban.kind) ||
                     !JsonGetString(request.body, "value", ban.value)) {
+                    audit("ban add rejected (kind and value required)");
                     return Response::Error(400, "kind and value required");
                 }
                 // The data plane enforces exactly these two kinds; accepting a
                 // "domain"/"dns" rule would silently no-op (fake privilege).
                 if ("ip" != ban.kind && "mac" != ban.kind) {
+                    audit("ban add rejected (kind must be ip or mac)");
                     return Response::Error(400, "kind must be ip or mac");
                 }
                 // Validate the value NOW so a malformed entry never enters the
@@ -3118,12 +3128,14 @@ namespace vgww {
                     // batch141: one canonical spelling, shared with the loader.
                     std::string canonical_ip;
                     if (!CanonicalBanIp(ban.value, canonical_ip)) {
+                        audit("ban add rejected (invalid ip address)");
                         return Response::Error(400, "invalid ip address");
                     }
                     ban.value = std::move(canonical_ip);
                 } else {
                     core::MacAddress m;
                     if (!core::ParseMac(ban.value, m)) {
+                        audit("ban add rejected (invalid mac address)");
                         return Response::Error(400, "invalid mac address");
                     }
                     // P8: canonical UPPERCASE colon form (matches /api/clients
@@ -3150,6 +3162,7 @@ namespace vgww {
                     request.query.end() != by_id) {
                     uint64_t id = 0;
                     if (!ParseListIndex(by_id->second, id) || 0 == id) {
+                        audit("ban delete rejected (invalid id)");
                         return Response::Error(400, "invalid id");
                     }
                     // P82: tombstone-full is a 500, not a 404.
@@ -3169,6 +3182,7 @@ namespace vgww {
                 }
                 const auto it = request.query.find("index");
                 if (request.query.end() == it) {
+                    audit("ban delete rejected (index or id required)");
                     return Response::Error(400, "index or id required");
                 }
                 // Mirror the portmap DELETE parsing: reject trailing junk so
@@ -3179,6 +3193,7 @@ namespace vgww {
                 // the exact reason it missed them there.
                 size_t index = 0;
                 if (!ParseListIndex(it->second, index)) {
+                    audit("ban delete rejected (invalid index)");
                     return Response::Error(400, "invalid index");
                 }
                 // batch88: one lock does the range check AND the erase (same
@@ -3219,6 +3234,7 @@ namespace vgww {
             server.Route("POST", "/api/ratelimit", [audit](const Request& request) {
                 RateLimitRule rule;
                 if (!JsonGetString(request.body, "mac", rule.mac)) {
+                    audit("ratelimit set rejected (mac required)");
                     return Response::Error(400, "mac required");
                 }
                 // batch139: optional ""replace_mac"". When present the rule
@@ -3244,6 +3260,7 @@ namespace vgww {
                     request.body.find("\"replace_mac\"");
                 if (replace_present &&
                     !JsonGetString(request.body, "replace_mac", replace_mac)) {
+                    audit("ratelimit set rejected (invalid replace_mac)");
                     return Response::Error(400, "invalid replace_mac");
                 }
                 const bool has_replace = replace_present;
@@ -3253,6 +3270,7 @@ namespace vgww {
                 {
                     core::MacAddress m;
                     if (!core::ParseMac(rule.mac, m)) {
+                        audit("ratelimit set rejected (invalid mac address)");
                         return Response::Error(400, "invalid mac address");
                     }
                     // P8: canonical UPPERCASE colon form so GET/UI echo a
@@ -3276,6 +3294,7 @@ namespace vgww {
                     rule.downlink_kbps = number;
                 }
                 if (0 == rule.uplink_kbps && 0 == rule.downlink_kbps) {
+                    audit("ratelimit set rejected (at least one direction > 0)");
                     return Response::Error(400, "at least one direction > 0");
                 }
                 if (has_replace) {
@@ -3285,6 +3304,7 @@ namespace vgww {
                     // request answered success.
                     core::MacAddress old_parsed;
                     if (!core::ParseMac(replace_mac, old_parsed)) {
+                        audit("ratelimit set rejected (invalid replace_mac)");
                         return Response::Error(400, "invalid replace_mac");
                     }
                     const std::string line =
@@ -3319,6 +3339,7 @@ namespace vgww {
             server.Route("DELETE", "/api/ratelimit", [audit](const Request& request) {
                 const auto it = request.query.find("mac");
                 if (request.query.end() == it) {
+                    audit("ratelimit delete rejected (mac required)");
                     return Response::Error(400, "mac required");
                 }
                 // P8 regression (audit A2): POST stores the MAC in canonical
