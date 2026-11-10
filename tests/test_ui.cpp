@@ -22127,6 +22127,53 @@ static void TestP100UiBindingPersistFailureIsAudited() {
     }
     CHECK(saw_failed);
 
+    // v4 delete: the runtime removal is live, the persisted row cannot be
+    // dropped - the audit line is the only durable record.
+    console_log::ClearForTest();
+    const CommandResult removed =
+        executor.Execute(Command{RemoveDhcpBindingCmd{
+            "02:00:00:00:a0:11"}});
+    CHECK(!removed.ok);
+    bool saw_delete_failed = false;
+    for (const auto& line : console_log::Snapshot()) {
+        if (line.find(L"[audit]") != std::wstring::npos &&
+            line.find(L"dhcp binding delete failed") != std::wstring::npos) {
+            saw_delete_failed = true;
+        }
+    }
+    CHECK(saw_delete_failed);
+
+    // v6 add: same defect class on the DHCPv6 row.
+    console_log::ClearForTest();
+    const CommandResult added6 =
+        executor.Execute(Command{AddDhcp6BindingCmd{
+            "00:03:00:01:02:00:00:a0:11",
+            "fd00:1133:4455:6677::1100", "ui-v6", ""}});
+    CHECK(!added6.ok);
+    bool saw_v6_failed = false;
+    for (const auto& line : console_log::Snapshot()) {
+        if (line.find(L"[audit]") != std::wstring::npos &&
+            line.find(L"dhcp6 binding add failed") != std::wstring::npos) {
+            saw_v6_failed = true;
+        }
+    }
+    CHECK(saw_v6_failed);
+
+    // v6 delete: the last of the four persist-failure paths.
+    console_log::ClearForTest();
+    const CommandResult removed6 =
+        executor.Execute(Command{RemoveDhcp6BindingCmd{
+            "00:03:00:01:02:00:00:a0:11"}});
+    CHECK(!removed6.ok);
+    bool saw_v6_delete_failed = false;
+    for (const auto& line : console_log::Snapshot()) {
+        if (line.find(L"[audit]") != std::wstring::npos &&
+            line.find(L"dhcp6 binding delete failed") != std::wstring::npos) {
+            saw_v6_delete_failed = true;
+        }
+    }
+    CHECK(saw_v6_delete_failed);
+
     std::string stop_error;
     CHECK(dataplane.Stop(stop_error));
     std::filesystem::remove_all(cfg_path, ec);
