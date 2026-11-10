@@ -2304,6 +2304,53 @@ static void TestB4PrivilegedEndpoints() {
     CHECK(audit.find("s3cr3t") == std::string::npos);
         api.Stop();
     }
+
+    // P120: the unwired-hook path (503) and the malformed-boolean path (400)
+    // must be audited too - both are refusals the operator can only see in
+    // the ring.
+    cfg.web.token = "s3cr3t";
+    audit.clear();
+    {
+        vgww::runtime::Dataplane dp(cfg);
+        HttpServer api;
+        vgww::web::RegisterApi(
+            api, dp, cfg, path, "s3cr3t", {}, /*repair=*/{}, /*autostart=*/{},
+            [&audit](const std::string& l) { audit += l + "\n"; });
+        constexpr uint16_t kPort = 18096;
+        std::string se;
+        CHECK(api.Start("127.0.0.1", kPort, se));
+        std::string body;
+        CHECK(HttpPost(kPort, "/api/repair-driver", "s3cr3t", "{}", body) ==
+              503);
+        CHECK(HttpPost(kPort, "/api/autostart", "s3cr3t",
+                       "{\"enabled\":true}", body) == 503);
+        CHECK(audit.find("repair-driver refused (unavailable)") !=
+              std::string::npos);
+        CHECK(audit.find("autostart refused (unavailable)") !=
+              std::string::npos);
+        api.Stop();
+    }
+    audit.clear();
+    {
+        vgww::runtime::Dataplane dp(cfg);
+        HttpServer api;
+        vgww::web::RegisterApi(
+            api, dp, cfg, path, "s3cr3t", {}, [] { return true; },
+            [&autostart_state](bool v) {
+                autostart_state = v;
+                return autostart_state;
+            },
+            [&audit](const std::string& l) { audit += l + "\n"; });
+        constexpr uint16_t kPort = 18096;
+        std::string se;
+        CHECK(api.Start("127.0.0.1", kPort, se));
+        std::string body;
+        CHECK(HttpPost(kPort, "/api/autostart", "s3cr3t",
+                       "{\"enabled\":\"yes\"}", body) == 400);
+        CHECK(audit.find("autostart rejected (enabled must be boolean)") !=
+              std::string::npos);
+        api.Stop();
+    }
     std::remove(path);
     std::remove(rules.c_str());
 }
