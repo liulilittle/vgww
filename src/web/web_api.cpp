@@ -2999,12 +2999,18 @@ namespace vgww {
                 for (const auto& existing : existing_rules) {
                     if (existing.proto == rule.proto &&
                         existing.wan_port == rule.wan_port) {
+                        audit(std::string("portmap add ") + rule.proto + ":" +
+                              std::to_string(rule.wan_port) +
+                              " failed (wan endpoint already mapped)");
                         return Response::Error(
                             400, "wan endpoint already mapped");
                     }
                 }
                 // Super-large guard: token-driven cap.
                 if (RuleStore::Instance().PortMapCount() >= ::vgww::core::limits::kMaxPortMaps) {
+                    audit(std::string("portmap add ") + rule.proto + ":" +
+                          std::to_string(rule.wan_port) +
+                          " failed (too many portmaps)");
                     return Response::Error(400, "too many portmaps");
                 }
                 const std::string line = "portmap add " + rule.proto + ":" +

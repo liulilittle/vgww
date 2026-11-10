@@ -2870,6 +2870,95 @@ static void TestP107WebBindingRefusalIsAudited() {
     std::remove(lease_path);
 }
 
+// P113: the rule add refusals (duplicate WAN endpoint, per-kind cap) used to
+// answer 400 with no audit line. The store-level cap is covered by TestB34o;
+// this pins the ROUTE's audit record for both the duplicate and the cap path.
+static void TestP113WebRuleAddRefusalIsAudited() {
+    using namespace vgww::core;
+    const char* path = "p113-rules.json";
+    const std::string rules = std::string(path) + ".rules.json";
+    std::remove(path);
+    std::error_code ec;
+    std::filesystem::remove_all(rules, ec);
+    vgww::web::RuleStore::Instance().AttachFile(rules);
+    vgww::web::RuleStore::Instance().Clear();
+
+    Config cfg;
+    cfg.web.port = 18140;
+    cfg.web.token = "tok";
+    bool ok = false;
+    cfg.gateway.ipv4 = ParseIpv4("192.168.55.1", ok);
+    cfg.gateway.mask = ParseIpv4("255.255.255.0", ok);
+    MacAddress mac{};
+    ParseMac("30:fc:68:88:b4:a5", mac);
+    cfg.gateway.mac = mac;
+    std::string err;
+    CHECK(cfg.SaveToFile(path, err));
+
+    vgww::runtime::Dataplane dp(cfg);
+    HttpServer api;
+    std::vector<std::string> audit_lines;
+    vgww::web::RegisterApi(
+        api, dp, cfg, path, "tok", {}, [] { return true; },
+        [](bool) { return false; },
+        [&audit_lines](const std::string& line) {
+            audit_lines.push_back(line);
+        });
+    constexpr uint16_t kPort = 18140;
+    CHECK(api.Start("127.0.0.1", kPort, err));
+
+    std::string body;
+    // A duplicate WAN endpoint is a conflict, not a silent shadow.
+    CHECK(HttpPost(kPort, "/api/portmap", "tok",
+                   R"({"proto":"tcp","wan_port":8080,"lan_ip":"192.168.55.5","lan_port":80})",
+                   body) == 200);
+    audit_lines.clear();
+    CHECK(HttpPost(kPort, "/api/portmap", "tok",
+                   R"({"proto":"tcp","wan_port":8080,"lan_ip":"192.168.55.6","lan_port":81})",
+                   body) == 400);
+    bool saw_duplicate = false;
+    for (const auto& line : audit_lines) {
+        if (line.find("portmap add tcp:8080") != std::string::npos &&
+            line.find("failed (wan endpoint already mapped)") !=
+                std::string::npos) {
+            saw_duplicate = true;
+        }
+    }
+    CHECK(saw_duplicate);
+
+    // The per-kind cap: fill the store directly, then POST the overflow.
+    vgww::web::RuleStore::Instance().Clear();
+    for (size_t i = 0; i < ::vgww::core::limits::kMaxPortMaps; ++i) {
+        vgww::web::PortMappingRule m;
+        m.proto = "tcp";
+        m.wan_port = static_cast<uint16_t>(1 + i);
+        m.lan_ip = "192.168.55.10";
+        m.lan_port = 80;
+        vgww::web::RuleStore::Instance().AddPortMap(std::move(m));
+    }
+    // The route's own pre-check refuses the overflow before the store's cap
+    // can be reached: the line is the duplicate-conflict one (the WAN port
+    // 50001 is free, so this is the cap pre-check refusing the add).
+    audit_lines.clear();
+    CHECK(HttpPost(kPort, "/api/portmap", "tok",
+                   R"({"proto":"tcp","wan_port":50001,"lan_ip":"192.168.55.7","lan_port":82})",
+                   body) == 400);
+    bool saw_cap = false;
+    for (const auto& line : audit_lines) {
+        if (line.find("portmap add tcp:50001") != std::string::npos &&
+            line.find("failed (too many portmaps)") != std::string::npos) {
+            saw_cap = true;
+        }
+    }
+    CHECK(saw_cap);
+
+    api.Stop();
+    vgww::web::RuleStore::Instance().AttachFile("");
+    vgww::web::RuleStore::Instance().Clear();
+    std::remove(path);
+    std::filesystem::remove_all(rules, ec);
+}
+
 // P104: a failed rule delete used to leave no audit line - only the HTTP
 // 404/500. The ring is the operator's durable record, so a refused or missing
 // delete must be visible there too.
@@ -9153,6 +9242,7 @@ int main(int argc, char** argv) {
     TestP102WebBindingPersistFailureIsAudited();
     TestP104RuleDeleteFailureIsAudited();
     TestP107WebBindingRefusalIsAudited();
+    TestP113WebRuleAddRefusalIsAudited();
     TestB126WebConsoleReportsDropped();
     TestB127StatusContractKeys();
     TestB113NoApplierDoesNotStampAttempt();
