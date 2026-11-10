@@ -113,6 +113,17 @@ namespace vgww {
         return options;
     }
 
+    bool BypassesSingleInstanceGate(
+        const std::vector<std::string>& args) noexcept {
+        // P87: the gate has one bypass rule - a headless run owns no window.
+        // --web-only implies headless (see ParseStartupOptions), so it bypasses
+        // too; the flags that used to bypass (--ui-debug-port / --ui-page) are
+        // NOT here anymore (batch37h): they run a visible window, so a second
+        // launch must be refused instead of starting a duplicate app.
+        const StartupOptions options = ParseStartupOptions(args);
+        return options.headless;
+    }
+
     bool IsKnownUiPage(const std::string& id) noexcept {
         static constexpr const char* kUiPages[] = {
             "dashboard", "firewall", "portmap", "ratelimit",

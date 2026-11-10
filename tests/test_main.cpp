@@ -72,6 +72,26 @@ TEST(MainStartup, WebOnly) {
     EXPECT_TRUE(o.web_only && o.web && !o.ui && o.headless);
 }
 
+// P87: the single-instance gate has exactly one bypass - a headless run owns
+// no window to activate. The old local literal scan only matched "--headless",
+// so a --web-only WebUI beside the normal launch was refused as a second
+// instance and never started. The predicate must now be testable and must
+// cover --web-only (implied headless) while still gating the visible-window
+// flags (--ui-debug-port / --ui-page / --minimized), which batch37h removed
+// from the bypass set.
+TEST(MainStartup, GateBypassIsHeadlessOnly) {
+    EXPECT_TRUE(vgww::BypassesSingleInstanceGate({"--headless"}));
+    EXPECT_TRUE(vgww::BypassesSingleInstanceGate({"--web-only"}));
+    EXPECT_TRUE(vgww::BypassesSingleInstanceGate(
+        {"--config=x.json", "--web-only"}));
+    // A GUI launch is gated - even with the debug/test flags.
+    EXPECT_TRUE(!vgww::BypassesSingleInstanceGate({}));
+    EXPECT_TRUE(!vgww::BypassesSingleInstanceGate({"--config=x.json"}));
+    EXPECT_TRUE(!vgww::BypassesSingleInstanceGate({"--minimized"}));
+    EXPECT_TRUE(!vgww::BypassesSingleInstanceGate({"--ui-page=dashboard"}));
+    EXPECT_TRUE(!vgww::BypassesSingleInstanceGate({"--ui-debug-port=19777"}));
+}
+
 TEST(MainStartup, NoWebOverridesTheConfigDefault) {
     // web.enabled defaults to true, so --no-web is what turns the server off.
     const vgww::StartupOptions o = vgww::ParseStartupOptions(Args({"--no-web"}));
@@ -517,6 +537,7 @@ int main() {
     MainStartup_MinimizedKeepsUi();
     MainStartup_MinimizedAndHeadlessHeadlessWins();
     MainStartup_WebOnly();
+    MainStartup_GateBypassIsHeadlessOnly();
     MainStartup_NoWebOverridesTheConfigDefault();
     MainStartup_WebThenNoWebOff();
     MainStartup_ConsoleFlagDocumentedBehavior();

@@ -234,12 +234,11 @@ namespace {
         // single-instance gate. Only a headless run (no window) may bypass it;
         // --ui-debug-port/--ui-page used to bypass too, which let a debug
         // instance and a normal launch coexist as two visible apps.
-        // P87: --web-only is ALSO headless (no window to activate), so it
-        // must bypass the gate too; otherwise a --web-only WebUI beside the
-        // normal launch would be refused as a second instance and never
-        // start. This mirrors options.headless = has("--headless") ||
-        // options.web_only.
-        const bool headless_run = options.headless;
+        // P87: the predicate is the testable BypassesSingleInstanceGate()
+        // (options.headless), not a local literal scan, so the gate and its
+        // tests cannot drift apart. --web-only is headless too, so it bypasses.
+        const bool headless_run =
+            vgww::BypassesSingleInstanceGate(args);
         if (!headless_run) {
             const vgww::ui::InstanceClaim claim =
                 vgww::ui::ClaimSingleInstance();

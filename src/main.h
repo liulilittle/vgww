@@ -28,6 +28,14 @@ namespace vgww {
     StartupOptions ParseStartupOptions(
         const std::vector<std::string>& args) noexcept;
 
+    /// True when this launch must bypass the single-instance gate. Only a
+    /// headless run has no window to activate, so only it may coexist with
+    /// another instance (--headless, and --web-only which implies headless).
+    /// A GUI launch - including --ui-debug-port / --ui-page / --minimized -
+    /// must always participate, so a second visible app cannot start.
+    bool BypassesSingleInstanceGate(
+        const std::vector<std::string>& args) noexcept;
+
     /// Returns true when `id` is one of the 9 pages registered by
     /// RegisterAllPages. Keep in sync with src/ui/pages/*.cpp id() literals
     /// (cross-layer double source; drift risk accepted, see audit R3).
