@@ -3,6 +3,8 @@
 // ============================================================================
 #include "ui/snapshot.h"
 
+#include "ui/console_log.h"
+
 #include <algorithm>
 #include <cstdio>
 #include <exception>
@@ -257,9 +259,19 @@ namespace vgww {
         bool CommandQueue::Post(Command cmd) {
             std::lock_guard<std::mutex> lock(mutex_);
             if (!running_) {
+                // P108: a command posted while the worker is down was dropped
+                // with only a caller-side toast; the ring is the operator's
+                // durable record, so a silently refused command must land there.
+                console_log::AppendAuditLine(
+                    "command refused (worker not running)");
                 return false;
             }
             if (queue_.size() >= kMaxPendingCommands) {
+                // P108: the 65th pending command is backpressure, not a
+                // success - record the refusal so the operator can see that a
+                // click never became a command.
+                console_log::AppendAuditLine(
+                    "command refused (queue full)");
                 return false;  // backpressure: the UI shows a busy toast
             }
             queue_.push_back(std::move(cmd));

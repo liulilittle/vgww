@@ -7401,6 +7401,65 @@ static void TestBusyToastOnFullQueue() {
     I18n::Instance().SetLang(Lang::ZhCN);
 }
 
+// P108: a command the queue refuses (worker down, or the 64-slot backpressure
+// cap) used to be dropped with only a caller-side toast. The ring is the
+// operator's durable record, so a refused command must land there too.
+static void TestP108QueueRefusalIsAudited() {
+    using namespace vgww::ui;
+    FixTextMetrics();
+    console_log::ClearForTest();
+    ShellFakeSource source;
+    GatedExecutor executor;
+    UiController controller(source, executor);
+    std::string error;
+    CHECK(controller.Start(error));
+
+    // The worker takes one command and blocks; the queue then holds 64.
+    CHECK(controller.Post(Command{AddBanCmd{"mac", "gate"}}));
+    const auto deadline = std::chrono::steady_clock::now() +
+                          std::chrono::seconds(3);
+    while (!executor.entered.load(std::memory_order_acquire) &&
+           std::chrono::steady_clock::now() < deadline) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(2));
+    }
+    CHECK(executor.entered.load(std::memory_order_acquire));
+    for (int i = 0; i < 64; ++i) {
+        CHECK(controller.Post(
+            Command{AddBanCmd{"mac", "q" + std::to_string(i)}}));
+    }
+    console_log::ClearForTest();
+    CHECK(!controller.Post(
+        Command{AddBanCmd{"mac", "fill-check"}}));  // 65th rejected
+    bool saw_full = false;
+    for (const auto& line : console_log::Snapshot()) {
+        if (line.find(L"[audit]") != std::wstring::npos &&
+            line.find(L"command refused (queue full)") != std::wstring::npos) {
+            saw_full = true;
+        }
+    }
+    CHECK(saw_full);
+
+    executor.release.store(true, std::memory_order_release);
+    controller.Stop();
+
+    // A worker that is down refuses every Post - record it too.
+    console_log::ClearForTest();
+    ShellFakeSource source2;
+    GatedExecutor executor2;
+    UiController controller2(source2, executor2);
+    CHECK(!controller2.Post(Command{AddBanCmd{"mac", "down"}}));
+    bool saw_down = false;
+    for (const auto& line : console_log::Snapshot()) {
+        if (line.find(L"[audit]") != std::wstring::npos &&
+            line.find(L"command refused (worker not running)") !=
+                std::wstring::npos) {
+            saw_down = true;
+        }
+    }
+    CHECK(saw_down);
+    console_log::ClearForTest();
+}
+
 static void TestPageUtilNarrow() {
     using namespace vgww::ui;
     // S6 migration guard: Narrow is defined out-of-line in page_util.cpp but
@@ -35386,6 +35445,7 @@ int main() {
     TestDialogNestedShowGuard(); TestDialogRetireAndSweep();
     TestSelectPopupHitTest(); TestModalTabStaysInsideDialog();
     TestBusyToastOnFullQueue();
+    TestP108QueueRefusalIsAudited();
     TestPageUtilNarrow();
     TestTextInputMouseCaret();
     TestM7CaretPrefixWidthCache();
