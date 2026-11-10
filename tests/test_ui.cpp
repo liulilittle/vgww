@@ -24964,6 +24964,133 @@ static void TestP107UiAddRefusalIsAudited() {
     console_log::ClearForTest();
 }
 
+// P118: the UI command executor's input-validation refusals (malformed
+// command, missing runtime) used to leave no audit line - only the toast.
+// P116 covered the Web routes; the native executor is the same contract.
+static void TestP118UiValidationRefusalIsAudited() {
+    using namespace vgww::ui;
+    FixTextMetrics();
+    console_log::ClearForTest();
+    vgww::web::RuleStore& store = vgww::web::RuleStore::Instance();
+    store.AttachFile("");
+    store.Clear();
+
+    vgww::core::Config cfg;
+    bool ok = false;
+    cfg.gateway.ipv4 = vgww::core::ParseIpv4("192.168.59.1", ok);
+    cfg.gateway.mask = vgww::core::ParseIpv4("255.255.255.0", ok);
+    vgww::core::ParseMac("30:fc:68:88:b4:a9", cfg.gateway.mac);
+    vgww::runtime::Dataplane dataplane(cfg);  // not started: no runtime
+    DataplaneCommandExecutor executor(dataplane, "");
+
+    const auto saw = [](const std::wstring& needle) {
+        for (const auto& line : console_log::Snapshot()) {
+            if (line.find(L"[audit]") != std::wstring::npos &&
+                line.find(needle) != std::wstring::npos) {
+                return true;
+            }
+        }
+        return false;
+    };
+
+    // portmap: proto / lan ip / port zero.
+    console_log::ClearForTest();
+    CHECK(!executor
+              .Execute(Command{AddPortMapCmd{"udp", 8080, "192.168.59.5", 80}})
+              .ok);
+    CHECK(saw(L"portmap add rejected (only tcp is supported)"));
+
+    console_log::ClearForTest();
+    CHECK(!executor
+              .Execute(Command{AddPortMapCmd{"tcp", 8080, "not-an-ip", 80}})
+              .ok);
+    CHECK(saw(L"portmap add rejected (invalid lan ip)"));
+
+    console_log::ClearForTest();
+    CHECK(!executor
+              .Execute(Command{AddPortMapCmd{"tcp", 0, "192.168.59.5", 80}})
+              .ok);
+    CHECK(saw(L"portmap add rejected (ports must be non-zero)"));
+
+    // ban: kind / ip / mac.
+    console_log::ClearForTest();
+    CHECK(!executor
+              .Execute(Command{AddBanCmd{"ip", "999.1.1.1"}})
+              .ok);
+    CHECK(saw(L"ban add rejected (invalid ip)"));
+
+    console_log::ClearForTest();
+    CHECK(!executor
+              .Execute(Command{AddBanCmd{"mac", "not-a-mac"}})
+              .ok);
+    CHECK(saw(L"ban add rejected (invalid mac)"));
+
+    console_log::ClearForTest();
+    CHECK(!executor
+              .Execute(Command{AddBanCmd{"domain", "example"}})
+              .ok);
+    CHECK(saw(L"ban add rejected (kind must be ip or mac)"));
+
+    // ratelimit: mac / both directions zero.
+    console_log::ClearForTest();
+    CHECK(!executor
+              .Execute(Command{SetRateLimitCmd{"bogus", 100, 0, ""}})
+              .ok);
+    CHECK(saw(L"ratelimit set rejected (invalid mac)"));
+
+    console_log::ClearForTest();
+    CHECK(!executor
+              .Execute(Command{SetRateLimitCmd{"02:00:00:00:00:0a", 0, 0, ""}})
+              .ok);
+    CHECK(saw(L"ratelimit set rejected (at least one direction > 0)"));
+
+    // bindings: validation + missing runtime + missing binding.
+    console_log::ClearForTest();
+    CHECK(!executor
+              .Execute(Command{AddDhcpBindingCmd{"bad", "192.168.59.50", "", ""}})
+              .ok);
+    CHECK(saw(L"dhcp binding add rejected (invalid mac)"));
+
+    console_log::ClearForTest();
+    CHECK(!executor
+              .Execute(Command{AddDhcpBindingCmd{"02:00:00:00:00:0c", "nope", "", ""}})
+              .ok);
+    CHECK(saw(L"dhcp binding add rejected (invalid ip)"));
+
+    console_log::ClearForTest();
+    CHECK(!executor
+              .Execute(Command{AddDhcpBindingCmd{"02:00:00:00:00:0c", "192.168.59.50", "", ""}})
+              .ok);
+    CHECK(saw(L"dhcp binding add rejected (dhcp disabled)"));
+
+    console_log::ClearForTest();
+    CHECK(!executor
+              .Execute(Command{RemoveDhcpBindingCmd{"02:00:00:00:00:0c"}})
+              .ok);
+    CHECK(saw(L"dhcp binding delete rejected (dhcp disabled)"));
+
+    console_log::ClearForTest();
+    CHECK(!executor
+              .Execute(Command{AddDhcp6BindingCmd{"", "fd00::1", "", ""}})
+              .ok);
+    CHECK(saw(L"dhcp6 binding add rejected (empty duid)"));
+
+    console_log::ClearForTest();
+    CHECK(!executor
+              .Execute(Command{AddDhcp6BindingCmd{"00:01:00:00:00:01", "fd00::1", "", ""}})
+              .ok);
+    CHECK(saw(L"dhcp6 binding add rejected (dhcp6 disabled)"));
+
+    console_log::ClearForTest();
+    CHECK(!executor
+              .Execute(Command{RemoveDhcp6BindingCmd{""}})
+              .ok);
+    CHECK(saw(L"dhcp6 binding delete rejected (empty duid)"));
+
+    store.Clear();
+    console_log::ClearForTest();
+}
+
 static void TestB276ShortAdapterNameBoundaries() {
     using namespace vgww::ui;
     FixTextMetrics();
@@ -35775,6 +35902,7 @@ int main() {
     TestP100UiBindingPersistFailureIsAudited();
     TestP105UiRuleDeleteFailureIsAudited();
     TestP107UiAddRefusalIsAudited();
+    TestP118UiValidationRefusalIsAudited();
     TestP89DirtyStopIsNotReportedClean();
     TestP90RecheckSurfacesDirtyStop();
     TestB103LeasePersistVerdictSurface();

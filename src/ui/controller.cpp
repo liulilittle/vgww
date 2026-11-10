@@ -147,14 +147,20 @@ namespace vgww {
 
             CommandResult DoAddPortMap(const AddPortMapCmd& cmd) {
                 if ("tcp" != cmd.proto) {
+                    console_log::AppendAuditLine(
+                        "portmap add rejected (only tcp is supported)");
                     return Fail(I18n::Instance().Copy(Str::CmdTcpOnly));
                 }
                 bool ok = false;
                 vgww::core::ParseIpv4(cmd.lan_ip, ok);
                 if (!ok) {
+                    console_log::AppendAuditLine(
+                        "portmap add rejected (invalid lan ip)");
                     return Fail(I18n::Instance().Copy(Str::CmdLanIpInvalid));
                 }
                 if (0 == cmd.wan_port || 0 == cmd.lan_port) {
+                    console_log::AppendAuditLine(
+                        "portmap add rejected (ports must be non-zero)");
                     return Fail(I18n::Instance().Copy(Str::CmdPortNotZero));
                 }
                 web::RuleStore& store = web::RuleStore::Instance();
@@ -263,14 +269,20 @@ namespace vgww {
                     bool ok = false;
                     vgww::core::ParseIpv4(cmd.value, ok);
                     if (!ok) {
+                        console_log::AppendAuditLine(
+                            "ban add rejected (invalid ip)");
                         return Fail(I18n::Instance().Copy(Str::CmdIpInvalid));
                     }
                 } else if ("mac" == cmd.kind) {
                     vgww::core::MacAddress mac{};
                     if (!vgww::core::ParseMac(cmd.value, mac)) {
+                        console_log::AppendAuditLine(
+                            "ban add rejected (invalid mac)");
                         return Fail(I18n::Instance().Copy(Str::CmdMacInvalid));
                     }
                 } else {
+                    console_log::AppendAuditLine(
+                        "ban add rejected (kind must be ip or mac)");
                     return Fail(I18n::Instance().Copy(Str::CmdBanKindInvalid));
                 }
                 web::RuleStore& store = web::RuleStore::Instance();
@@ -341,9 +353,13 @@ namespace vgww {
             CommandResult DoSetRateLimit(const SetRateLimitCmd& cmd) {
                 vgww::core::MacAddress mac{};
                 if (!vgww::core::ParseMac(cmd.mac, mac)) {
+                    console_log::AppendAuditLine(
+                        "ratelimit set rejected (invalid mac)");
                     return Fail(I18n::Instance().Copy(Str::CmdMacInvalid));
                 }
                 if (0 == cmd.up_kbps && 0 == cmd.down_kbps) {
+                    console_log::AppendAuditLine(
+                        "ratelimit set rejected (at least one direction > 0)");
                     return Fail(I18n::Instance().Copy(Str::CmdRateBothZero));
                 }
                 web::RateLimitRule rule;
@@ -475,14 +491,20 @@ namespace vgww {
                                            const AddDhcpBindingCmd& cmd) {
                 vgww::core::MacAddress mac{};
                 if (!vgww::core::ParseMac(cmd.mac, mac)) {
+                    console_log::AppendAuditLine(
+                        "dhcp binding add rejected (invalid mac)");
                     return Fail(I18n::Instance().Copy(Str::CmdMacInvalid));
                 }
                 bool ok = false;
                 const uint32_t ip = vgww::core::ParseIpv4(cmd.ip, ok);
                 if (!ok || 0 == ip) {
+                    console_log::AppendAuditLine(
+                        "dhcp binding add rejected (invalid ip)");
                     return Fail(I18n::Instance().Copy(Str::CmdIpInvalid));
                 }
                 if (!dataplane.DhcpActive()) {
+                    console_log::AppendAuditLine(
+                        "dhcp binding add rejected (dhcp disabled)");
                     return Fail(I18n::Instance().Copy(Str::CmdDhcpDisabled));
                 }
                 // batch137: a MAC edit arrives as ONE command carrying the old
@@ -515,12 +537,19 @@ namespace vgww {
                 const RemoveDhcpBindingCmd& cmd) {
                 vgww::core::MacAddress mac{};
                 if (!vgww::core::ParseMac(cmd.mac, mac)) {
+                    console_log::AppendAuditLine(
+                        "dhcp binding delete rejected (invalid mac)");
                     return Fail(I18n::Instance().Copy(Str::CmdMacInvalid));
                 }
                 if (!dataplane.DhcpActive()) {
+                    console_log::AppendAuditLine(
+                        "dhcp binding delete rejected (dhcp disabled)");
                     return Fail(I18n::Instance().Copy(Str::CmdDhcpDisabled));
                 }
                 if (!dataplane.RemoveDhcpBinding(cmd.mac)) {
+                    console_log::AppendAuditLine(
+                        "dhcp binding delete " + cmd.mac +
+                        " failed (no such binding)");
                     return Fail(I18n::Instance().Copy(Str::CmdDhcpBindingMissing));
                 }
                 // batch97: drop the persisted row too (delete of an absent row
@@ -542,12 +571,18 @@ namespace vgww {
                                             const std::string& config_path,
                                             const AddDhcp6BindingCmd& cmd) {
                 if (cmd.duid.empty()) {
+                    console_log::AppendAuditLine(
+                        "dhcp6 binding add rejected (empty duid)");
                     return Fail(I18n::Instance().Copy(Str::CmdDuidEmpty));
                 }
                 if (!IsValidIpv6(cmd.ip)) {
+                    console_log::AppendAuditLine(
+                        "dhcp6 binding add rejected (invalid ipv6)");
                     return Fail(I18n::Instance().Copy(Str::CmdIpv6Invalid));
                 }
                 if (!dataplane.Dhcp6Active()) {
+                    console_log::AppendAuditLine(
+                        "dhcp6 binding add rejected (dhcp6 disabled)");
                     return Fail(I18n::Instance().Copy(Str::CmdDhcp6Disabled));
                 }
                 // batch137: same one-command re-key as the v4 sibling.
@@ -576,12 +611,19 @@ namespace vgww {
                 runtime::Dataplane& dataplane, const std::string& config_path,
                 const RemoveDhcp6BindingCmd& cmd) {
                 if (cmd.duid.empty()) {
+                    console_log::AppendAuditLine(
+                        "dhcp6 binding delete rejected (empty duid)");
                     return Fail(I18n::Instance().Copy(Str::CmdDuidEmpty));
                 }
                 if (!dataplane.Dhcp6Active()) {
+                    console_log::AppendAuditLine(
+                        "dhcp6 binding delete rejected (dhcp6 disabled)");
                     return Fail(I18n::Instance().Copy(Str::CmdDhcp6Disabled));
                 }
                 if (!dataplane.RemoveDhcp6Binding(cmd.duid)) {
+                    console_log::AppendAuditLine(
+                        "dhcp6 binding delete " + cmd.duid +
+                        " failed (no such binding)");
                     return Fail(I18n::Instance().Copy(Str::CmdDhcp6BindingMissing));
                 }
                 // batch97: drop the persisted v6 row too.
