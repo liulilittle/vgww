@@ -31414,6 +31414,54 @@ static void TestB125LifecycleCommandsAreAudited() {
     CHECK(contains("[audit] autostart set 1"));
 }
 
+// P85: the language switch is a privileged preference change (it persists to
+// the config document); the native UI is the primary interface, so it must
+// leave the same audit trail the other commands do.
+static void TestB127LanguageSwitchIsAudited() {
+    using namespace vgww::ui;
+    FixTextMetrics();
+    console_log::ClearForTest();
+
+    const std::string cfg_path = "test_ui_b127_cfg.json";
+    std::remove(cfg_path.c_str());
+    vgww::core::Config cfg;
+    cfg.adapter = "Ethernet";
+    cfg.mode = vgww::core::Mode::kMain;
+    bool parsed = false;
+    cfg.gateway.ipv4 = vgww::core::ParseIpv4("192.168.53.1", parsed);
+    cfg.gateway.mask = vgww::core::ParseIpv4("255.255.255.0", parsed);
+    cfg.gateway.mac = {0x30, 0xFC, 0x68, 0x88, 0xB4, 0x73};
+    std::string err;
+    CHECK(cfg.SaveToFile(cfg_path, err));
+
+    vgww::runtime::Dataplane dataplane(cfg);
+    DataplaneCommandExecutor executor(dataplane, cfg_path);
+    ShellFakeSource source;
+    UiController controller(source, executor);
+    CHECK(controller.Start(err));
+
+    CHECK(controller.Post(Command{SetLanguageCmd{"en"}}));
+    CHECK(controller.Post(Command{SetLanguageCmd{"zh-CN"}}));
+    controller.Stop();
+
+    const auto lines = console_log::Snapshot();
+    const auto count = [&lines](const std::string& needle) {
+        const std::wstring needle_w(needle.begin(), needle.end());
+        size_t n = 0;
+        for (const auto& line : lines) {
+            if (line.find(needle_w) != std::wstring::npos) {
+                ++n;
+            }
+        }
+        return n;
+    };
+    CHECK(count("[audit] language set en") == 1);
+    CHECK(count("[audit] language set zh-CN") == 1);
+
+    console_log::ClearForTest();
+    std::remove(cfg_path.c_str());
+}
+
 static void TestB124NativeUiCommandsAreAudited() {
     using namespace vgww::ui;
     FixTextMetrics();
@@ -35018,6 +35066,7 @@ int main() {
     TestB121ParseRejectsSurface();
     TestB124NativeUiCommandsAreAudited();
     TestB125LifecycleCommandsAreAudited();
+    TestB127LanguageSwitchIsAudited();
     TestB126ConsoleDroppedSurface();
     TestB104Dhcp6PoolExhaustionSurface();
     TestB24AdapterWarningBanner();

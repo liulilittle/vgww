@@ -587,6 +587,11 @@ namespace vgww {
                     return Fail(i18n.FormatCopy(Str::SaveWriteFailedFmt,
                                             {Widen(error)}));
                 }
+                // P85: a language switch is a privileged preference change
+                // (it rewrites the config document); it must leave the same
+                // audit trail as every other native command.
+                console_log::AppendAuditLine(std::string("language set ") +
+                                             cmd.code);
                 return Ok(i18n.Copy(Str::SaveLangApplied));
             }
             CommandResult DoSetAutostart(
