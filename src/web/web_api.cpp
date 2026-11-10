@@ -2222,10 +2222,19 @@ namespace vgww {
                 return request.path == "/api/repair-driver" ||
                        request.path == "/api/autostart";
             };
+            auto audit = [audit_log](const std::string& line) {
+                if (audit_log) audit_log(line);
+            };
+            // P125: an authentication refusal used to leave no audit line -
+            // only the HTTP 401/403. The ring is the operator's durable
+            // record of who tried to change the router, so a refused
+            // credential must be visible there too. The global write guard
+            // answers before any route handler runs, so the audit callback
+            // must be reachable from the guard itself.
             if (auth_token != nullptr) {
                 server.SetWriteGuard(
-                    [auth_token, is_privileged_path](const Request& request)
-                        -> Response {
+                    [auth_token, is_privileged_path,
+                     audit_log](const Request& request) -> Response {
                         Response pass = Response::Json("{\"ok\":true}");
                         pass.status = 200;
                         if (is_privileged_path(request)) {
@@ -2251,6 +2260,11 @@ namespace vgww {
                                      auth->second.substr(7), state.token);
                         }
                         if (!ok) {
+                            if (audit_log) {
+                                audit_log(
+                                    "request refused (unauthorized: "
+                                    "invalid token)");
+                            }
                             return Response::Error(401, "unauthorized");
                         }
                         return pass;
@@ -2505,11 +2519,14 @@ namespace vgww {
             //         operations stay refused - we do NOT invent a credential),
             //   401 = a credential exists but the request did not carry it.
             const auto privileged_denied =
-                [auth_token](const Request& request) -> std::optional<Response> {
+                [auth_token, audit](const Request& request)
+                -> std::optional<Response> {
                 const AuthTokenSnapshot state =
                     auth_token != nullptr ? auth_token->Get()
                                           : AuthTokenSnapshot{};
                 if (!state.configured) {
+                    audit("request refused (forbidden: no credential "
+                          "configured)");
                     return Response::Error(403, "forbidden");
                 }
                 std::string provided;
@@ -2526,12 +2543,10 @@ namespace vgww {
                     }
                 }
                 if (!ConstantTimeEquals(provided, state.token)) {
+                    audit("request refused (unauthorized: invalid token)");
                     return Response::Error(401, "unauthorized");
                 }
                 return std::nullopt;
-            };
-            auto audit = [audit_log](const std::string& line) {
-                if (audit_log) audit_log(line);
             };
             auto repair_pending_until =
                 std::make_shared<std::atomic<std::int64_t>>(0);  // steady ms

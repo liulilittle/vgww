@@ -2215,7 +2215,8 @@ static void TestB4PrivilegedEndpoints() {
         CHECK(HttpPost(kPort, "/api/autostart", "secret", "{\"enabled\":true}",
                        body) == 403);
         CHECK(setter_calls == 0);  // 403 must not reach the OS layer
-        CHECK(audit.empty());
+        // P125: the refusal is audited (no credential configured).
+        CHECK(audit.find("request refused (forbidden") != std::string::npos);
         api.Stop();
     }
 
@@ -2248,6 +2249,10 @@ static void TestB4PrivilegedEndpoints() {
         CHECK(setter_calls == 0);
         // An UNRELATED route keeps the old guard behaviour (401 on a bad token).
         CHECK(HttpPost(kPort, "/api/portmap", "wrong", "{}", body) == 401);
+        // P125: the GLOBAL write guard's refusal is audited too (this route
+        // bypasses the endpoint-level check, so only the guard fires).
+        CHECK(audit.find("request refused (unauthorized: invalid token)") !=
+              std::string::npos);
         api.Stop();
     }
 
@@ -2272,6 +2277,8 @@ static void TestB4PrivilegedEndpoints() {
         std::string body;
         // Case 2: wrong token -> 401 (global write guard).
         CHECK(HttpPost(kPort, "/api/repair-driver", "wrong", "{}", body) == 401);
+        // P125: the auth refusal is audited.
+        CHECK(audit.find("request refused (unauthorized") != std::string::npos);
         // Case 3: correct token -> 200 requested:true.
         CHECK(HttpPost(kPort, "/api/repair-driver", "s3cr3t", "{}", body) == 200);
         CHECK(body.find("\"requested\":true") != std::string::npos);
