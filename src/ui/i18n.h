@@ -509,6 +509,10 @@ namespace vgww {
             CmdServiceStarted,
             CmdServiceStopped,
             CmdServiceRechecked,
+            /// P87: a stop that succeeded but could not persist the lease
+            /// document must not report a clean stop (batch100: Stop returns
+            /// true with a non-empty error in that case).
+            CmdServiceStoppedDirty,
             /// batch118: driver-repair summary and tray-autostart results,
             /// both user-visible through the same toast path.
             FixRefusedSummary,

@@ -405,6 +405,7 @@ namespace vgww {
                 L"服务已开始",  // CmdServiceStarted
                 L"服务已停止",  // CmdServiceStopped
                 L"已重新检测网卡",  // CmdServiceRechecked
+                L"服务已停止，但租约文件保存失败：{0}",  // CmdServiceStoppedDirty
                 L"UAC 被拒绝或提权启动失败",  // FixRefusedSummary
                 L"安装器仍未完成",  // FixStillRunningSummary
                 L"未知错误",  // CommonUnknownError
@@ -802,6 +803,7 @@ namespace vgww {
                 L"Service started",  // CmdServiceStarted
                 L"Service stopped",  // CmdServiceStopped
                 L"Adapter re-checked",  // CmdServiceRechecked
+                L"Service stopped, but the lease file could not be saved: {0}",  // CmdServiceStoppedDirty
                 L"UAC was declined or the elevation launch failed",  // FixRefusedSummary
                 L"The installer has not finished yet",  // FixStillRunningSummary
                 L"Unknown error",  // CommonUnknownError

@@ -634,6 +634,17 @@ namespace vgww {
                 if (!dataplane.Stop(error)) {
                     return Fail(Widen(error));
                 }
+                // batch100 semantics: a clean teardown whose lease dump failed
+                // returns true with a non-empty error. Reporting a plain
+                // "stopped" hides the lost lease snapshot from the operator -
+                // the same verdict main.cpp checks with
+                // `!stop_error.empty()` (src/main.cpp:830) and the leases page
+                // shows via UiSnapshot.lease_persist_failed.
+                if (!error.empty()) {
+                    console_log::AppendAuditLine("service stopped (lease save failed)");
+                    return Ok(I18n::Instance().FormatCopy(
+                        Str::CmdServiceStoppedDirty, {Widen(error)}));
+                }
                 console_log::AppendAuditLine("service stopped");
                 return Ok(I18n::Instance().Copy(Str::CmdServiceStopped));
             }

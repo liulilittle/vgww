@@ -31903,14 +31903,67 @@ static void TestB115RulesPersistFailureSurface() {
     std::filesystem::remove_all(dir);
 }
 
+// P89: a stop whose lease dump failed must not be reported as a clean stop.
+// batch100 makes Stop() return true with a non-empty error for that case (the
+// plane did stop; the snapshot did not land), but DoStopService only checked
+// the bool and returned the plain "stopped" message - so the operator saw a
+// clean stop while the lease mappings were lost, the opposite of the verdict
+// the leases page shows (UiSnapshot.lease_persist_failed) and of main.cpp's
+// `!stop_error.empty()` handling.
+static void TestP89DirtyStopIsNotReportedClean() {
+    using namespace vgww::ui;
+    FixTextMetrics();
+    I18n::Instance().SetLang(Lang::ZhCN);
+
+    vgww::core::Config cfg;
+    cfg.adapter = "Ethernet";
+    cfg.mode = vgww::core::Mode::kMain;
+    cfg.dhcp.enabled = true;
+    bool parsed = false;
+    cfg.gateway.ipv4 = vgww::core::ParseIpv4("192.168.47.1", parsed);
+    cfg.gateway.mask = vgww::core::ParseIpv4("255.255.255.0", parsed);
+    cfg.gateway.mac = {0x30, 0xFC, 0x68, 0x88, 0xB4, 0x68};
+    cfg.dhcp.pool_start = vgww::core::ParseIpv4("192.168.47.100", parsed);
+    cfg.dhcp.pool_end = vgww::core::ParseIpv4("192.168.47.200", parsed);
+    cfg.perf.workers = 2;
+    cfg.perf.ring_capacity = 256;
+    cfg.perf.max_conns = 64;
+    cfg.perf.dial_timeout_ms = 400;
+
+    const std::string lease_path = "test_ui_p89_leases.json";
+    std::remove(lease_path.c_str());
+    vgww::runtime::Dataplane dataplane(cfg, lease_path);
+    dataplane.SetDriverClient(std::make_unique<B24AdapterDriver>());
+    std::string err;
+    CHECK(dataplane.Start(err));
+    {
+        std::ofstream out(lease_path);
+        out << "{\"version\":1,\"leases\":[]}";
+    }
+    const HANDLE held = ::CreateFileA(
+        lease_path.c_str(), GENERIC_READ,
+        FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr, OPEN_EXISTING,
+        FILE_ATTRIBUTE_NORMAL, nullptr);
+    CHECK(INVALID_HANDLE_VALUE != held);
+
+    DataplaneCommandExecutor executor(dataplane, "");
+    const CommandResult verdict = executor.Execute(Command{StopServiceCmd{}});
+    ::CloseHandle(held);
+    CHECK(verdict.ok);
+    // The message must carry the lease-save reason; the exact backend text
+    // is not part of the contract.
+    CHECK(verdict.message.find(L"lease") != std::wstring::npos ||
+          verdict.message.find(L"租约") != std::wstring::npos);
+    CHECK(verdict.message != I18n::Instance().T(Str::CmdServiceStopped));
+    std::remove(lease_path.c_str());
+}
 static void TestB103LeasePersistVerdictSurface() {
     using namespace vgww::ui;
     FixTextMetrics();
     I18n::Instance().SetLang(Lang::ZhCN);
 
     // (a) The source maps a dirty stop into the snapshot verdict.
-    {
-        vgww::core::Config cfg;
+    {        vgww::core::Config cfg;
         cfg.adapter = "Ethernet";
         cfg.mode = vgww::core::Mode::kMain;
         cfg.dhcp.enabled = true;
@@ -35058,6 +35111,7 @@ int main() {
     TestB24AdapterBindingSnapshot();
     TestB97UiBindingCommandsPersist();
     TestB98UiRuleCommandsReportPersistFailure();
+    TestP89DirtyStopIsNotReportedClean();
     TestB103LeasePersistVerdictSurface();
     TestB115RulesPersistFailureSurface();
     TestB118RulesDiscardedSurface();
