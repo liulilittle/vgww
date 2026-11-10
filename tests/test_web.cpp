@@ -3276,6 +3276,119 @@ static void TestP123WebConfigMergeMatchesDuidByValue() {
     std::filesystem::remove_all(rules, ec);
 }
 
+// P124: the v6 side of the config merge has its own cap
+// (kMaxStaticBindings6) and its own refusal path. A body that already names
+// the cap's worth of v6 bindings cannot absorb a disk binding the page never
+// rendered, so the merge must drop it and refuse with 409 - and the refusal
+// must be audited.
+static void TestP124WebConfigV6BindingCapRefusalIsAudited() {
+    using namespace vgww::core;
+    const char* path = "p124-v6cap.json";
+    const std::string rules = std::string(path) + ".rules.json";
+    std::remove(path);
+    std::error_code ec;
+    std::filesystem::remove_all(rules, ec);
+    Config cfg;
+    cfg.adapter = "P124NIC";
+    cfg.mode = Mode::kMain;
+    cfg.web.port = 18144;
+    cfg.web.token = "tok";
+    bool ok = false;
+    cfg.gateway.ipv4 = ParseIpv4("192.168.80.1", ok);
+    cfg.gateway.mask = ParseIpv4("255.255.255.0", ok);
+    cfg.gateway.mac = {0x30, 0xFC, 0x68, 0x88, 0xB4, 0xA8};
+    cfg.ipv6.enabled = true;
+    cfg.ipv6.ula_prefix = std::array<uint8_t, 16>{0xFD, 0xBB, 0, 0, 0, 0, 0,
+                                                  0,    0,    0, 0, 0, 0,
+                                                  0,    0,    0};
+    cfg.ipv6.prefix_len = 64;
+    cfg.ipv6.ra_lifetime_s = 900;
+    cfg.ipv6.dhcpv6.enabled = true;
+    const auto v6 = [](uint8_t hi, uint8_t lo) {
+        std::array<uint8_t, 16> a{};
+        a[0] = 0xFD;
+        a[1] = 0xBB;
+        a[14] = hi;
+        a[15] = lo;
+        return a;
+    };
+    cfg.ipv6.dhcpv6.pool_start = v6(0x10, 0x00);
+    cfg.ipv6.dhcpv6.pool_end = v6(0x1F, 0xFF);
+    cfg.ipv6.dhcpv6.lease_seconds = 1800;
+    cfg.perf.workers = 2;
+    cfg.perf.ring_capacity = 64;
+    cfg.perf.max_conns = 64;
+    // One v6 binding on disk: the runtime route adds it after the page was
+    // rendered, so the stale body cannot name it.
+    cfg.ipv6.dhcpv6.static_bindings.push_back(
+        Dhcp6StaticBinding{{0x00, 0x03, 0x00, 0x01, 0xAA, 0xBB},
+                           v6(0x50, 0x00),
+                           "nas6"});
+    std::string err;
+    CHECK(cfg.SaveToFile(path, err));
+
+    vgww::runtime::Dataplane dp(cfg, "p124_leases.json");
+    dp.SetDriverClient(std::make_unique<WebFakeDriver>());
+    std::string start_error;
+    CHECK(dp.Start(start_error));
+    CHECK(dp.Dhcp6Active());
+
+    HttpServer api;
+    std::vector<std::string> audit_lines;
+    vgww::web::RegisterApi(
+        api, dp, cfg, path, "tok", {}, [] { return true; },
+        [](bool) { return false; },
+        [&audit_lines](const std::string& line) {
+            audit_lines.push_back(line);
+        });
+    constexpr uint16_t kPort = 18144;
+    CHECK(api.Start("127.0.0.1", kPort, err));
+
+    // Add one more binding at runtime: it lands on disk but not in the body
+    // the settings page would have rendered.
+    std::string body;
+    CHECK(HttpPost(kPort, "/api/dhcp6/bindings", "tok",
+                   R"({"duid":"00:03:00:01:CC:DD","ip":"fdbb::6000"})",
+                   body) == 200);
+
+    // The stale body (fetched before the add) cannot name the new row; the
+    // merge must keep it. To reach the cap without a 1024-row fixture, the
+    // submitted body itself names the cap's worth of bindings.
+    std::string stale;
+    CHECK(HttpGet("/api/config", kPort, stale) == 200);
+    nlohmann::json over = nlohmann::json::parse(stale);
+    over["ipv6"]["dhcpv6"]["static_bindings"] = nlohmann::json::array();
+    for (size_t i = 0; i < limits::kMaxStaticBindings6; ++i) {
+        char duid_text[32];
+        std::snprintf(duid_text, sizeof(duid_text), "02:02:%02X:%02X:00:01",
+                      static_cast<unsigned>((i >> 8) & 0xFF),
+                      static_cast<unsigned>(i & 0xFF));
+        char ip_text[32];
+        std::snprintf(ip_text, sizeof(ip_text), "fdbb::%x",
+                      static_cast<unsigned>(0x100u + i));
+        over["ipv6"]["dhcpv6"]["static_bindings"].push_back(
+            {{"duid", duid_text}, {"ip", ip_text}});
+    }
+    audit_lines.clear();
+    CHECK(HttpPost(kPort, "/api/config", "tok", over.dump(), body) == 409);
+    bool saw_cap_refusal = false;
+    for (const auto& line : audit_lines) {
+        if (line.find("config save refused (binding cap reached)") !=
+            std::string::npos) {
+            saw_cap_refusal = true;
+        }
+    }
+    CHECK(saw_cap_refusal);
+
+    api.Stop();
+    std::string stop_error;
+    CHECK(dp.Stop(stop_error));
+    std::remove(path);
+    std::remove("p124_leases.json");
+    std::error_code ec2;
+    std::filesystem::remove_all(rules, ec2);
+}
+
 // P104: a failed rule delete used to leave no audit line - only the HTTP
 // 404/500. The ring is the operator's durable record, so a refused or missing
 // delete must be visible there too.
@@ -9653,6 +9766,7 @@ int main(int argc, char** argv) {
     TestP104RuleDeleteFailureIsAudited();
     TestP122WebConfigBindingCapRefusalIsAudited();
     TestP123WebConfigMergeMatchesDuidByValue();
+    TestP124WebConfigV6BindingCapRefusalIsAudited();
     TestP107WebBindingRefusalIsAudited();
     TestP113WebRuleAddRefusalIsAudited();
     TestB126WebConsoleReportsDropped();
