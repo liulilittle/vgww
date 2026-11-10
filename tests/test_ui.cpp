@@ -13347,6 +13347,59 @@ static void TestP94RepairOutcomeIsAudited() {
     CHECK(saw_ok);
 }
 
+// P96: a failed native config save used to leave no audit line at all - only
+// the toast. The web route already records its failures (P95); the native
+// command must leave the same durable record.
+static void TestP96UiConfigSaveFailureIsAudited() {
+    using namespace vgww::ui;
+    FixTextMetrics();
+    console_log::ClearForTest();
+    const std::string cfg_path = "test_ui_p96_config.json";
+    std::remove(cfg_path.c_str());
+    vgww::core::Config cfg;
+    cfg.adapter = "Ethernet";
+    bool ok = false;
+    cfg.gateway.ipv4 = vgww::core::ParseIpv4("192.168.49.1", ok);
+    cfg.gateway.mask = vgww::core::ParseIpv4("255.255.255.0", ok);
+    vgww::core::ParseMac("30:fc:68:88:b4:99", cfg.gateway.mac);
+    vgww::runtime::Dataplane dataplane(cfg);
+    DataplaneCommandExecutor executor(dataplane, cfg_path);
+
+    // An invalid document is rejected before any write.
+    vgww::core::Config invalid;
+    invalid.gateway.ipv4 = 0;
+    const CommandResult rejected =
+        executor.Execute(Command{SaveConfigCmd{std::move(invalid)}});
+    CHECK(!rejected.ok);
+    bool saw_rejected = false;
+    for (const auto& line : console_log::Snapshot()) {
+        if (line.find(L"[audit]") != std::wstring::npos &&
+            line.find(L"config save rejected") != std::wstring::npos) {
+            saw_rejected = true;
+        }
+    }
+    CHECK(saw_rejected);
+
+    // A directory at the config path makes the write fail after validation.
+    console_log::ClearForTest();
+    std::error_code ec;
+    std::filesystem::remove(cfg_path, ec);
+    CHECK(std::filesystem::create_directory(cfg_path, ec));
+    const CommandResult failed =
+        executor.Execute(Command{SaveConfigCmd{cfg}});
+    CHECK(!failed.ok);
+    bool saw_failed = false;
+    for (const auto& line : console_log::Snapshot()) {
+        if (line.find(L"[audit]") != std::wstring::npos &&
+            line.find(L"config save failed") != std::wstring::npos) {
+            saw_failed = true;
+        }
+    }
+    CHECK(saw_failed);
+
+    std::filesystem::remove_all(cfg_path, ec);
+}
+
 // T8 defect 3 (audit B2): an injected modifier mask must not latch forever; a
 // debug key op resets it so a later real Shift+Tab falls back to GetKeyState.
 static void TestDebugModifierReset() {
@@ -35289,6 +35342,7 @@ int main() {
     TestB98UiRuleCommandsReportPersistFailure();
     TestP91AuditLineCarriesPersistFailure();
     TestP94RepairOutcomeIsAudited();
+    TestP96UiConfigSaveFailureIsAudited();
     TestP89DirtyStopIsNotReportedClean();
     TestP90RecheckSurfacesDirtyStop();
     TestB103LeasePersistVerdictSurface();

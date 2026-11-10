@@ -558,20 +558,28 @@ namespace vgww {
                 const I18n& i18n = I18n::Instance();
                 std::string error;
                 if (!vgww::core::ValidateConfig(cmd.config, error)) {
+                    console_log::AppendAuditLine(
+                        "config save rejected (invalid configuration)");
                     return Fail(i18n.FormatCopy(Str::SaveInvalidConfigFmt,
                                             {Widen(error)}));
                 }
                 if (config_path.empty()) {
+                    console_log::AppendAuditLine(
+                        "config save rejected (no config path)");
                     return Fail(i18n.Copy(Str::SaveNoConfigPath));
                 }
                 if (!cmd.config.SaveToFilePreservingBindings(config_path,
                                                              error)) {
+                    console_log::AppendAuditLine(
+                        "config save failed (write error)");
                     return Fail(i18n.FormatCopy(Str::SaveWriteFailedFmt,
                                             {Widen(error)}));
                 }
                 if (apply_live) {
                     std::wstring live_error;
                     if (!apply_live(cmd.config, live_error)) {
+                        console_log::AppendAuditLine(
+                            "config save failed (live apply)");
                         return Fail(live_error.empty()
                                         ? i18n.Copy(Str::SaveAppliedNoLive)
                                         : live_error);
