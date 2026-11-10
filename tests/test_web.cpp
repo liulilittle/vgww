@@ -3072,6 +3072,107 @@ static void TestP113WebRuleAddRefusalIsAudited() {
     std::filesystem::remove_all(rules, ec);
 }
 
+// P122: POST /api/config answers 409 when the merge cannot fit the disk
+// bindings (the submitted body is stale and the disk list is over the cap).
+// The refusal must be audited.
+static void TestP122WebConfigBindingCapRefusalIsAudited() {
+    using namespace vgww::core;
+    const char* path = "p122-cap.json";
+    const std::string rules = std::string(path) + ".rules.json";
+    std::remove(path);
+    std::error_code ec;
+    std::filesystem::remove_all(rules, ec);
+    Config cfg;
+    cfg.adapter = "P122NIC";
+    cfg.mode = Mode::kMain;
+    cfg.dhcp.enabled = true;
+    cfg.web.port = 18142;
+    cfg.web.token = "tok";
+    bool ok = false;
+    cfg.gateway.ipv4 = ParseIpv4("192.168.60.1", ok);
+    cfg.gateway.mask = ParseIpv4("255.255.255.0", ok);
+    cfg.gateway.mac = {0x30, 0xFC, 0x68, 0x88, 0xB4, 0xA6};
+    cfg.dhcp.pool_start = ParseIpv4("192.168.60.100", ok);
+    cfg.dhcp.pool_end = ParseIpv4("192.168.60.200", ok);
+    cfg.dhcp.lease_seconds = 3600;
+    cfg.perf.workers = 2;
+    cfg.perf.ring_capacity = 64;
+    cfg.perf.max_conns = 64;
+    // The config carries one binding; the runtime route adds a second
+    // (persisted straight to disk). The stale body the page posts back cannot
+    // name the new row, so the merge must keep it - and the cap check fires
+    // only when the merged list would exceed the cap. To exercise the cap
+    // without a 1024-row fixture, the submitted body itself is over the cap:
+    // it names 1025 distinct MACs, so the merge drops the overflow.
+    for (size_t i = 0; i < 1; ++i) {
+        StaticBinding b;
+        b.mac = {0x02, 0x00, static_cast<uint8_t>((i >> 8) & 0xFF),
+                 static_cast<uint8_t>(i & 0xFF), 0x00, 0x01};
+        b.ip = ParseIpv4("192.168.60." + std::to_string(100u + i), ok);
+        cfg.dhcp.static_bindings.push_back(b);
+    }
+    std::string err;
+    CHECK(cfg.SaveToFile(path, err));
+
+    vgww::runtime::Dataplane dp(cfg, "p122_leases.json");
+    dp.SetDriverClient(std::make_unique<WebFakeDriver>());
+    std::string start_error;
+    CHECK(dp.Start(start_error));
+    CHECK(dp.DhcpActive());
+
+    HttpServer api;
+    std::vector<std::string> audit_lines;
+    vgww::web::RegisterApi(
+        api, dp, cfg, path, "tok", {}, [] { return true; },
+        [](bool) { return false; },
+        [&audit_lines](const std::string& line) {
+            audit_lines.push_back(line);
+        });
+    constexpr uint16_t kPort = 18142;
+    CHECK(api.Start("127.0.0.1", kPort, err));
+
+    // Add one more binding at runtime: it lands on disk but not in the body
+    // the settings page would have rendered.
+    std::string body;
+    CHECK(HttpPost(kPort, "/api/dhcp/bindings", "tok",
+                   R"({"mac":"02:00:00:00:f0:01","ip":"192.168.60.150"})",
+                   body) == 200);
+
+    // Build a body that already names the cap's worth of bindings: the merge
+    // cannot fit the disk row the body omits, so it refuses with 409.
+    std::string stale;
+    CHECK(HttpGet("/api/config", kPort, stale) == 200);
+    nlohmann::json over = nlohmann::json::parse(stale);
+    over["dhcp"]["static_bindings"] = nlohmann::json::array();
+    for (size_t i = 0; i < limits::kMaxStaticBindings; ++i) {
+        char mac_text[32];
+        std::snprintf(mac_text, sizeof(mac_text), "02:02:%02X:%02X:00:01",
+                      static_cast<unsigned>((i >> 8) & 0xFF),
+                      static_cast<unsigned>(i & 0xFF));
+        char ip_text[32];
+        std::snprintf(ip_text, sizeof(ip_text), "192.168.61.%zu", i + 1);
+        over["dhcp"]["static_bindings"].push_back(
+            {{"mac", mac_text}, {"ip", ip_text}});
+    }
+    audit_lines.clear();
+    CHECK(HttpPost(kPort, "/api/config", "tok", over.dump(), body) == 409);
+    bool saw_cap_refusal = false;
+    for (const auto& line : audit_lines) {
+        if (line.find("config save refused (binding cap reached)") !=
+            std::string::npos) {
+            saw_cap_refusal = true;
+        }
+    }
+    CHECK(saw_cap_refusal);
+
+    api.Stop();
+    std::string stop_error;
+    CHECK(dp.Stop(stop_error));
+    std::remove(path);
+    std::remove("p122_leases.json");
+    std::filesystem::remove_all(rules, ec);
+}
+
 // P104: a failed rule delete used to leave no audit line - only the HTTP
 // 404/500. The ring is the operator's durable record, so a refused or missing
 // delete must be visible there too.
@@ -9447,6 +9548,7 @@ int main(int argc, char** argv) {
     TestP95ConfigSaveFailureIsAudited();
     TestP102WebBindingPersistFailureIsAudited();
     TestP104RuleDeleteFailureIsAudited();
+    TestP122WebConfigBindingCapRefusalIsAudited();
     TestP107WebBindingRefusalIsAudited();
     TestP113WebRuleAddRefusalIsAudited();
     TestB126WebConsoleReportsDropped();
