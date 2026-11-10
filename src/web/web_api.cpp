@@ -2597,7 +2597,20 @@ namespace vgww {
                         return Response::Error(400, "enabled must be boolean");
                     }
                     const bool actual = autostart_setter(want);
-                    audit(std::string("autostart set ") + (want ? "1" : "0"));
+                    // P93: the audit line used to record the DESIRED state
+                    // (`want`) while the response reports the ACTUAL state.
+                    // The production setter ignores SetAutostart's return
+                    // value and reads the registry back, so a failed write
+                    // leaves `actual` at the old value: the ring claimed
+                    // "autostart set 1" while the route answered
+                    // {"enabled":false}. Record the outcome, not the wish.
+                    if (actual == want) {
+                        audit(std::string("autostart set ") +
+                              (actual ? "1" : "0"));
+                    } else {
+                        audit(std::string("autostart set ") +
+                              (actual ? "1" : "0") + " (NOT applied)");
+                    }
                     std::ostringstream out;
                     out << "{\"enabled\":" << (actual ? "true" : "false") << "}";
                     return Response::Json(out.str());

@@ -2303,8 +2303,88 @@ static void TestB4PrivilegedEndpoints() {
     std::remove(rules.c_str());
 }
 
-// ---------------------------------------------------------------------------
-// batch34o: rule persistence robustness.
+// P93: the autostart audit line used to record the DESIRED state (`want`)
+// while the response reports the ACTUAL state (`actual`). The production
+// setter (main.cpp) ignores SetAutostart's return value and reads the registry
+// back, so a failed write leaves `actual` at the old value - the audit ring
+// then claims "autostart set 1" while the route answers {"enabled":false}.
+// The audit trail must carry the same verdict as the response.
+static void TestP93AutostartAuditCarriesActualState() {
+    using namespace vgww::core;
+    const char* path = "p93-autostart.json";
+    const std::string rules = std::string(path) + ".rules.json";
+    std::remove(path);
+    std::remove(rules.c_str());
+    Config cfg;
+    cfg.web.port = 18130;
+    cfg.web.token = "tok";
+    bool ok = false;
+    cfg.gateway.ipv4 = ParseIpv4("192.168.0.46", ok);
+    cfg.gateway.mask = ParseIpv4("255.255.255.0", ok);
+    MacAddress mac{};
+    ParseMac("30:fc:68:88:b4:ae", mac);
+    cfg.gateway.mac = mac;
+    std::string err;
+    CHECK(cfg.SaveToFile(path, err));
+
+    vgww::runtime::Dataplane dp(cfg);
+    HttpServer api;
+    std::vector<std::string> audit_lines;
+    bool registry_enabled = false;
+    vgww::web::RegisterApi(
+        api, dp, cfg, path, "tok", {}, [] { return true; },
+        [&registry_enabled](bool /*v*/) {
+            // A failed write leaves the registry untouched: the read-back is
+            // the OLD value, not the requested one.
+            return registry_enabled;
+        },
+        [&audit_lines](const std::string& line) {
+            audit_lines.push_back(line);
+        });
+    constexpr uint16_t kPort = 18130;
+    std::string start_err;
+    CHECK(api.Start("127.0.0.1", kPort, start_err));
+
+    std::string body;
+    CHECK(HttpPost(kPort, "/api/autostart", "tok",
+                   "{\"enabled\":true}", body) == 200);
+    CHECK(body.find("\"enabled\":false") != std::string::npos);
+
+    bool saw_failed_line = false;
+    bool saw_plain_want_line = false;
+    for (const auto& line : audit_lines) {
+        if (line.find("autostart set") == std::string::npos) {
+            continue;
+        }
+        if (line.find("NOT applied") != std::string::npos) {
+            saw_failed_line = true;
+        } else if (line.find("autostart set 1") != std::string::npos) {
+            saw_plain_want_line = true;
+        }
+    }
+    CHECK(saw_failed_line);
+    CHECK(!saw_plain_want_line);
+
+    // A successful write audits the plain line (the guard is not a blanket
+    // suffix).
+    registry_enabled = true;
+    audit_lines.clear();
+    CHECK(HttpPost(kPort, "/api/autostart", "tok",
+                   "{\"enabled\":true}", body) == 200);
+    CHECK(body.find("\"enabled\":true") != std::string::npos);
+    bool saw_clean_line = false;
+    for (const auto& line : audit_lines) {
+        if (line.find("autostart set 1") != std::string::npos &&
+            line.find("NOT applied") == std::string::npos) {
+            saw_clean_line = true;
+        }
+    }
+    CHECK(saw_clean_line);
+
+    api.Stop();
+    std::remove(path);
+    std::remove(rules.c_str());
+}
 //
 // A persisted rule file is the ONLY record of the operator's port forwards.
 // If loading it fails, the process must not silently behave as if the file
@@ -8505,6 +8585,7 @@ int main(int argc, char** argv) {
     TestB122WebStatusReportsParseRejects6();
     TestB123PrivilegedChangesAreAudited();
     TestP92WebAuditLineCarriesPersistFailure();
+    TestP93AutostartAuditCarriesActualState();
     TestB126WebConsoleReportsDropped();
     TestB127StatusContractKeys();
     TestB113NoApplierDoesNotStampAttempt();
