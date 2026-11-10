@@ -3092,6 +3092,31 @@ static void TestP104RuleDeleteFailureIsAudited() {
     }
     CHECK(saw_ratelimit_failed);
 
+    // The positional (index) path is the same refusal, reached by a stale
+    // position rather than a missing id. It must be audited too.
+    audit_lines.clear();
+    CHECK(HttpDeleteWithToken("/api/portmap?index=999999", kPort, "tok",
+                              body) == 404);
+    bool saw_portmap_index_failed = false;
+    for (const auto& line : audit_lines) {
+        if (line.find("portmap delete index=999999 failed") !=
+            std::string::npos) {
+            saw_portmap_index_failed = true;
+        }
+    }
+    CHECK(saw_portmap_index_failed);
+
+    audit_lines.clear();
+    CHECK(HttpDeleteWithToken("/api/bans?index=999999", kPort, "tok",
+                              body) == 404);
+    bool saw_ban_index_failed = false;
+    for (const auto& line : audit_lines) {
+        if (line.find("ban delete index=999999 failed") != std::string::npos) {
+            saw_ban_index_failed = true;
+        }
+    }
+    CHECK(saw_ban_index_failed);
+
     api.Stop();
     vgww::web::RuleStore::Instance().AttachFile("");
     vgww::web::RuleStore::Instance().Clear();

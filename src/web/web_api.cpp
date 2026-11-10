@@ -3072,6 +3072,10 @@ namespace vgww {
                 // the indices, so this request deleted a DIFFERENT rule.
                 bool refused = false;
                 if (!store.RemovePortMapChecked(index, refused)) {
+                    audit(std::string("portmap delete index=") +
+                          std::to_string(index) +
+                          (refused ? " failed (tombstone store full)"
+                                   : " failed (no such index)"));
                     return Response::Error(
                         refused ? 500 : 404,
                         refused ? "rule tombstone store is full"
@@ -3184,6 +3188,10 @@ namespace vgww {
                 // this route still answered {"ok":true}.
                 bool refused = false;
                 if (!store.RemoveBanChecked(index, refused)) {
+                    audit(std::string("ban delete index=") +
+                          std::to_string(index) +
+                          (refused ? " failed (tombstone store full)"
+                                   : " failed (no such index)"));
                     return Response::Error(
                         refused ? 500 : 404,
                         refused ? "rule tombstone store is full"
