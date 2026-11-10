@@ -13397,6 +13397,34 @@ static void TestP96UiConfigSaveFailureIsAudited() {
     }
     CHECK(saw_failed);
 
+    // A failing live-apply hook must audit the failure (the file is saved,
+    // so this is the only durable record of the rejected switch).
+    console_log::ClearForTest();
+    std::filesystem::remove_all(cfg_path, ec);
+    std::string write_err;
+    CHECK(cfg.SaveToFile(cfg_path, write_err));
+    int apply_calls = 0;
+    DataplaneCommandExecutor applying(
+        dataplane, cfg_path, {}, [&apply_calls](const vgww::core::Config&,
+                                               std::wstring& error) {
+            ++apply_calls;
+            error = L"adapter busy";
+            return false;
+        });
+    const CommandResult apply_failed =
+        applying.Execute(Command{SaveConfigCmd{cfg}});
+    CHECK(!apply_failed.ok);
+    CHECK(1 == apply_calls);
+    bool saw_apply_failed = false;
+    for (const auto& line : console_log::Snapshot()) {
+        if (line.find(L"[audit]") != std::wstring::npos &&
+            line.find(L"config save failed (live apply)") !=
+                std::wstring::npos) {
+            saw_apply_failed = true;
+        }
+    }
+    CHECK(saw_apply_failed);
+
     std::filesystem::remove_all(cfg_path, ec);
 }
 
