@@ -2927,6 +2927,8 @@ static void TestP113WebRuleAddRefusalIsAudited() {
     CHECK(saw_duplicate);
 
     // The per-kind cap: fill the store directly, then POST the overflow.
+    // Persistence is detached so the 1024-row fill is pure in-memory.
+    vgww::web::RuleStore::Instance().AttachFile("");
     vgww::web::RuleStore::Instance().Clear();
     for (size_t i = 0; i < ::vgww::core::limits::kMaxPortMaps; ++i) {
         vgww::web::PortMappingRule m;
@@ -2951,6 +2953,65 @@ static void TestP113WebRuleAddRefusalIsAudited() {
         }
     }
     CHECK(saw_cap);
+
+    // ban cap: fill the store directly, then POST the overflow. The ban route
+    // has no pre-check cap, so the refusal comes from AddBanChecked inside the
+    // store's lock - the route must still record it. Persistence is detached
+    // so the 4096-row fill is pure in-memory (a disk-backed fill would write
+    // the whole document per insert).
+    vgww::web::RuleStore::Instance().AttachFile("");
+    vgww::web::RuleStore::Instance().Clear();
+    for (size_t i = 0; i < ::vgww::core::limits::kMaxBans; ++i) {
+        char buf[32];
+        std::snprintf(buf, sizeof(buf), "02:00:%02X:%02X:%02X:%02X",
+                      static_cast<unsigned>((i >> 24) & 0xFF),
+                      static_cast<unsigned>((i >> 16) & 0xFF),
+                      static_cast<unsigned>((i >> 8) & 0xFF),
+                      static_cast<unsigned>(i & 0xFF));
+        vgww::web::RuleStore::Instance().AddBanChecked(
+            vgww::web::BanEntry{"mac", buf});
+    }
+    audit_lines.clear();
+    CHECK(HttpPost(kPort, "/api/bans", "tok",
+                   R"({"kind":"mac","value":"02:00:FF:FF:FF:FF"})",
+                   body) == 400);
+    bool saw_ban_cap = false;
+    for (const auto& line : audit_lines) {
+        if (line.find("ban add mac") != std::string::npos &&
+            line.find("failed (firewall rule limit reached)") !=
+                std::string::npos) {
+            saw_ban_cap = true;
+        }
+    }
+    CHECK(saw_ban_cap);
+
+    // ratelimit cap: same shape. At the cap a NEW MAC is refused (an upsert of
+    // an existing MAC would still be allowed - that is the batch131 contract).
+    vgww::web::RuleStore::Instance().AttachFile("");
+    vgww::web::RuleStore::Instance().Clear();
+    for (size_t i = 0; i < ::vgww::core::limits::kMaxRateLimits; ++i) {
+        char buf[32];
+        std::snprintf(buf, sizeof(buf), "02:00:01:00:%02X:%02X",
+                      static_cast<unsigned>((i >> 8) & 0xFF),
+                      static_cast<unsigned>(i & 0xFF));
+        vgww::web::RateLimitRule r;
+        r.mac = buf;
+        r.uplink_kbps = 100;
+        vgww::web::RuleStore::Instance().SetRateLimitChecked(std::move(r));
+    }
+    audit_lines.clear();
+    CHECK(HttpPost(kPort, "/api/ratelimit", "tok",
+                   R"({"mac":"02:00:02:00:00:01","uplink_kbps":1000})",
+                   body) == 400);
+    bool saw_rate_cap = false;
+    for (const auto& line : audit_lines) {
+        if (line.find("ratelimit set") != std::string::npos &&
+            line.find("failed (rate-limit rule limit reached)") !=
+                std::string::npos) {
+            saw_rate_cap = true;
+        }
+    }
+    CHECK(saw_rate_cap);
 
     api.Stop();
     vgww::web::RuleStore::Instance().AttachFile("");
