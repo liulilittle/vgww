@@ -22180,6 +22180,77 @@ static void TestP100UiBindingPersistFailureIsAudited() {
     std::remove(lease_path.c_str());
 }
 
+// P105: a failed rule delete used to leave no audit line - only the toast.
+// The ring is the operator's durable record, so a refused or missing delete
+// must be visible there too.
+static void TestP105UiRuleDeleteFailureIsAudited() {
+    using namespace vgww::ui;
+    FixTextMetrics();
+    console_log::ClearForTest();
+    vgww::web::RuleStore& store = vgww::web::RuleStore::Instance();
+    const std::string path = "test_ui_p105_rules.json";
+    const std::string rules = path + ".rules.json";
+    std::remove(path.c_str());
+    std::error_code ec;
+    std::filesystem::remove_all(rules, ec);
+    store.AttachFile(rules);
+    store.Clear();
+
+    vgww::core::Config cfg;
+    bool ok = false;
+    cfg.gateway.ipv4 = vgww::core::ParseIpv4("192.168.56.1", ok);
+    cfg.gateway.mask = vgww::core::ParseIpv4("255.255.255.0", ok);
+    vgww::core::ParseMac("30:fc:68:88:b4:a5", cfg.gateway.mac);
+    vgww::runtime::Dataplane dataplane(cfg);
+    DataplaneCommandExecutor executor(dataplane, "");
+
+    // Deleting a portmap id that does not exist is a failure, not a no-op.
+    const CommandResult portmap =
+        executor.Execute(Command{RemovePortMapCmd{999999, 0}});
+    CHECK(!portmap.ok);
+    bool saw_portmap_failed = false;
+    for (const auto& line : console_log::Snapshot()) {
+        if (line.find(L"[audit]") != std::wstring::npos &&
+            line.find(L"portmap delete id=999999 failed") !=
+                std::wstring::npos) {
+            saw_portmap_failed = true;
+        }
+    }
+    CHECK(saw_portmap_failed);
+
+    console_log::ClearForTest();
+    const CommandResult ban =
+        executor.Execute(Command{RemoveBanCmd{999999, 0}});
+    CHECK(!ban.ok);
+    bool saw_ban_failed = false;
+    for (const auto& line : console_log::Snapshot()) {
+        if (line.find(L"[audit]") != std::wstring::npos &&
+            line.find(L"ban delete id=999999 failed") != std::wstring::npos) {
+            saw_ban_failed = true;
+        }
+    }
+    CHECK(saw_ban_failed);
+
+    console_log::ClearForTest();
+    const CommandResult ratelimit =
+        executor.Execute(Command{RemoveRateLimitCmd{"aa:bb:cc:dd:ee:ff"}});
+    CHECK(!ratelimit.ok);
+    bool saw_ratelimit_failed = false;
+    for (const auto& line : console_log::Snapshot()) {
+        if (line.find(L"[audit]") != std::wstring::npos &&
+            line.find(L"ratelimit delete") != std::wstring::npos &&
+            line.find(L"failed") != std::wstring::npos) {
+            saw_ratelimit_failed = true;
+        }
+    }
+    CHECK(saw_ratelimit_failed);
+
+    store.AttachFile("");
+    store.Clear();
+    std::remove(path.c_str());
+    std::filesystem::remove_all(rules, ec);
+}
+
 static void TestB98UiRuleCommandsReportPersistFailure() {
     using namespace vgww::ui;
     FixTextMetrics();
@@ -35500,6 +35571,7 @@ int main() {
     TestP94RepairOutcomeIsAudited();
     TestP96UiConfigSaveFailureIsAudited();
     TestP100UiBindingPersistFailureIsAudited();
+    TestP105UiRuleDeleteFailureIsAudited();
     TestP89DirtyStopIsNotReportedClean();
     TestP90RecheckSurfacesDirtyStop();
     TestB103LeasePersistVerdictSurface();

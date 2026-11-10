@@ -206,6 +206,11 @@ namespace vgww {
                     // still in force.
                     bool refused = false;
                     if (!store.RemovePortMapById(cmd.id, refused)) {
+                        console_log::AppendAuditLine(
+                            std::string("portmap delete id=") +
+                            std::to_string(cmd.id) +
+                            (refused ? " failed (tombstone store full)"
+                                     : " failed (no such id)"));
                         if (refused) {
                             return Fail(I18n::Instance().FormatCopy(
                                 Str::SaveWriteFailedFmt,
@@ -223,6 +228,11 @@ namespace vgww {
                 // callers that only have a position (tests, legacy commands).
                 bool refused = false;
                 if (!store.RemovePortMapChecked(cmd.index, refused)) {
+                    console_log::AppendAuditLine(
+                        "portmap delete index=" +
+                        std::to_string(cmd.index) +
+                        (refused ? " failed (tombstone store full)"
+                                 : " failed (no such index)"));
                     if (refused) {
                         return Fail(I18n::Instance().FormatCopy(
                             Str::SaveWriteFailedFmt,
@@ -274,6 +284,11 @@ namespace vgww {
                     // DoRemovePortMap).
                     bool refused = false;
                     if (!store.RemoveBanById(cmd.id, refused)) {
+                        console_log::AppendAuditLine(
+                            std::string("ban delete id=") +
+                            std::to_string(cmd.id) +
+                            (refused ? " failed (tombstone store full)"
+                                     : " failed (no such id)"));
                         if (refused) {
                             return Fail(I18n::Instance().FormatCopy(
                                 Str::SaveWriteFailedFmt,
@@ -290,6 +305,11 @@ namespace vgww {
                 // batch89: same one-lock shape as the port-map path above.
                 bool refused = false;
                 if (!store.RemoveBanChecked(cmd.index, refused)) {
+                    console_log::AppendAuditLine(
+                        "ban delete index=" +
+                        std::to_string(cmd.index) +
+                        (refused ? " failed (tombstone store full)"
+                                 : " failed (no such index)"));
                     if (refused) {
                         return Fail(I18n::Instance().FormatCopy(
                             Str::SaveWriteFailedFmt,
@@ -348,6 +368,8 @@ namespace vgww {
 
             CommandResult DoRemoveRateLimit(const RemoveRateLimitCmd& cmd) {
                 if (!web::RuleStore::Instance().RemoveRateLimit(cmd.mac)) {
+                    console_log::AppendAuditLine(
+                        "ratelimit delete " + cmd.mac + " failed (no such mac)");
                     return Fail(I18n::Instance().Copy(Str::CmdRateLimitMissing));
                 }
                 AuditRuleChange("ratelimit delete " + cmd.mac);
