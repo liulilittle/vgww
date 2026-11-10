@@ -650,15 +650,27 @@ namespace vgww {
             }
 
             CommandResult DoRecheckService(runtime::Dataplane& dataplane) {
+                std::string stop_error;
                 if (dataplane.IsRunning()) {
-                    std::string error;
-                    if (!dataplane.Stop(error)) {
-                        return Fail(Widen(error));
+                    if (!dataplane.Stop(stop_error)) {
+                        return Fail(Widen(stop_error));
                     }
                 }
                 std::string error;
                 if (!dataplane.Start(error)) {
                     return Fail(Widen(error));
+                }
+                // P90 (same defect class as the stop command): a clean stop
+                // whose lease dump failed returns true with a non-empty error
+                // (batch100). The recheck then reports the plain "re-checked"
+                // success, hiding the lost lease snapshot from the operator.
+                // The recheck itself did run (the plane is up again), so this
+                // stays a success verdict - but it must carry the reason.
+                if (!stop_error.empty()) {
+                    console_log::AppendAuditLine(
+                        "service rechecked (lease save failed)");
+                    return Ok(I18n::Instance().FormatCopy(
+                        Str::CmdServiceStoppedDirty, {Widen(stop_error)}));
                 }
                 console_log::AppendAuditLine("service rechecked");
                 return Ok(I18n::Instance().Copy(Str::CmdServiceRechecked));

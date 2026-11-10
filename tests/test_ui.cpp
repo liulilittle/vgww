@@ -31957,6 +31957,58 @@ static void TestP89DirtyStopIsNotReportedClean() {
     CHECK(verdict.message != I18n::Instance().T(Str::CmdServiceStopped));
     std::remove(lease_path.c_str());
 }
+
+// P90: the recheck command has the same defect class as the stop command -
+// it ignores a non-empty Stop(error) from its internal stop and reports the
+// plain "re-checked" success. A recheck whose lease dump failed loses the
+// snapshot silently while the operator is told everything is fine.
+static void TestP90RecheckSurfacesDirtyStop() {
+    using namespace vgww::ui;
+    FixTextMetrics();
+    I18n::Instance().SetLang(Lang::ZhCN);
+
+    vgww::core::Config cfg;
+    cfg.adapter = "Ethernet";
+    cfg.mode = vgww::core::Mode::kMain;
+    cfg.dhcp.enabled = true;
+    bool parsed = false;
+    cfg.gateway.ipv4 = vgww::core::ParseIpv4("192.168.48.1", parsed);
+    cfg.gateway.mask = vgww::core::ParseIpv4("255.255.255.0", parsed);
+    cfg.gateway.mac = {0x30, 0xFC, 0x68, 0x88, 0xB4, 0x69};
+    cfg.dhcp.pool_start = vgww::core::ParseIpv4("192.168.48.100", parsed);
+    cfg.dhcp.pool_end = vgww::core::ParseIpv4("192.168.48.200", parsed);
+    cfg.perf.workers = 2;
+    cfg.perf.ring_capacity = 256;
+    cfg.perf.max_conns = 64;
+    cfg.perf.dial_timeout_ms = 400;
+
+    const std::string lease_path = "test_ui_p90_leases.json";
+    std::remove(lease_path.c_str());
+    vgww::runtime::Dataplane dataplane(cfg, lease_path);
+    dataplane.SetDriverClient(std::make_unique<B24AdapterDriver>());
+    std::string err;
+    CHECK(dataplane.Start(err));
+    {
+        std::ofstream out(lease_path);
+        out << "{\"version\":1,\"leases\":[]}";
+    }
+    const HANDLE held = ::CreateFileA(
+        lease_path.c_str(), GENERIC_READ,
+        FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr, OPEN_EXISTING,
+        FILE_ATTRIBUTE_NORMAL, nullptr);
+    CHECK(INVALID_HANDLE_VALUE != held);
+
+    DataplaneCommandExecutor executor(dataplane, "");
+    const CommandResult verdict =
+        executor.Execute(Command{RecheckServiceCmd{}});
+    ::CloseHandle(held);
+    CHECK(verdict.ok);
+    CHECK(verdict.message.find(L"lease") != std::wstring::npos ||
+          verdict.message.find(L"租约") != std::wstring::npos);
+    CHECK(verdict.message != I18n::Instance().T(Str::CmdServiceRechecked));
+    std::remove(lease_path.c_str());
+}
+
 static void TestB103LeasePersistVerdictSurface() {
     using namespace vgww::ui;
     FixTextMetrics();
@@ -35112,6 +35164,7 @@ int main() {
     TestB97UiBindingCommandsPersist();
     TestB98UiRuleCommandsReportPersistFailure();
     TestP89DirtyStopIsNotReportedClean();
+    TestP90RecheckSurfacesDirtyStop();
     TestB103LeasePersistVerdictSurface();
     TestB115RulesPersistFailureSurface();
     TestB118RulesDiscardedSurface();
