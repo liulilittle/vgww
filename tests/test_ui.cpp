@@ -13305,6 +13305,48 @@ static void TestDebugTickCountBackfill() {
     CHECK(after2.at("tick_count") == 2);
 }
 
+// P94: the driver-repair outcome used to live only in a toast (transient) and
+// stderr. A failed repair is exactly what a post-mortem needs, and the web
+// route already records the request - the result must reach the audit ring.
+static void TestP94RepairOutcomeIsAudited() {
+    using namespace vgww::ui;
+    FixTextMetrics();
+    console_log::ClearForTest();
+    ShellFakeSource source;
+    ShellFakeExecutor executor;
+    UiController controller(source, executor);
+    UiApp app;
+    UiSnapshot first;
+    first.seq = 1;
+    app.Compose(controller, first);
+
+    // A failed repair must leave a matching audit line.
+    app.SetRepairOutcomeForTest(false, L"access denied");
+    app.OnTickForTest();
+    bool saw_failed = false;
+    for (const auto& line : console_log::Snapshot()) {
+        if (line.find(L"[audit]") != std::wstring::npos &&
+            line.find(L"driver repair failed") != std::wstring::npos) {
+            saw_failed = true;
+        }
+    }
+    CHECK(saw_failed);
+
+    // A successful repair audits the success line (the guard is not a blanket
+    // suffix).
+    console_log::ClearForTest();
+    app.SetRepairOutcomeForTest(true, L"");
+    app.OnTickForTest();
+    bool saw_ok = false;
+    for (const auto& line : console_log::Snapshot()) {
+        if (line.find(L"[audit]") != std::wstring::npos &&
+            line.find(L"driver repair succeeded") != std::wstring::npos) {
+            saw_ok = true;
+        }
+    }
+    CHECK(saw_ok);
+}
+
 // T8 defect 3 (audit B2): an injected modifier mask must not latch forever; a
 // debug key op resets it so a later real Shift+Tab falls back to GetKeyState.
 static void TestDebugModifierReset() {
@@ -35246,6 +35288,7 @@ int main() {
     TestB97UiBindingCommandsPersist();
     TestB98UiRuleCommandsReportPersistFailure();
     TestP91AuditLineCarriesPersistFailure();
+    TestP94RepairOutcomeIsAudited();
     TestP89DirtyStopIsNotReportedClean();
     TestP90RecheckSurfacesDirtyStop();
     TestB103LeasePersistVerdictSurface();

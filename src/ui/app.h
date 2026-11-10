@@ -162,6 +162,17 @@ namespace vgww {
                                          const std::string& intent) {
                 NavigateTo(id, intent);
             }
+            /// P94 test seam: installs a repair outcome directly so a headless
+            /// test can assert OnTick writes the matching audit line without
+            /// spawning the elevated installer.
+            void SetRepairOutcomeForTest(bool ok, std::wstring summary) {
+                auto state = std::make_shared<RepairAsyncState>();
+                state->done = true;
+                state->ok = ok;
+                state->summary = std::move(summary);
+                repair_state_ = state;
+                repair_in_flight_ = true;
+            }
 
         private:
             std::atomic<bool> web_repair_requested_{false};

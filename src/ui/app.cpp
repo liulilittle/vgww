@@ -5,6 +5,7 @@
 
 #include "core/handler_guard.h"
 #include "ui/controls.h"
+#include "ui/console_log.h"
 #include "ui/i18n.h"
 #include "ui/pages/page_util.h"
 #include "ui/tray.h"
@@ -1041,6 +1042,14 @@ namespace vgww {
                                 ToastKind::Warning);
                         }
                     }
+                    // P94: the repair outcome used to live only in a toast
+                    // (transient, UI-thread) and stderr. The audit ring is the
+                    // operator's durable record of privileged changes, and a
+                    // failed repair is exactly what a post-mortem needs - the
+                    // web route records the request, the result must be here.
+                    console_log::AppendAuditLine(
+                        ok ? "driver repair succeeded"
+                           : "driver repair failed");
                     repair_state_.reset();
                     repair_in_flight_ = false;
                 }
