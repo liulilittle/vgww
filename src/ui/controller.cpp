@@ -737,6 +737,13 @@ namespace vgww {
                     console_log::AppendAuditLine(
                         std::string("autostart set ") +
                         (cmd.enabled ? "1" : "0"));
+                } else {
+                    // P126: an autostart refusal (the OS setter reported a
+                    // failure) left no audit line - only the user-visible
+                    // verdict. Record it like every other native command.
+                    console_log::AppendAuditLine(
+                        std::string("autostart set ") +
+                        (cmd.enabled ? "1" : "0") + " failed");
                 }
                 return result;
             }
@@ -751,6 +758,8 @@ namespace vgww {
                 }
                 std::string error;
                 if (!dataplane.Start(error)) {
+                    console_log::AppendAuditLine(
+                        "service start failed (" + error + ")");
                     return Fail(Widen(error));
                 }
                 console_log::AppendAuditLine("service started");
@@ -763,6 +772,8 @@ namespace vgww {
                 }
                 std::string error;
                 if (!dataplane.Stop(error)) {
+                    console_log::AppendAuditLine(
+                        "service stop failed (" + error + ")");
                     return Fail(Widen(error));
                 }
                 // batch100 semantics: a clean teardown whose lease dump failed
@@ -784,11 +795,16 @@ namespace vgww {
                 std::string stop_error;
                 if (dataplane.IsRunning()) {
                     if (!dataplane.Stop(stop_error)) {
+                        console_log::AppendAuditLine(
+                            "service recheck failed (stop: " + stop_error +
+                            ")");
                         return Fail(Widen(stop_error));
                     }
                 }
                 std::string error;
                 if (!dataplane.Start(error)) {
+                    console_log::AppendAuditLine(
+                        "service recheck failed (start: " + error + ")");
                     return Fail(Widen(error));
                 }
                 // P90 (same defect class as the stop command): a clean stop

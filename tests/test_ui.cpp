@@ -32076,6 +32076,111 @@ static void TestB125LifecycleCommandsAreAudited() {
     CHECK(contains("[audit] autostart set 1"));
 }
 
+// A driver with no adapter: the dataplane start fails, which is the path
+// P126 audits.
+class P126NoAdapterDriver final : public vgww::driver::IDriverClient {
+ public:
+    const std::vector<vgww::driver::AdapterEntry>& Adapters() const
+        noexcept override {
+        return adapters_;
+    }
+    const vgww::driver::AdapterEntry* FindAdapter(
+        const std::wstring&, bool* = nullptr) const noexcept override {
+        return nullptr;
+    }
+    bool SetAdapterMode(const vgww::driver::AdapterEntry&, uint32_t,
+                        std::string&) override {
+        return false;
+    }
+    bool SetHwPacketFilter(const vgww::driver::AdapterEntry&, uint32_t,
+                           std::string&) override {
+        return false;
+    }
+    bool GetHwPacketFilter(const vgww::driver::AdapterEntry&, uint32_t&,
+                           std::string&) override {
+        return false;
+    }
+    bool ArmRxEvent(const vgww::driver::AdapterEntry&, void*,
+                    std::string&) override {
+        return false;
+    }
+    uint32_t ReadPackets(void*, INTERMEDIATE_BUFFER*, uint32_t,
+                         std::string&) override {
+        return 0;
+    }
+    bool SendPacketsToAdapter(void*, INTERMEDIATE_BUFFER*, uint32_t,
+                              std::string&) override {
+        return false;
+    }
+    bool SendPacketsToMstcp(void*, INTERMEDIATE_BUFFER*, uint32_t,
+                            std::string&) override {
+        return false;
+    }
+    bool FlushAdapterQueue(const vgww::driver::AdapterEntry&,
+                           std::string&) override {
+        return false;
+    }
+    bool ResetAdapterMode(const vgww::driver::AdapterEntry&,
+                          std::string&) override {
+        return false;
+    }
+
+ private:
+    std::vector<vgww::driver::AdapterEntry> adapters_;
+};
+
+// P126: the lifecycle/autostart FAILURE paths left no audit line - only the
+// user-visible verdict. A failed start/stop/recheck or a refused autostart
+// must leave the same record a success does.
+static void TestP126UiLifecycleFailureIsAudited() {
+    using namespace vgww::ui;
+    FixTextMetrics();
+    console_log::ClearForTest();
+
+    vgww::core::Config cfg;
+    cfg.adapter = "Ethernet";
+    cfg.mode = vgww::core::Mode::kMain;
+    cfg.dhcp.enabled = true;
+    bool parsed = false;
+    cfg.gateway.ipv4 = vgww::core::ParseIpv4("192.168.52.1", parsed);
+    cfg.gateway.mask = vgww::core::ParseIpv4("255.255.255.0", parsed);
+    cfg.gateway.mac = {0x30, 0xFC, 0x68, 0x88, 0xB4, 0x72};
+    cfg.dhcp.pool_start = vgww::core::ParseIpv4("192.168.52.100", parsed);
+    cfg.dhcp.pool_end = vgww::core::ParseIpv4("192.168.52.200", parsed);
+
+    vgww::runtime::Dataplane dataplane(cfg);
+    dataplane.SetDriverClient(std::make_unique<P126NoAdapterDriver>());
+    // The autostart setter refuses: the OS layer rejected the change.
+    DataplaneCommandExecutor executor(
+        dataplane, "",
+        [](const SetAutostartCmd&) {
+            return CommandResult{false, L"denied"};
+        });
+    ShellFakeSource source;
+    UiController controller(source, executor);
+    std::string err;
+    CHECK(controller.Start(err));
+
+    CHECK(controller.Post(Command{StartServiceCmd{}}));
+    CHECK(controller.Post(Command{SetAutostartCmd{true}}));
+    controller.Stop();
+
+    const auto lines = console_log::Snapshot();
+    const auto contains = [&lines](const std::string& needle) {
+        const std::wstring needle_w(needle.begin(), needle.end());
+        for (const auto& line : lines) {
+            if (line.find(needle_w) != std::wstring::npos) {
+                return true;
+            }
+        }
+        return false;
+    };
+    // The start failed (no adapter in the driver) and must be audited.
+    CHECK(contains("[audit] service start failed"));
+    // The autostart refusal must be audited.
+    CHECK(contains("[audit] autostart set 1 failed"));
+}
+
 // P85: the language switch is a privileged preference change (it persists to
 // the config document); the native UI is the primary interface, so it must
 // leave the same audit trail the other commands do.
@@ -35913,6 +36018,7 @@ int main() {
     TestB121ParseRejectsSurface();
     TestB124NativeUiCommandsAreAudited();
     TestB125LifecycleCommandsAreAudited();
+    TestP126UiLifecycleFailureIsAudited();
     TestB127LanguageSwitchIsAudited();
     TestP109LanguageFailureIsAudited();
     TestB126ConsoleDroppedSurface();
