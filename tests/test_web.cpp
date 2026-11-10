@@ -3173,6 +3173,109 @@ static void TestP122WebConfigBindingCapRefusalIsAudited() {
     std::filesystem::remove_all(rules, ec);
 }
 
+// P123: the v6 merge matched the submitted DUID text verbatim, so a legal
+// spelling that differs from the canonical form (upper case, ':' separators)
+// slipped past "known" and the disk binding was merged back as a SECOND entry
+// - the same value stored twice under different text. The v4 sibling parses
+// MACs by value and the v6 binding route parses DUIDs by value (batch142);
+// this merge must too.
+static void TestP123WebConfigMergeMatchesDuidByValue() {
+    using namespace vgww::core;
+    const char* path = "p123-merge.json";
+    const std::string rules = std::string(path) + ".rules.json";
+    std::remove(path);
+    std::remove(rules.c_str());
+    Config cfg;
+    cfg.adapter = "P123NIC";
+    cfg.mode = Mode::kMain;
+    cfg.web.port = 18143;
+    cfg.web.token = "tok";
+    bool ok = false;
+    cfg.gateway.ipv4 = ParseIpv4("192.168.70.1", ok);
+    cfg.gateway.mask = ParseIpv4("255.255.255.0", ok);
+    cfg.gateway.mac = {0x30, 0xFC, 0x68, 0x88, 0xB4, 0xA7};
+    cfg.dhcp.lease_seconds = 3600;
+    cfg.ipv6.enabled = true;
+    cfg.ipv6.ula_prefix = std::array<uint8_t, 16>{0xFD, 0xAA, 0, 0, 0, 0, 0,
+                                                  0,    0,    0, 0, 0, 0,
+                                                  0,    0,    0};
+    cfg.ipv6.prefix_len = 64;
+    cfg.ipv6.ra_lifetime_s = 900;
+    cfg.ipv6.dhcpv6.enabled = true;
+    const auto v6 = [](uint8_t hi, uint8_t lo) {
+        std::array<uint8_t, 16> a{};
+        a[0] = 0xFD;
+        a[1] = 0xAA;
+        a[14] = hi;
+        a[15] = lo;
+        return a;
+    };
+    cfg.ipv6.dhcpv6.pool_start = v6(0x10, 0x00);
+    cfg.ipv6.dhcpv6.pool_end = v6(0x1F, 0xFF);
+    cfg.ipv6.dhcpv6.lease_seconds = 1800;
+    cfg.perf.workers = 2;
+    cfg.perf.ring_capacity = 64;
+    cfg.perf.max_conns = 64;
+    // One v6 binding on disk.
+    cfg.ipv6.dhcpv6.static_bindings.push_back(
+        Dhcp6StaticBinding{{0x00, 0x03, 0x00, 0x01, 0xAA, 0xBB},
+                           v6(0x50, 0x00),
+                           "nas6"});
+    std::string err;
+    CHECK(cfg.SaveToFile(path, err));
+
+    vgww::runtime::Dataplane dp(cfg, "p123_leases.json");
+    dp.SetDriverClient(std::make_unique<WebFakeDriver>());
+    std::string start_error;
+    CHECK(dp.Start(start_error));
+
+    HttpServer api;
+    std::vector<std::string> audit_lines;
+    vgww::web::RegisterApi(
+        api, dp, cfg, path, "tok", {}, [] { return true; },
+        [](bool) { return false; },
+        [&audit_lines](const std::string& line) {
+            audit_lines.push_back(line);
+        });
+    constexpr uint16_t kPort = 18143;
+    CHECK(api.Start("127.0.0.1", kPort, err));
+
+    // The page posts the SAME binding back with a different legal spelling:
+    // upper-case and ':' separators. The merge must match it by value.
+    std::string stale;
+    CHECK(HttpGet("/api/config", kPort, stale) == 200);
+    nlohmann::json body = nlohmann::json::parse(stale);
+    body["ipv6"]["dhcpv6"]["static_bindings"] = nlohmann::json::array(
+        {{{"duid", "00:03:00:01:AA:BB"},
+          {"ip", "fdaa::5000"},
+          {"hostname", "nas6"}}});
+    std::string resp;
+    CHECK(HttpPost(kPort, "/api/config", "tok", body.dump(), resp) == 200);
+
+    // One value, not two.
+    std::string load_err;
+    const auto disk = Config::LoadFromFile(path, load_err);
+    CHECK(disk.has_value());
+    size_t duid_count = 0;
+    if (disk) {
+        for (const auto& b : disk->ipv6.dhcpv6.static_bindings) {
+            if (b.duid == std::vector<uint8_t>{0x00, 0x03, 0x00, 0x01, 0xAA,
+                                                0xBB}) {
+                ++duid_count;
+            }
+        }
+    }
+    CHECK(duid_count == 1);
+
+    api.Stop();
+    std::string stop_error;
+    CHECK(dp.Stop(stop_error));
+    std::remove(path);
+    std::remove("p123_leases.json");
+    std::error_code ec;
+    std::filesystem::remove_all(rules, ec);
+}
+
 // P104: a failed rule delete used to leave no audit line - only the HTTP
 // 404/500. The ring is the operator's durable record, so a refused or missing
 // delete must be visible there too.
@@ -9549,6 +9652,7 @@ int main(int argc, char** argv) {
     TestP102WebBindingPersistFailureIsAudited();
     TestP104RuleDeleteFailureIsAudited();
     TestP122WebConfigBindingCapRefusalIsAudited();
+    TestP123WebConfigMergeMatchesDuidByValue();
     TestP107WebBindingRefusalIsAudited();
     TestP113WebRuleAddRefusalIsAudited();
     TestB126WebConsoleReportsDropped();

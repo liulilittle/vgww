@@ -3804,7 +3804,7 @@ namespace vgww {
                                   } catch (const std::exception&) {
                                       parsed_ok = false;
                                   }
-                                  std::string disk_error;
+                                   std::string disk_error;
                                   const auto disk = parsed_ok
                                       ? core::Config::LoadFromFile(
                                             config_path, disk_error)
@@ -3886,26 +3886,35 @@ namespace vgww {
                                                       kHex[byte & 0x0F]);
                                               }
                                           }
-                                          bool known = false;
-                                          for (const auto& e : v6) {
-                                              if (!e.is_object() ||
-                                                  !e.contains("duid") ||
-                                                  !e["duid"].is_string()) {
-                                                  continue;
-                                              }
-                                              std::string text =
-                                                  e["duid"].get<std::string>();
-                                              for (char& c : text) {
-                                                  if (c >= 'A' && c <= 'F') {
-                                                      c = static_cast<char>(
-                                                          c - 'A' + 'a');
-                                                  }
-                                              }
-                                              if (text == duid) {
-                                                  known = true;
-                                                  break;
-                                              }
-                                          }
+                                           // batch142/P123: match the DUID by VALUE.
+                                           // The old check compared the posted
+                                           // text with the canonical text, so
+                                           // any other legal spelling (upper
+                                           // case, ':' / '-' separators) slipped
+                                           // past "known" and the disk binding
+                                           // was merged back as a SECOND entry -
+                                           // the same value stored twice under
+                                           // different text, which the loader
+                                           // then rejected as a duplicate DUID.
+                                           // The v4 sibling parses MACs by
+                                           // value; this is the same rule.
+                                           bool known = false;
+                                           for (const auto& e : v6) {
+                                               if (!e.is_object() ||
+                                                   !e.contains("duid") ||
+                                                   !e["duid"].is_string()) {
+                                                   continue;
+                                               }
+                                               std::vector<uint8_t> posted;
+                                               if (runtime::ParseDuidText(
+                                                       e["duid"]
+                                                           .get<std::string>(),
+                                                       posted) &&
+                                                   posted == binding.duid) {
+                                                   known = true;
+                                                   break;
+                                               }
+                                           }
                                           if (known) {
                                               continue;
                                           }
@@ -3935,7 +3944,36 @@ namespace vgww {
                                                    "merged; remove entries on "
                                                    "the bindings page");
                                        }
-                                      body = submitted.dump();
+                                       // batch142/P123: the submitted entry is
+                                       // echoed verbatim, so a DUID the page
+                                       // spelled differently (':' separators,
+                                       // upper case) would be written back in
+                                       // that form and the loader - which
+                                       // accepts bare hex only - would reject
+                                       // the whole document. Normalize every
+                                       // entry to the canonical bare-hex form.
+                                       for (auto& e : v6) {
+                                           std::vector<uint8_t> parsed;
+                                           if (e.is_object() &&
+                                               e.contains("duid") &&
+                                               e["duid"].is_string() &&
+                                               runtime::ParseDuidText(
+                                                   e["duid"]
+                                                       .get<std::string>(),
+                                                   parsed)) {
+                                               static const char* kHex =
+                                                   "0123456789abcdef";
+                                               std::string canonical;
+                                               for (const uint8_t byte : parsed) {
+                                                   canonical.push_back(
+                                                       kHex[byte >> 4]);
+                                                   canonical.push_back(
+                                                       kHex[byte & 0x0F]);
+                                               }
+                                               e["duid"] = canonical;
+                                           }
+                                       }
+                                       body = submitted.dump();
                                   }
                               }                              std::string write_error;
                               // batch94: hold the per-path config lock while
@@ -3963,12 +4001,12 @@ namespace vgww {
                                                      temp_path, ignore)
                                               .has_value();
                                       });
-                              if (core::AtomicWriteOutcome::
-                                      kValidationFailed == outcome) {
-                                  audit("config save rejected (invalid configuration)");
-                                  return Response::Error(
-                                      400, "invalid configuration rejected");
-                              }
+                                       if (core::AtomicWriteOutcome::
+                                               kValidationFailed == outcome) {
+                                           audit("config save rejected (invalid configuration)");
+                                           return Response::Error(
+                                               400, "invalid configuration rejected");
+                                       }
                               if (core::AtomicWriteOutcome::kOk != outcome) {
                                   audit("config save failed (write error)");
                                   return Response::Error(500,

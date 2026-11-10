@@ -27,6 +27,11 @@ if(MSVC)
     # std::min/std::max calls and break compilation.
     add_compile_definitions(NOMINMAX)
     add_link_options(/DEBUG)
+    # batch309/CI: test_ui.cpp grew past the COFF object-file section limit
+    # (fatal C1128) under a plain build; /bigobj was previously only enabled
+    # for the ASan build, so the release CI job failed on every push. It is
+    # harmless for every other target and is now unconditional on MSVC.
+    add_compile_options(/bigobj)
 else()
     add_compile_options(-Wall -Wextra)
 endif()
@@ -45,11 +50,9 @@ if(VGWW_ASAN)
         message(FATAL_ERROR "VGWW_ASAN requires the MSVC x64 toolchain")
     endif()
     add_compile_options(/fsanitize=address)
-    # batch309: ASan instrumentation multiplies the section count; the largest
-    # test translation units (test_ui.cpp, 33k lines) exceed the default
-    # object-file limit (C1128). /bigobj is harmless for every other target
-    # and keeps the diagnostic build complete.
-    add_compile_options(/bigobj)
+    # batch309: ASan instrumentation multiplies the section count; /bigobj is
+    # now enabled unconditionally above, so the diagnostic build keeps working
+    # with no extra option.
     # The ASan runtime libraries are linked automatically (link.exe's
     # /INFERASANLIBS is ON by default; verified by dumpbin: the exes depend
     # on clang_rt.asan_dynamic-x86_64.dll). Passing /fsanitize=address to
