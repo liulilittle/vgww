@@ -3283,12 +3283,14 @@ namespace vgww {
                 // while throttling nobody - a plausible-but-broken fake.
                 if (request.body.find("\"uplink_kbps\"") != std::string::npos) {
                     if (!JsonGetNumber(request.body, "uplink_kbps", number)) {
+                        audit("ratelimit set rejected (invalid kbps)");
                         return Response::Error(400, "invalid kbps");
                     }
                     rule.uplink_kbps = number;
                 }
                 if (request.body.find("\"downlink_kbps\"") != std::string::npos) {
                     if (!JsonGetNumber(request.body, "downlink_kbps", number)) {
+                        audit("ratelimit set rejected (invalid kbps)");
                         return Response::Error(400, "invalid kbps");
                     }
                     rule.downlink_kbps = number;

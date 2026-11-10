@@ -3170,6 +3170,21 @@ static void TestP104RuleDeleteFailureIsAudited() {
     }
     CHECK(saw_bad_id);
 
+    // A present-but-unparseable kbps field must not silently fall back to 0:
+    // the refusal is audited too.
+    audit_lines.clear();
+    CHECK(HttpPost(kPort, "/api/ratelimit", "tok",
+                   R"({"mac":"aa:bb:cc:dd:ee:ff","uplink_kbps":"lots"})",
+                   body) == 400);
+    bool saw_bad_kbps = false;
+    for (const auto& line : audit_lines) {
+        if (line.find("ratelimit set rejected (invalid kbps)") !=
+            std::string::npos) {
+            saw_bad_kbps = true;
+        }
+    }
+    CHECK(saw_bad_kbps);
+
     api.Stop();
     vgww::web::RuleStore::Instance().AttachFile("");
     vgww::web::RuleStore::Instance().Clear();
