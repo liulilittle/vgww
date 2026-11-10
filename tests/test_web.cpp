@@ -2385,6 +2385,72 @@ static void TestP93AutostartAuditCarriesActualState() {
     std::remove(path);
     std::remove(rules.c_str());
 }
+
+// P95: a failed config save used to leave no audit line at all - only the HTTP
+// 500/400. The ring is the operator's durable record of privileged changes, so
+// a refused or failed save must be visible there too.
+static void TestP95ConfigSaveFailureIsAudited() {
+    using namespace vgww::core;
+    const char* path = "p95-config.json";
+    const std::string rules = std::string(path) + ".rules.json";
+    std::remove(path);
+    std::remove(rules.c_str());
+    Config cfg;
+    cfg.web.port = 18132;
+    cfg.web.token = "tok";
+    bool ok = false;
+    cfg.gateway.ipv4 = ParseIpv4("192.168.0.48", ok);
+    cfg.gateway.mask = ParseIpv4("255.255.255.0", ok);
+    MacAddress mac{};
+    ParseMac("30:fc:68:88:b4:b0", mac);
+    cfg.gateway.mac = mac;
+    std::string err;
+    CHECK(cfg.SaveToFile(path, err));
+
+    vgww::runtime::Dataplane dp(cfg);
+    HttpServer api;
+    std::vector<std::string> audit_lines;
+    vgww::web::RegisterApi(
+        api, dp, cfg, path, "tok", {}, [] { return true; },
+        [](bool) { return false; },
+        [&audit_lines](const std::string& line) {
+            audit_lines.push_back(line);
+        });
+    constexpr uint16_t kPort = 18132;
+    std::string start_err;
+    CHECK(api.Start("127.0.0.1", kPort, start_err));
+
+    std::string body;
+    // An invalid document is rejected before any write.
+    CHECK(HttpPost(kPort, "/api/config", "tok",
+                   "{\"gateway\":{\"ipv4\":\"not-an-ip\"}}", body) == 400);
+    bool saw_rejected = false;
+    for (const auto& line : audit_lines) {
+        if (line.find("config save rejected") != std::string::npos) {
+            saw_rejected = true;
+        }
+    }
+    CHECK(saw_rejected);
+
+    // A directory at the config path makes the write fail after validation.
+    audit_lines.clear();
+    std::error_code ec;
+    std::filesystem::remove(path, ec);
+    CHECK(std::filesystem::create_directory(path, ec));
+    CHECK(HttpPost(kPort, "/api/config", "tok", cfg.ToJsonString(),
+                   body) == 500);
+    bool saw_failed = false;
+    for (const auto& line : audit_lines) {
+        if (line.find("config save failed") != std::string::npos) {
+            saw_failed = true;
+        }
+    }
+    CHECK(saw_failed);
+
+    api.Stop();
+    std::filesystem::remove_all(path, ec);
+    std::remove(rules.c_str());
+}
 //
 // A persisted rule file is the ONLY record of the operator's port forwards.
 // If loading it fails, the process must not silently behave as if the file
@@ -8586,6 +8652,7 @@ int main(int argc, char** argv) {
     TestB123PrivilegedChangesAreAudited();
     TestP92WebAuditLineCarriesPersistFailure();
     TestP93AutostartAuditCarriesActualState();
+    TestP95ConfigSaveFailureIsAudited();
     TestB126WebConsoleReportsDropped();
     TestB127StatusContractKeys();
     TestB113NoApplierDoesNotStampAttempt();

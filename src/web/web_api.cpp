@@ -3848,6 +3848,7 @@ namespace vgww {
                                   // batch107: never publish without the
                                   // cross-process lock; the message stays in
                                   // the existing 500 contract.
+                                  audit("config save failed (cross-process lock)");
                                   return Response::Error(500,
                                                          "config save failed");
                               }
@@ -3862,10 +3863,12 @@ namespace vgww {
                                       });
                               if (core::AtomicWriteOutcome::
                                       kValidationFailed == outcome) {
+                                  audit("config save rejected (invalid configuration)");
                                   return Response::Error(
                                       400, "invalid configuration rejected");
                               }
                               if (core::AtomicWriteOutcome::kOk != outcome) {
+                                  audit("config save failed (write error)");
                                   return Response::Error(500,
                                                          "config save failed");
                               }
