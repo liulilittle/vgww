@@ -2483,6 +2483,77 @@ static void TestP95ConfigSaveFailureIsAudited() {
     std::filesystem::remove_all(path, ec);
     std::remove(rules.c_str());
 }
+
+// P102: a failed binding persist must audit the outcome too. The runtime
+// change is live in that path, so the ring is the only durable record that the
+// row will be lost on restart.
+static void TestP102WebBindingPersistFailureIsAudited() {
+    using namespace vgww::core;
+    const char* path = "p102-binding.json";
+    const char* lease_path = "p102_leases.json";
+    std::remove(path);
+    std::remove(lease_path);
+    Config cfg;
+    cfg.adapter = "P102NIC";
+    cfg.mode = Mode::kMain;
+    cfg.dhcp.enabled = true;
+    cfg.web.port = 18134;
+    cfg.web.token = "tok";
+    bool ok = false;
+    cfg.gateway.ipv4 = ParseIpv4("192.168.52.1", ok);
+    cfg.gateway.mask = ParseIpv4("255.255.255.0", ok);
+    cfg.gateway.mac = {0x30, 0xFC, 0x68, 0x88, 0xB4, 0xA2};
+    cfg.dhcp.pool_start = ParseIpv4("192.168.52.100", ok);
+    cfg.dhcp.pool_end = ParseIpv4("192.168.52.200", ok);
+    cfg.dhcp.lease_seconds = 3600;
+    cfg.perf.workers = 2;
+    cfg.perf.ring_capacity = 64;
+    cfg.perf.max_conns = 64;
+    std::string err;
+    CHECK(cfg.SaveToFile(path, err));
+
+    vgww::runtime::Dataplane dp(cfg, lease_path);
+    dp.SetDriverClient(std::make_unique<WebFakeDriver>());
+    std::string start_error;
+    CHECK(dp.Start(start_error));
+    CHECK(dp.DhcpActive());
+
+    HttpServer api;
+    std::vector<std::string> audit_lines;
+    vgww::web::RegisterApi(
+        api, dp, cfg, path, "tok", {}, [] { return true; },
+        [](bool) { return false; },
+        [&audit_lines](const std::string& line) {
+            audit_lines.push_back(line);
+        });
+    constexpr uint16_t kPort = 18134;
+    CHECK(api.Start("127.0.0.1", kPort, err));
+
+    std::string body;
+    // A directory at the config path makes the persist fail after the runtime
+    // change is applied.
+    std::error_code ec;
+    std::filesystem::remove(path, ec);
+    CHECK(std::filesystem::create_directory(path, ec));
+    CHECK(HttpPost(kPort, "/api/dhcp/bindings", "tok",
+                   R"({"mac":"02:00:00:00:a2:11","ip":"192.168.52.111"})",
+                   body) == 200);
+    CHECK(body.find("\"persisted\":false") != std::string::npos);
+    bool saw_failed = false;
+    for (const auto& line : audit_lines) {
+        if (line.find("dhcp binding add") != std::string::npos &&
+            line.find("NOT saved") != std::string::npos) {
+            saw_failed = true;
+        }
+    }
+    CHECK(saw_failed);
+
+    api.Stop();
+    std::string stop_error;
+    CHECK(dp.Stop(stop_error));
+    std::filesystem::remove_all(path, ec);
+    std::remove(lease_path);
+}
 //
 // A persisted rule file is the ONLY record of the operator's port forwards.
 // If loading it fails, the process must not silently behave as if the file
@@ -8685,6 +8756,7 @@ int main(int argc, char** argv) {
     TestP92WebAuditLineCarriesPersistFailure();
     TestP93AutostartAuditCarriesActualState();
     TestP95ConfigSaveFailureIsAudited();
+    TestP102WebBindingPersistFailureIsAudited();
     TestB126WebConsoleReportsDropped();
     TestB127StatusContractKeys();
     TestB113NoApplierDoesNotStampAttempt();
