@@ -2717,6 +2717,58 @@ static void TestP107WebBindingRefusalIsAudited() {
     }
     CHECK(saw_v6_missing_key);
 
+    // POST refusals while the service is up: a malformed key (400) and a
+    // missing field (400) must be audited, not just answered.
+    audit_lines.clear();
+    CHECK(HttpPost(kPort, "/api/dhcp/bindings", "tok",
+                   R"({"mac":"not-a-mac","ip":"192.168.53.111"})",
+                   body) == 400);
+    bool saw_v4_bad_mac = false;
+    for (const auto& line : audit_lines) {
+        if (line.find("dhcp binding add rejected (invalid mac)") !=
+            std::string::npos) {
+            saw_v4_bad_mac = true;
+        }
+    }
+    CHECK(saw_v4_bad_mac);
+
+    audit_lines.clear();
+    CHECK(HttpPost(kPort, "/api/dhcp/bindings", "tok",
+                   R"({"ip":"192.168.53.111"})", body) == 400);
+    bool saw_v4_missing_fields = false;
+    for (const auto& line : audit_lines) {
+        if (line.find("dhcp binding add rejected (mac and ip required)") !=
+            std::string::npos) {
+            saw_v4_missing_fields = true;
+        }
+    }
+    CHECK(saw_v4_missing_fields);
+
+    audit_lines.clear();
+    CHECK(HttpPost(kPort, "/api/dhcp6/bindings", "tok",
+                   R"({"duid":"not-a-duid","ip":"fd00:1133:4455:6677::1100"})",
+                   body) == 400);
+    bool saw_v6_bad_duid = false;
+    for (const auto& line : audit_lines) {
+        if (line.find("dhcp6 binding add rejected (invalid duid)") !=
+            std::string::npos) {
+            saw_v6_bad_duid = true;
+        }
+    }
+    CHECK(saw_v6_bad_duid);
+
+    audit_lines.clear();
+    CHECK(HttpPost(kPort, "/api/dhcp6/bindings", "tok",
+                   R"({"ip":"fd00:1133:4455:6677::1100"})", body) == 400);
+    bool saw_v6_missing_fields = false;
+    for (const auto& line : audit_lines) {
+        if (line.find("dhcp6 binding add rejected (duid and ip required)") !=
+            std::string::npos) {
+            saw_v6_missing_fields = true;
+        }
+    }
+    CHECK(saw_v6_missing_fields);
+
     // Stop the plane: the same routes now answer 409 "service not running".
     api.Stop();
     std::string stop_error;

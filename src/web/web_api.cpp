@@ -3549,10 +3549,11 @@ namespace vgww {
                              // sides; this is the same rule, implemented once.
                              // ParseDuidText already refuses an empty text, so
                              // its false result covers "malformed" and "empty".
-                             std::vector<uint8_t> wanted_duid;
-                             if (!runtime::ParseDuidText(duid, wanted_duid)) {
-                                 return Response::Error(400, "invalid duid");
-                             }
+                              std::vector<uint8_t> wanted_duid;
+                              if (!runtime::ParseDuidText(duid, wanted_duid)) {
+                                  audit("dhcp6 binding add rejected (invalid duid)");
+                                  return Response::Error(400, "invalid duid");
+                              }
                              const auto existing =
                                  dataplane.GetDhcp6Bindings();
                              for (const auto& binding : existing) {
