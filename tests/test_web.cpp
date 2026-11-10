@@ -6169,6 +6169,18 @@ static void TestP82WorkerDeletesTheTombstonedRule() {
     if (j["portmaps"].size() == 1) {
         CHECK(j["portmaps"][0]["id"].get<uint64_t>() == 100);
     }
+    // The worker writes its side file before signalling done, so the deletion
+    // verdict must be the WORKER's own (loaded-then-removed id 200), not a
+    // value reverse-derived from the final document. This pins the channel for
+    // the del op the same way the add op's test pins it.
+    {
+        std::ifstream id_in(path + ".worker_id", std::ios::binary);
+        uint64_t worker_id = 0;
+        id_in >> worker_id;
+        CHECK(0 != worker_id);
+        CHECK(worker_id == 200);
+        std::remove((path + ".worker_id").c_str());
+    }
     bool tombstone_found = false;
     if (j.contains("removed") && j["removed"].is_array()) {
         for (const auto& e : j["removed"]) {
