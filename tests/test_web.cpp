@@ -2447,6 +2447,38 @@ static void TestP95ConfigSaveFailureIsAudited() {
     }
     CHECK(saw_failed);
 
+    // A second owner holding the cross-process lock must be audited too: the
+    // save is refused (never published without mutual exclusion).
+    audit_lines.clear();
+    std::filesystem::remove_all(path, ec);
+    CHECK(cfg.SaveToFile(path, err));
+    vgww::core::SetConfigLockWaitForTest(std::chrono::milliseconds(20));
+    std::atomic<bool> held{false};
+    std::atomic<bool> release{false};
+    std::thread holder([&] {
+        vgww::core::ConfigFileLock lock(path);
+        held.store(true, std::memory_order_release);
+        while (!release.load(std::memory_order_acquire)) {
+            std::this_thread::yield();
+        }
+    });
+    while (!held.load(std::memory_order_acquire)) {
+        std::this_thread::yield();
+    }
+    CHECK(HttpPost(kPort, "/api/config", "tok", cfg.ToJsonString(),
+                   body) == 500);
+    release.store(true, std::memory_order_release);
+    holder.join();
+    vgww::core::SetConfigLockWaitForTest(std::chrono::milliseconds(0));
+    bool saw_lock_failed = false;
+    for (const auto& line : audit_lines) {
+        if (line.find("config save failed (cross-process lock)") !=
+            std::string::npos) {
+            saw_lock_failed = true;
+        }
+    }
+    CHECK(saw_lock_failed);
+
     api.Stop();
     std::filesystem::remove_all(path, ec);
     std::remove(rules.c_str());
