@@ -2692,6 +2692,31 @@ static void TestP107WebBindingRefusalIsAudited() {
     }
     CHECK(saw_v6_delete_refused);
 
+    // The same DELETE routes also reject a malformed query: the token is
+    // present, the service is up, but the key is missing (400). The refusal
+    // must be audited, not just answered.
+    audit_lines.clear();
+    CHECK(HttpDeleteWithToken("/api/dhcp/bindings", kPort, "tok", body) == 400);
+    bool saw_v4_missing_key = false;
+    for (const auto& line : audit_lines) {
+        if (line.find("dhcp binding delete rejected (mac required)") !=
+            std::string::npos) {
+            saw_v4_missing_key = true;
+        }
+    }
+    CHECK(saw_v4_missing_key);
+
+    audit_lines.clear();
+    CHECK(HttpDeleteWithToken("/api/dhcp6/bindings", kPort, "tok", body) == 400);
+    bool saw_v6_missing_key = false;
+    for (const auto& line : audit_lines) {
+        if (line.find("dhcp6 binding delete rejected (duid required)") !=
+            std::string::npos) {
+            saw_v6_missing_key = true;
+        }
+    }
+    CHECK(saw_v6_missing_key);
+
     // Stop the plane: the same routes now answer 409 "service not running".
     api.Stop();
     std::string stop_error;
@@ -2724,6 +2749,33 @@ static void TestP107WebBindingRefusalIsAudited() {
         }
     }
     CHECK(saw_v6_stopped);
+
+    // The DELETE routes hit the same 409 gate: the service is down, so the
+    // request is refused before the key is even looked at.
+    audit_lines.clear();
+    CHECK(HttpDeleteWithToken("/api/dhcp/bindings?mac=02:00:00:00:a3:11",
+                              kPort, "tok", body) == 409);
+    bool saw_v4_delete_stopped = false;
+    for (const auto& line : audit_lines) {
+        if (line.find("dhcp binding delete failed (service not running)") !=
+            std::string::npos) {
+            saw_v4_delete_stopped = true;
+        }
+    }
+    CHECK(saw_v4_delete_stopped);
+
+    audit_lines.clear();
+    CHECK(HttpDeleteWithToken(
+              "/api/dhcp6/bindings?duid=00:03:00:01:02:00:00:a3:11",
+              kPort, "tok", body) == 409);
+    bool saw_v6_delete_stopped = false;
+    for (const auto& line : audit_lines) {
+        if (line.find("dhcp6 binding delete failed (service not running)") !=
+            std::string::npos) {
+            saw_v6_delete_stopped = true;
+        }
+    }
+    CHECK(saw_v6_delete_stopped);
 
     api.Stop();
     std::remove(path);
