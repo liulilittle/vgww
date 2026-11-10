@@ -13425,6 +13425,22 @@ static void TestP96UiConfigSaveFailureIsAudited() {
     }
     CHECK(saw_apply_failed);
 
+    // An empty config path is refused before any write.
+    console_log::ClearForTest();
+    DataplaneCommandExecutor no_path(dataplane, "");
+    const CommandResult no_path_result =
+        no_path.Execute(Command{SaveConfigCmd{cfg}});
+    CHECK(!no_path_result.ok);
+    bool saw_no_path = false;
+    for (const auto& line : console_log::Snapshot()) {
+        if (line.find(L"[audit]") != std::wstring::npos &&
+            line.find(L"config save rejected (no config path)") !=
+                std::wstring::npos) {
+            saw_no_path = true;
+        }
+    }
+    CHECK(saw_no_path);
+
     std::filesystem::remove_all(cfg_path, ec);
 }
 
