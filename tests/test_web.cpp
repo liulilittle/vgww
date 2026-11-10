@@ -2291,12 +2291,17 @@ static void TestB4PrivilegedEndpoints() {
         CHECK(HttpPost(kPort, "/api/autostart", "s3cr3t", "{\"nope\":1}",
                        body) == 400);
         CHECK(setter_calls == before);
-        // Audit: one line per accepted privileged op (repair + 2 autostart).
-        CHECK(audit.find("repair-driver requested") != std::string::npos);
-        CHECK(audit.find("autostart set 1") != std::string::npos);
-        CHECK(audit.find("autostart set 0") != std::string::npos);
-        // No secret ever appears in an audit line.
-        CHECK(audit.find("s3cr3t") == std::string::npos);
+    // Audit: one line per accepted privileged op (repair + 2 autostart).
+    CHECK(audit.find("repair-driver requested") != std::string::npos);
+    CHECK(audit.find("autostart set 1") != std::string::npos);
+    CHECK(audit.find("autostart set 0") != std::string::npos);
+    // P119: the refusals are audited too - a second repair inside the guard
+    // window and a malformed autostart body must leave a record.
+    CHECK(audit.find("repair-driver refused (busy)") != std::string::npos);
+    CHECK(audit.find("autostart rejected (enabled required)") !=
+          std::string::npos);
+    // No secret ever appears in an audit line.
+    CHECK(audit.find("s3cr3t") == std::string::npos);
         api.Stop();
     }
     std::remove(path);

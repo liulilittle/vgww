@@ -2543,6 +2543,7 @@ namespace vgww {
                         return *denied;  // 403 no credential / 401 wrong token
                     }
                     if (!repair_requester) {
+                        audit("repair-driver refused (unavailable)");
                         return Response::Error(503, "unavailable");
                     }
                     const std::int64_t now = static_cast<std::int64_t>(
@@ -2552,6 +2553,7 @@ namespace vgww {
                     const std::int64_t until =
                         repair_pending_until->load(std::memory_order_acquire);
                     if (until > now) {
+                        audit("repair-driver refused (busy)");
                         return Response::Error(409, "busy");
                     }
                     // 60 s guard window: a second call while the first repair is
@@ -2560,6 +2562,7 @@ namespace vgww {
                                                 std::memory_order_release);
                     if (!repair_requester()) {
                         repair_pending_until->store(0, std::memory_order_release);
+                        audit("repair-driver refused (busy)");
                         return Response::Error(409, "busy");
                     }
                     audit("repair-driver requested");
@@ -2573,15 +2576,18 @@ namespace vgww {
                         return *denied;  // 403 no credential / 401 wrong token
                     }
                     if (!autostart_setter) {
+                        audit("autostart refused (unavailable)");
                         return Response::Error(503, "unavailable");
                     }
                     const std::size_t key = request.body.find("\"enabled\"");
                     if (key == std::string::npos) {
+                        audit("autostart rejected (enabled required)");
                         return Response::Error(400, "enabled required");
                     }
                     const std::size_t colon =
                         request.body.find(':', key + 9);
                     if (colon == std::string::npos) {
+                        audit("autostart rejected (enabled required)");
                         return Response::Error(400, "enabled required");
                     }
                     std::size_t v = colon + 1;
@@ -2594,6 +2600,7 @@ namespace vgww {
                     if (request.body.compare(v, 4, "true") == 0) {
                         want = true;
                     } else if (request.body.compare(v, 5, "false") != 0) {
+                        audit("autostart rejected (enabled must be boolean)");
                         return Response::Error(400, "enabled must be boolean");
                     }
                     const bool actual = autostart_setter(want);
