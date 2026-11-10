@@ -79,6 +79,22 @@ namespace vgww {
                 return Ok(i18n.Copy(key));
             }
 
+            /// P91: the audit line for a rule mutation is written AFTER the
+            /// mutation but BEFORE the durability verdict is known. When the
+            /// publish fails, the ring still records a plain success while the
+            /// command itself reports the loss - the same "fake success" class
+            /// OkIfRulesPersisted fixed for the toast, left in the audit trail.
+            /// A failed publish must leave a matching audit record, so an
+            /// operator reading the console page sees the same verdict as the
+            /// command result (and the HTTP persisted:false).
+            void AuditRuleChange(const std::string& line) {
+                if (web::RuleStore::Instance().PersistUpToDate()) {
+                    console_log::AppendAuditLine(line);
+                } else {
+                    console_log::AppendAuditLine(line + " (NOT saved)");
+                }
+            }
+
             /// Full 8-group text or a compressed form; InetPtonW is the
             /// platform parser (never hand-rolled).
             bool IsValidIpv6(const std::string& text) {
@@ -167,7 +183,7 @@ namespace vgww {
                 if (!store.AddPortMap(std::move(rule))) {
                     return Fail(I18n::Instance().Copy(Str::CmdWanPortTaken));
                 }
-                console_log::AppendAuditLine(
+                AuditRuleChange(
                     "portmap add " + cmd.proto + ":" +
                     std::to_string(cmd.wan_port) + " -> " + cmd.lan_ip +
                     ":" + std::to_string(cmd.lan_port));
@@ -199,8 +215,8 @@ namespace vgww {
                         return Fail(I18n::Instance().Copy(
                             Str::CmdIndexOutOfRange));
                     }
-                    console_log::AppendAuditLine("portmap delete id=" +
-                                                 std::to_string(cmd.id));
+                AuditRuleChange("portmap delete id=" +
+                                std::to_string(cmd.id));
                     return OkIfRulesPersisted(Str::CmdPortmapRemoved);
                 }
                 // batch89: range check and erase under ONE lock. Kept for
@@ -215,8 +231,8 @@ namespace vgww {
                     }
                     return Fail(I18n::Instance().Copy(Str::CmdIndexOutOfRange));
                 }
-                console_log::AppendAuditLine("portmap delete index=" +
-                                             std::to_string(cmd.index));
+                AuditRuleChange("portmap delete index=" +
+                                std::to_string(cmd.index));
                 return OkIfRulesPersisted(Str::CmdPortmapRemoved);
             }
 
@@ -245,8 +261,8 @@ namespace vgww {
                 if (!store.AddBanChecked(std::move(ban))) {
                     return Fail(I18n::Instance().Copy(Str::CmdBanLimit));
                 }
-                console_log::AppendAuditLine("ban add " + cmd.kind + " " +
-                                             cmd.value);
+                AuditRuleChange("ban add " + cmd.kind + " " +
+                                cmd.value);
                 return OkIfRulesPersisted(Str::CmdBanAdded);
             }
 
@@ -267,8 +283,8 @@ namespace vgww {
                         return Fail(I18n::Instance().Copy(
                             Str::CmdIndexOutOfRange));
                     }
-                    console_log::AppendAuditLine("ban delete id=" +
-                                                 std::to_string(cmd.id));
+                AuditRuleChange("ban delete id=" +
+                                std::to_string(cmd.id));
                     return OkIfRulesPersisted(Str::CmdBanRemoved);
                 }
                 // batch89: same one-lock shape as the port-map path above.
@@ -282,8 +298,8 @@ namespace vgww {
                     }
                     return Fail(I18n::Instance().Copy(Str::CmdIndexOutOfRange));
                 }
-                console_log::AppendAuditLine("ban delete index=" +
-                                             std::to_string(cmd.index));
+                AuditRuleChange("ban delete index=" +
+                                std::to_string(cmd.index));
                 return OkIfRulesPersisted(Str::CmdBanRemoved);
             }
 
@@ -308,7 +324,7 @@ namespace vgww {
                             cmd.replace_mac, std::move(rule))) {
                         return Fail(I18n::Instance().Copy(Str::CmdRateLimitLimit));
                     }
-                    console_log::AppendAuditLine(
+                    AuditRuleChange(
                         "ratelimit set " + cmd.mac + " up=" +
                         std::to_string(cmd.up_kbps) + " down=" +
                         std::to_string(cmd.down_kbps) + " replace=" +
@@ -323,7 +339,7 @@ namespace vgww {
                         std::move(rule))) {
                     return Fail(I18n::Instance().Copy(Str::CmdRateLimitLimit));
                 }
-                console_log::AppendAuditLine(
+                AuditRuleChange(
                     "ratelimit set " + cmd.mac + " up=" +
                     std::to_string(cmd.up_kbps) + " down=" +
                     std::to_string(cmd.down_kbps));
@@ -334,7 +350,7 @@ namespace vgww {
                 if (!web::RuleStore::Instance().RemoveRateLimit(cmd.mac)) {
                     return Fail(I18n::Instance().Copy(Str::CmdRateLimitMissing));
                 }
-                console_log::AppendAuditLine("ratelimit delete " + cmd.mac);
+                AuditRuleChange("ratelimit delete " + cmd.mac);
                 return OkIfRulesPersisted(Str::CmdRateLimitRemoved);
             }
 

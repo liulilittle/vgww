@@ -21984,6 +21984,88 @@ static void TestB98UiRuleCommandsReportPersistFailure() {
     std::filesystem::remove_all(rules, ec);
 }
 
+// P91: the audit line for a rule mutation used to be written before the
+// durability verdict was known, so a publish that failed still left a plain
+// "ban add" record while the command reported the loss (and the HTTP route
+// answered persisted:false). The audit trail must carry the same verdict.
+static void TestP91AuditLineCarriesPersistFailure() {
+    using namespace vgww::ui;
+    FixTextMetrics();
+    I18n& i18n = I18n::Instance();
+    const Lang saved_lang = i18n.Lang();
+    i18n.SetLang(Lang::En);
+    console_log::ClearForTest();
+
+    vgww::web::RuleStore& store = vgww::web::RuleStore::Instance();
+    const std::string path = "test_ui_p91_rules.json";
+    const std::string rules = path + ".rules.json";
+    std::remove(path.c_str());
+    std::error_code ec;
+    std::filesystem::remove_all(rules, ec);
+    store.AttachFile(rules);
+    store.Clear();
+    CHECK(store.PersistUpToDate());
+
+    vgww::core::Config cfg;
+    bool ok = false;
+    cfg.gateway.ipv4 = vgww::core::ParseIpv4("192.168.44.1", ok);
+    cfg.gateway.mask = vgww::core::ParseIpv4("255.255.255.0", ok);
+    vgww::core::ParseMac("30:fc:68:88:b4:91", cfg.gateway.mac);
+    vgww::runtime::Dataplane dataplane(cfg);
+    DataplaneCommandExecutor executor(dataplane, "");
+
+    // A DIRECTORY at the rules path makes every publish fail permanently.
+    std::filesystem::remove(rules, ec);
+    CHECK(std::filesystem::create_directory(rules, ec));
+    const CommandResult blocked =
+        executor.Execute(Command{AddBanCmd{"ip", "10.9.8.7"}});
+    CHECK(!blocked.ok);
+    CHECK(!store.PersistUpToDate());
+
+    const auto lines = console_log::Snapshot();
+    bool saw_unsaved = false;
+    bool saw_plain_ban_add = false;
+    const std::wstring plain(L"ban add");
+    const std::wstring unsaved(L"NOT saved");
+    for (const auto& line : lines) {
+        if (line.find(L"[audit]") == std::wstring::npos) {
+            continue;
+        }
+        if (line.find(plain) != std::wstring::npos) {
+            if (line.find(unsaved) != std::wstring::npos) {
+                saw_unsaved = true;
+            } else {
+                saw_plain_ban_add = true;
+            }
+        }
+    }
+    CHECK(saw_unsaved);
+    CHECK(!saw_plain_ban_add);
+
+    // A clean publish writes the plain line again (the guard is not a blanket
+    // suffix).
+    std::filesystem::remove_all(rules, ec);
+    console_log::ClearForTest();
+    const CommandResult saved =
+        executor.Execute(Command{AddBanCmd{"ip", "10.9.8.8"}});
+    CHECK(saved.ok);
+    const auto clean_lines = console_log::Snapshot();
+    bool saw_clean_ban_add = false;
+    for (const auto& line : clean_lines) {
+        if (line.find(L"[audit]") != std::wstring::npos &&
+            line.find(plain) != std::wstring::npos &&
+            line.find(unsaved) == std::wstring::npos) {
+            saw_clean_ban_add = true;
+        }
+    }
+    CHECK(saw_clean_ban_add);
+
+    store.AttachFile("");
+    store.Clear();
+    i18n.SetLang(saved_lang);
+    std::remove(path.c_str());
+    std::filesystem::remove_all(rules, ec);
+}
 static void TestB24AdapterDiagnosticLine() {
     using namespace vgww::ui;
     FixTextMetrics();
@@ -35163,6 +35245,7 @@ int main() {
     TestB24AdapterBindingSnapshot();
     TestB97UiBindingCommandsPersist();
     TestB98UiRuleCommandsReportPersistFailure();
+    TestP91AuditLineCarriesPersistFailure();
     TestP89DirtyStopIsNotReportedClean();
     TestP90RecheckSurfacesDirtyStop();
     TestB103LeasePersistVerdictSurface();
