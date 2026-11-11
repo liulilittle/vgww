@@ -6009,6 +6009,85 @@ static void TestAboutPage() {
     controller.Stop();
 }
 
+// batch164 P1-2: when the OS autostart setter refuses the change, the About
+// page must roll the checkbox back to the real registry state instead of
+// leaving it showing a state the system did not accept.
+static void TestB164AutostartCheckboxRollsBackOnFailure() {
+    using namespace vgww::ui;
+    FixTextMetrics();
+    I18n::Instance().SetLang(Lang::ZhCN);
+    ShellFakeSource source;
+
+    // Executor that routes SetAutostartCmd through the real tray setter (so
+    // the injected hook can make it fail) and succeeds everything else.
+    class AutostartFailingExecutor final : public vgww::ui::CommandExecutor {
+    public:
+        vgww::ui::CommandResult Execute(const vgww::ui::Command& cmd) override {
+            commands.push_back(cmd);
+            if (const auto* c =
+                    std::get_if<vgww::ui::SetAutostartCmd>(&cmd)) {
+                std::string error;
+                const bool ok = vgww::ui::tray::SetAutostart(c->enabled, error);
+                return vgww::ui::CommandResult{ok,
+                                               Widen(error.empty()
+                                                          ? std::string()
+                                                          : error),
+                                               false};
+            }
+            return vgww::ui::CommandResult{true, L"ok", false};
+        }
+        std::vector<vgww::ui::Command> commands;
+    };
+    AutostartFailingExecutor executor;
+    UiController controller(source, executor);
+    std::string error;
+    CHECK(controller.Start(error));
+
+    UiSnapshot snapshot = MakeRulesSnapshot(1, 1);
+    snapshot.uptime_s = 3661;
+    snapshot.driver_running = true;
+    snapshot.config.config_path = "C:\\vgww\\config.json";
+
+    // Force the tray setter to fail so the command result comes back ok=false.
+    tray::SetAutostartHookForTest(
+        [](bool, std::string& err) -> bool {
+            err = "cannot update HKCU Run value (code 5)";
+            return false;
+        });
+    const bool real_before = tray::IsAutostartEnabled();
+
+    UiApp app;
+    app.Compose(controller, snapshot);
+    app.root().Arrange({0.0f, 0.0f, 1280.0f, 800.0f});
+    app.router().Navigate("about");
+    app.Update(snapshot);
+    app.root().Arrange({0.0f, 0.0f, 1280.0f, 800.0f});
+
+    auto* autostart = dynamic_cast<Checkbox*>(
+        FindById(app.root(), "about.autostart"));
+    CHECK(autostart != nullptr);
+    if (autostart == nullptr) {
+        tray::SetAutostartHookForTest(nullptr);
+        controller.Stop();
+        return;
+    }
+    CHECK(autostart->checked == real_before);
+
+    // Toggle: the UI reflects the requested state immediately ...
+    const bool requested = !real_before;
+    autostart->checked = requested;
+    autostart->on_changed(requested);
+    CHECK(autostart->checked == requested);
+    // ... but the command result is a failure; draining results rolls it back.
+    auto* page = app.router().current();
+    CHECK(page != nullptr);
+    page->OnCommandFailed();
+    CHECK(autostart->checked == real_before);
+
+    tray::SetAutostartHookForTest(nullptr);
+    controller.Stop();
+}
+
 // ============================================================================
 // T8-F2: control RenderCore via a recording render context + relabel M1/M3.
 // ============================================================================
@@ -29506,6 +29585,18 @@ static void TestB29AdapterSelectOnly() {
     auto* none_hint = dynamic_cast<Text*>(
         FindById(app.root(), "settings.adapter_none_hint"));
     CHECK(none_hint != nullptr && none_hint->visible);
+    // batch164 P0-1: the hint must name an action the user can actually take.
+    // "Click Refresh in the top-right corner" is a dead end - there is no
+    // refresh control anywhere in the shell (measured: Str::CommonRefresh has
+    // zero control references), and the save button is disabled in this state,
+    // so the user was told to do something impossible with no other way out.
+    CHECK(none_hint != nullptr);
+    if (none_hint != nullptr) {
+        const std::wstring hint = none_hint->text();
+        CHECK(hint.find(L"右上角") == std::wstring::npos);
+        CHECK(hint.find(L"top-right") == std::wstring::npos);
+        CHECK(hint.find(L"Refresh") == std::wstring::npos);
+    }
     controller.Stop();
     I18n::Instance().SetLang(Lang::ZhCN);
 }
@@ -35706,6 +35797,7 @@ int main() {
     TestSettingsEarlyEmptySnapshotHeals();
     TestB39SettingsSaveDoubleClickGuard();
     TestBridgePage(); TestAboutPage();
+    TestB164AutostartCheckboxRollsBackOnFailure();
     TestControlRendering(); TestRelabelAcrossPages(); TestRatelimitEditMacChange();
     TestCullRenderSkipsOutOfRegion(); TestCulledOutUnit(); TestCullClearRegression();
     TestShouldFullClear();

@@ -30,30 +30,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
-#include <new>
 #include <vector>
-
-// batch302: one-shot allocation failure on the CALLING thread only, so the
-// noexcept-survival test is deterministic.
-static thread_local bool g_throw_next_alloc = false;
-
-void* operator new(size_t size) {
-    if (g_throw_next_alloc) {
-        g_throw_next_alloc = false;
-        throw std::bad_alloc();
-    }
-    void* p = std::malloc(size ? size : 1);
-    if (nullptr == p) {
-        throw std::bad_alloc();
-    }
-    return p;
-}
-
-void* operator new[](size_t size) { return ::operator new(size); }
-void operator delete(void* p) noexcept { std::free(p); }
-void operator delete[](void* p) noexcept { std::free(p); }
-void operator delete(void* p, size_t) noexcept { std::free(p); }
-void operator delete[](void* p, size_t) noexcept { std::free(p); }
 
 namespace {
 
@@ -278,10 +255,11 @@ namespace vgww {
     /// byte-for-byte, TTL is set, and BOTH checksums verify to zero.
     int TestEchoReplyContents() {
         auto request = MakeRequest(kIcmpEchoRequest, 0x1234, 0x5678, 32);
-        std::vector<uint8_t> reply;
-        BuildEchoReplyFrame(request.data(), request.size(), kGatewayMac,
-                            kClientMac, reply);
-        CHECK(request.size() + net::kEthernetHeaderLen == reply.size());
+        std::array<uint8_t, proto::kMaxEchoReplyFrameBytes> reply;
+        const size_t reply_len = proto::BuildEchoReplyFrame(
+            request.data(), request.size(), kGatewayMac,
+            kClientMac, reply);
+        CHECK(request.size() + net::kEthernetHeaderLen == reply_len);
 
         // Ethernet: the reply goes TO the client FROM the gateway. Without
         // this pair a swap is unobservable (the IP-layer addresses below are
@@ -320,9 +298,12 @@ namespace vgww {
     /// copied) and still checksum correctly.
     int TestEchoReplyWithOptions() {
         auto request = MakeRequest(kIcmpEchoRequest, 7, 8, 16, 1, 4, 6);
-        std::vector<uint8_t> reply;
-        BuildEchoReplyFrame(request.data(), request.size(), kGatewayMac,
-                            kClientMac, reply);
+        std::array<uint8_t, proto::kMaxEchoReplyFrameBytes> reply;
+        const size_t reply_len = proto::BuildEchoReplyFrame(
+            request.data(), request.size(), kGatewayMac,
+            kClientMac, reply);
+        CHECK(reply_len ==
+              net::kEthernetHeaderLen + request.size());
         const uint8_t* ip = reply.data() + net::kEthernetHeaderLen;
         CHECK(24 == (ip[0] & 0x0F) * 4);
         CHECK(0 == std::memcmp(ip + 12, kGwIp, 4));
@@ -331,61 +312,53 @@ namespace vgww {
         return 0;
     }
 
-    /// A non-echo / unparseable request must leave out_frame untouched.
+    /// A non-echo / unparseable request must return 0 and leave out untouched.
     int TestEchoReplyIgnoresGarbage() {
-        std::vector<uint8_t> reply{0xAA, 0xBB};
-        BuildEchoReplyFrame(nullptr, 0, kGatewayMac, kClientMac, reply);
-        CHECK(2 == reply.size());
-        CHECK(0xAA == reply[0] && 0xBB == reply[1]);
+        std::array<uint8_t, proto::kMaxEchoReplyFrameBytes> reply;
+        reply.fill(0xAA);
+        CHECK(0 == proto::BuildEchoReplyFrame(nullptr, 0, kGatewayMac,
+                                              kClientMac, reply));
+        // untouched: still 0xAA at both ends
+        CHECK(0xAA == reply[0] && 0xAA == reply[reply.size() - 1]);
 
         // Wrong protocol: still untouched.
         auto d = MakeRequest(kIcmpEchoRequest, 1, 1, 8, /*proto*/ 17);
-        std::vector<uint8_t> reply2{0xCC};
-        BuildEchoReplyFrame(d.data(), d.size(), kGatewayMac, kClientMac, reply2);
-        CHECK(1 == reply2.size());
-        CHECK(0xCC == reply2[0]);
+        std::array<uint8_t, proto::kMaxEchoReplyFrameBytes> reply2;
+        reply2.fill(0xCC);
+        CHECK(0 == proto::BuildEchoReplyFrame(d.data(), d.size(), kGatewayMac,
+                                              kClientMac, reply2));
+        CHECK(0xCC == reply2[0] && 0xCC == reply2[reply2.size() - 1]);
         return 0;
     }
 
-    /// batch302: the builders run on the RX/worker threads. An allocation
-    /// failure must propagate to RunGuarded (which stops the plane safely),
-    /// not call std::terminate inside a noexcept function.
-    int TestBuilderAllocationFailurePropagates() {
+    /// The stack-buffer builder writes nothing beyond its buffer. A request
+    /// whose reply would exceed kMaxEchoReplyFrameBytes returns 0 (caller
+    /// drops it via AppendDown), never heap-allocates, never throws.
+    int TestBuilderNeverAllocates() {
         auto request = MakeRequest(kIcmpEchoRequest, 1, 1, 32);
+        std::array<uint8_t, proto::kMaxEchoReplyFrameBytes> reply{};
+        const size_t len = proto::BuildEchoReplyFrame(
+            request.data(), request.size(), kGatewayMac,
+            kClientMac, reply);
+        CHECK(len == request.size() + net::kEthernetHeaderLen);
+        return 0;
+    }
 
-        std::vector<uint8_t> reply{0xAA};
-        g_throw_next_alloc = true;
-        bool threw = false;
-        try {
-            BuildEchoReplyFrame(request.data(), request.size(), kGatewayMac,
-                                kClientMac, reply);
-        } catch (const std::bad_alloc&) {
-            threw = true;
-        }
-        CHECK(threw);
-        CHECK(!g_throw_next_alloc);   // the hook fired
-        CHECK(1 == reply.size());     // unchanged on failure
-        CHECK(0xAA == reply[0]);
-        BuildEchoReplyFrame(request.data(), request.size(), kGatewayMac,
-                            kClientMac, reply);
-        CHECK(request.size() + net::kEthernetHeaderLen == reply.size());
-
-        std::vector<uint8_t> frame;
-        g_throw_next_alloc = true;
-        threw = false;
-        try {
-            BuildRelayedEchoReplyFrame(kRemoteIp, kClientIp, kGatewayMac,
-                                       kClientMac, 1, 2, nullptr, 0, frame);
-        } catch (const std::bad_alloc&) {
-            threw = true;
-        }
-        CHECK(threw);
-        CHECK(!g_throw_next_alloc);
-        CHECK(frame.empty());
-        BuildRelayedEchoReplyFrame(kRemoteIp, kClientIp, kGatewayMac,
-                                   kClientMac, 1, 2, nullptr, 0, frame);
-        CHECK(net::kEthernetHeaderLen + kIpv4HeaderLenMin + kIcmpHeaderLen ==
-              frame.size());
+    /// A request whose reply would exceed kMaxEchoReplyFrameBytes must be
+    /// dropped: return 0 and leave `out` untouched, so the caller (AppendDown)
+    /// never forwards an overrun frame.
+    int TestBuilderDropsOversizeReply() {
+        constexpr size_t kPayload = proto::kMaxEchoReplyFrameBytes + 256;
+        auto request =
+            MakeRequest(kIcmpEchoRequest, 1, 1, kPayload);
+        std::array<uint8_t, proto::kMaxEchoReplyFrameBytes> reply{};
+        reply.fill(0xAA);
+        const size_t len = proto::BuildEchoReplyFrame(
+            request.data(), request.size(), kGatewayMac,
+            kClientMac, reply);
+        CHECK(0 == len);
+        // untouched: still 0xAA at both ends
+        CHECK(0xAA == reply[0] && 0xAA == reply[reply.size() - 1]);
         return 0;
     }
 
@@ -551,7 +524,8 @@ int main() {
     if (vgww::TestRelayedReplyEmptyPayload()) return 1;
     if (vgww::TestRelayedReplyIgnoresEthernetPadding()) return 1;
     if (vgww::TestRelayedReplyIdSeqBoundaries()) return 1;
-    if (vgww::TestBuilderAllocationFailurePropagates()) return 1;
+        if (vgww::TestBuilderNeverAllocates()) return 1;
+        if (vgww::TestBuilderDropsOversizeReply()) return 1;
     std::puts("test_icmp: ALL PASS");
     return 0;
 }

@@ -123,6 +123,68 @@ namespace {
         std::remove(path.c_str());
     }
 
+    /// batch203: a temp file held open by a scanner (no delete sharing) must
+    /// still be removed once the hold is released. The failure path retries
+    /// DeleteFileW on a bounded budget; a single bare DeleteFileW would leave
+    /// `<path>.tmp.<pid>.<seq>` behind forever. This test uses the pre-delete
+    /// hook (which runs after the writer closed its handle, right before the
+    /// cleanup) to hold the temp file, releases it ~50 ms later from another
+    /// thread, and asserts the temp is gone - which only the retrying delete
+    /// achieves.
+    void TestTempCleanupRetriesWhileLocked() {
+        const std::string path = "b-tmp-lock.json";
+        std::remove(path.c_str());
+
+        std::atomic<bool> held{false};
+        std::atomic<bool> released{false};
+        HANDLE held_handle = INVALID_HANDLE_VALUE;
+        std::string held_name;
+
+        // Runs just before the failure-path delete. Open the temp with NO
+        // delete sharing so the first DeleteFileW fails, then let a helper
+        // thread close it shortly after (still well inside the 200 ms budget).
+        vgww::core::SetPreDeleteHookForTest([&](const std::string& p) {
+            if (p.find("b-tmp-lock.json.tmp.") != 0) {
+                return;
+            }
+            held_name = p;
+            held_handle = ::CreateFileA(
+                p.c_str(), GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE,
+                nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+            held = true;
+        });
+        std::thread releaser([&] {
+            while (!held.load()) {
+                std::this_thread::sleep_for(std::chrono::milliseconds(1));
+            }
+            std::this_thread::sleep_for(std::chrono::milliseconds(50));
+            if (INVALID_HANDLE_VALUE != held_handle) {
+                ::CloseHandle(held_handle);
+            }
+            released = true;
+        });
+
+        // A validator that rejects the temp drives the cleanup path without
+        // needing a flush failure (the writer handle is already closed here).
+        std::string err;
+        const auto outcome = vgww::core::WriteFileAtomicDurable(
+            path, "{\"x\":1}", err,
+            [](const std::string&) { return false; });
+        const bool saved = (outcome == vgww::core::AtomicWriteOutcome::kOk);
+        releaser.join();
+        vgww::core::SetPreDeleteHookForTest(nullptr);
+
+        CHECK(!saved);
+        CHECK(held.load());
+        CHECK(released.load());
+        // The lock must have actually been acquired, or the retry is not
+        // exercised and this test could pass for the wrong reason.
+        CHECK(INVALID_HANDLE_VALUE != held_handle);
+        // The retrying delete must have removed the temp after the hold ended.
+        CHECK(!held_name.empty());
+        CHECK(!std::filesystem::exists(held_name));
+        std::remove(path.c_str());
+    }
     /// A failed load is READ-ONLY. Startup exits on a corrupt config (main.cpp
     /// reports the error and returns), so the file the operator wrote must
     /// still be there byte-for-byte for them to inspect - the same
@@ -3085,6 +3147,7 @@ int main() {
     TestMacRoundTrip();
     TestDetachedBodyGuardPublishesFailure();
     TestFileFlushFailureIsNotSaved();
+    TestTempCleanupRetriesWhileLocked();
     TestLoadFailureDoesNotTouchTheFile();
     TestConfigOpenRetryOnTransientLock();
     TestConfigOpenFailureIsClassified();

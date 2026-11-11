@@ -65,6 +65,9 @@ namespace vgww {
             private:
                 void RefreshLabels(I18n& i18n);
                 void RefreshWebRow(const ConfigView& config, I18n& i18n);
+                /// batch164 P1-2: roll back the autostart checkbox when the
+                /// OS setter refused the change.
+                void OnCommandFailed() override;
 
                 PageContext* ctx_ = nullptr;
                 InfoRow version_;
@@ -74,6 +77,10 @@ namespace vgww {
                 InfoRow driver_;
                 Text* autostart_label_ = nullptr;
                 Checkbox* autostart_ = nullptr;
+                /// batch164 P1-2: true while the autostart command result is
+                /// pending; used to roll back the checkbox when the OS setter
+                /// refuses the change.
+                bool autostart_awaiting_ = false;
                 /// batch27 D4-B: plain-language explanation of the checkbox.
                 Text* autostart_hint_ = nullptr;
                 Text* lang_label_ = nullptr;
@@ -190,6 +197,7 @@ namespace vgww {
                 autostart_ = static_cast<Checkbox*>(row->Add(std::move(box)));
                 autostart_->on_changed = [this](bool enabled) {
                     if (ctx_ != nullptr && ctx_->controller != nullptr) {
+                        autostart_awaiting_ = true;
                         SubmitCommand(*ctx_, Command{SetAutostartCmd{enabled}});
                     }
                 };
@@ -270,9 +278,10 @@ namespace vgww {
                 if (language_ != nullptr) {
                     language_->SetCurrentCode(I18n::Instance().LangCode());
                 }
-                // The autostart switch keeps the user's toggle; the registry is
-                // the source of truth only at Build time (the command round
-                // trip is asynchronous).
+                // The autostart switch keeps the user's toggle; when the OS
+                // setter refuses the change, OnCommandFailed rolls the checkbox
+                // back to the registry truth so the UI never shows a state the
+                // system did not accept.
             }
 
             void AboutPage::RefreshLabels(I18n& i18n) {
@@ -312,6 +321,17 @@ namespace vgww {
             // snapshot and is never displayed. web.port is validated to
             // [1024, 65535] on load, so port==0 only happens when the server is
             // off - both gate the row to the disabled state.
+            void AboutPage::OnCommandFailed() {
+                // batch164 P1-2: roll back the autostart checkbox so it matches
+                // the real autostart state when the OS setter refused the
+                // change. WebUI does the same rollback (index.html:2811-2820).
+                if (autostart_awaiting_ && autostart_ != nullptr) {
+                    const bool real = vgww::ui::tray::IsAutostartEnabled();
+                    autostart_->SetChecked(real);
+                    autostart_awaiting_ = false;
+                }
+            }
+
             void AboutPage::RefreshWebRow(const ConfigView& config, I18n& i18n) {
                 if (web_value_ == nullptr) {
                     return;

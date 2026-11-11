@@ -12,6 +12,7 @@
 #include "net/eth.h"
 #include "net/ip_addr.h"
 
+#include <array>
 #include <cstddef>
 #include <cstdint>
 #include <vector>
@@ -26,6 +27,12 @@ namespace vgww {
         /// ICMP relay handlers index straight into the frame with the value;
         /// an unchecked ihl of 0 pointed them at the IPv4 header itself.
         inline constexpr size_t kIpv4HeaderLenMax = 60;
+
+        /// Stack reply-buffer size, matching Dataplane::AppendDown's send cap
+        /// (src/runtime/dataplane.cpp:3668). Replies larger than this are
+        /// dropped by AppendDown anyway, so a fixed stack buffer suffices and
+        /// removes the per-frame heap allocation.
+        inline constexpr size_t kMaxEchoReplyFrameBytes = 1514;
 
         /// True when `ihl` (already multiplied to bytes) is a legal IPv4
         /// header length. Total: every value is judged.
@@ -71,6 +78,16 @@ namespace vgww {
                                  const net::WireMac& gateway_mac,
                                  const net::WireMac& client_mac,
                                  std::vector<uint8_t>& out_frame);
+
+        /// Stack-buffer variant: writes into `out` and returns the frame
+        /// length (0 when the request is malformed or the reply would exceed
+        /// `kMaxEchoReplyFrameBytes` - the caller drops it). Zero heap
+        /// allocation; see proto::kMaxEchoReplyFrameBytes.
+        size_t BuildEchoReplyFrame(const uint8_t* request_ip,
+                                   size_t request_len,
+                                   const net::WireMac& gateway_mac,
+                                   const net::WireMac& client_mac,
+                                   std::array<uint8_t, kMaxEchoReplyFrameBytes>& out);
 
         /// Builds an Ethernet+IPv4+ICMP echo-REPLY frame for a RELAYED ping:
         /// the internet host at `remote_ip` answered us; deliver that answer

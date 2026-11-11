@@ -2376,14 +2376,24 @@ namespace vgww {
                                 proto::IcmpEchoView echo;
                                 if (proto::ParseIcmpEcho(ip, ip_len, echo) &&
                                     proto::kIcmpEchoRequest == echo.type) {
-                                    std::vector<uint8_t> icmp_reply;
-                                    proto::BuildEchoReplyFrame(ip, ip_len, config.gateway.mac,
-                                                               view.eth.src, icmp_reply);
-                                    AppendDown(up.For(in_port), icmp_reply.data(), icmp_reply.size());
+                                    // Stack buffer: zero heap allocation (ARP
+                                    // uses the same pattern via std::array;
+                                    // see arp.cpp:69).
+                                    std::array<uint8_t, proto::kMaxEchoReplyFrameBytes> reply;
+                                    const size_t reply_len =
+                                        proto::BuildEchoReplyFrame(ip, ip_len,
+                                                                   config.gateway.mac,
+                                                                   view.eth.src,
+                                                                   reply);
+                                    if (reply_len > 0) {
+                                        AppendDown(up.For(in_port), reply.data(),
+                                                   reply_len);
+                                    }
                                     ++stats->icmp_replies;
                                     LatTraceIcmp(echo.sequence);
-                                    neighbors.Learn(net::IpAddress::FromV4BigEndian(ip + 12),
-                                                    view.eth.src);
+                                    neighbors.Learn(
+                                        net::IpAddress::FromV4BigEndian(ip + 12),
+                                        view.eth.src);
                                     return;
                                 }
                             }
@@ -2498,10 +2508,16 @@ namespace vgww {
                         if (dst_net == config.gateway.ipv4 &&
                             proto::ParseIcmpEcho(ip, ip_len, echo) &&
                             proto::kIcmpEchoRequest == echo.type) {
-                            std::vector<uint8_t> reply;
-                            proto::BuildEchoReplyFrame(ip, ip_len, config.gateway.mac,
-                                                       view.eth.src, reply);
-                            AppendDown(down.For(in_port), reply.data(), reply.size());
+                            // Stack buffer: zero heap allocation (ARP uses the
+                            // same pattern via std::array; see arp.cpp:69).
+                            std::array<uint8_t, proto::kMaxEchoReplyFrameBytes> reply;
+                            const size_t reply_len = proto::BuildEchoReplyFrame(
+                                ip, ip_len, config.gateway.mac,
+                                view.eth.src, reply);
+                            if (reply_len > 0) {
+                                AppendDown(down.For(in_port), reply.data(),
+                                           reply_len);
+                            }
                             ++stats->icmp_replies;
                             LatTraceIcmp(echo.sequence);
                             break;
@@ -3676,7 +3692,9 @@ namespace vgww {
                 std::vector<INTERMEDIATE_BUFFER>& items = batch.items;
                 items.emplace_back();
                 INTERMEDIATE_BUFFER& ib = items.back();
-                std::memset(&ib, 0, sizeof(ib));
+                // P2: emplace_back() 值初始化已零化 POD INTERMEDIATE_BUFFER，
+                // 无需再 memset 1566B；驱动只消费 m_Length 字节的 m_IBuffer，
+                // 且所有被消费字段在下方显式设置。
                 ib.m_dwDeviceFlags = PACKET_FLAG_ON_SEND;
                 // C8: the frame is tagged with its batch's egress handle so
                 // the driver attributes it to the port it will actually leave.

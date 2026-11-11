@@ -335,7 +335,7 @@ namespace vgww {
                 L"当前配置: {0}(未检测到)",  // AdapterNotDetectedFmt
                 L"当前配置的网卡未检测到,可能已拔出或被改名;不改选时保存会原样保留。",  // AdapterNotDetectedHint
                 L"未检测到网卡",  // AdapterNoneDetected
-                L"点右上角刷新后重试。",  // AdapterNoneDetectedHint
+                L"未检测到网卡。请检查网卡与驱动连接,或重启应用后重试。",  // AdapterNoneDetectedHint
                 L"网卡不可用: {0}(请在上方重新选择已连接的网卡)",  // SettingsAdapterErrorFmt
                 L"窗口太窄,拉宽可看实时曲线",  // DashSparkNarrowHint
                 L"吞吐量",  // DashThroughput
@@ -733,7 +733,7 @@ namespace vgww {
                 L"Configured: {0} (not detected)",  // AdapterNotDetectedFmt
                 L"The configured adapter was not detected - it may be unplugged or renamed. Saving without changing it keeps the value.",  // AdapterNotDetectedHint
                 L"No network adapter detected",  // AdapterNoneDetected
-                L"Click Refresh in the top-right corner and try again.",  // AdapterNoneDetectedHint
+                L"No network adapter detected. Check the adapter and driver, or restart the app and try again.",  // AdapterNoneDetectedHint
                 L"Adapter unavailable: {0} (pick a connected adapter above)",  // SettingsAdapterErrorFmt
                 L"The window is too narrow - widen it to see the live curve.",  // DashSparkNarrowHint
                 L"Throughput",  // DashThroughput

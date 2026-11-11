@@ -13,6 +13,7 @@
 #include <cmath>
 #include <cstdio>
 #include <cstring>
+#include <functional>
 #include <vector>
 
 namespace vgww {
@@ -49,6 +50,9 @@ namespace vgww {
                 /// batch318: the shell call is injectable so the re-add state
                 /// machine is testable without a real taskbar.
                 ShellNotifyFn g_shell_notify = &::Shell_NotifyIconW;
+                /// batch164 P1-2 test seam: injectable autostart setter (nullptr
+                /// restores the real registry writer).
+                std::function<bool(bool, std::string&)> g_autostart_hook;
                 // U4: written by the command worker (SetAutostart/UpdateMenu
                 // via TrayAutostartHook) and read by the UI thread (ShowMenu);
                 // a plain bool would be a data race. Atomic keeps the
@@ -457,11 +461,19 @@ namespace vgww {
                 g_shell_notify = fn != nullptr ? fn : &::Shell_NotifyIconW;
             }
 
+            void SetAutostartHookForTest(
+                std::function<bool(bool, std::string&)> hook) noexcept {
+                g_autostart_hook = std::move(hook);
+            }
+
             void UpdateMenu(bool autostart) {
                 g_autostart_checked.store(autostart);
             }
 
             bool SetAutostart(bool enabled, std::string& error) {
+                if (g_autostart_hook) {
+                    return g_autostart_hook(enabled, error);
+                }
                 error.clear();
                 HKEY key = nullptr;
                 const LSTATUS opened = ::RegCreateKeyExW(

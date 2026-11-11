@@ -576,7 +576,9 @@ namespace vgww {
                 /// batch29: "configured but not detected" hint (visible only
                 /// while the saved value is missing from the detected list).
                 Text* adapter_missing_hint_ = nullptr;
-                /// batch29: "nothing detected - click Refresh" hint.
+                /// batch29: "nothing detected" hint. batch164 P0-1: names an
+                /// actionable recovery (check adapter/driver, restart), never a
+                /// control that does not exist.
                 Text* adapter_none_hint_ = nullptr;
                 /// batch29: true when no adapter was detected at all (the save
                 /// button is disabled in that state).
@@ -1633,10 +1635,14 @@ void SettingsPage::RefreshDirty() {
                 }
                 RefreshAdapterOptions(snapshot, i18n);
                 // batch29: with NO detected adapter there is nothing sensible to
-                // save - the save button is disabled and the hint says "click
-                // Refresh in the top-right corner and try again". A configured
+                // save - the save button is disabled and the hint names an
+                // action the user can actually take. A configured
                 // (but currently missing) adapter is NOT "empty": that state
                 // keeps its value and stays saveable.
+                // batch164 P0-1: the hint used to say "click Refresh in the
+                // top-right corner" - there is no refresh control anywhere in
+                // the shell (Str::CommonRefresh has zero control references),
+                // and the disabled save button left the user with no way out.
                 if (save_ != nullptr) {
                     const bool none = adapters_empty_ && adapter_value_.empty();
                     save_->enabled = !none;

@@ -8,8 +8,9 @@
 (function () {
   try {
     var p = localStorage.getItem("vgww_theme");
-    var d = (p === "light" || p === "dark") ? p :
-      (window.matchMedia && window.matchMedia("(prefers-color-scheme: light)").matches ? "light" : "dark");
+    // Default is DARK to match the native shell; "auto" is an explicit opt-in.
+    var d = (p === "light" || p === "dark" || p === "auto") ? p : "dark";
+    if (d === "auto") d = (window.matchMedia && window.matchMedia("(prefers-color-scheme: light)").matches ? "light" : "dark");
     document.documentElement.dataset.theme = d;
   } catch (e) { /* private mode: keep the dark default */ }
 })();
@@ -158,10 +159,18 @@ button,nav a,input,select{transition:background-color .15s ease,color .15s ease,
   .tk{flex-direction:row;align-items:center;padding:4px 6px}
   .tk input{width:110px}
   .tablewrap table{min-width:520px}
-  #page-settings .row{flex-direction:column;align-items:stretch}
-  #page-settings .row label{white-space:nowrap}
-  #page-settings .row input,#page-settings .row select{width:100%;flex:none;min-width:0;max-width:none}
-  #page-settings .row .field{flex-direction:column;align-items:stretch;width:100%}
+/* Settings page: card layout (batch200 web UI refresh). Each card groups
+   related fields vertically; labels sit above their inputs with the tooltip
+   copy below, matching the native shell's settings page. */
+.set-card{display:flex;flex-direction:column;gap:14px;margin-bottom:16px}
+.set-card h2{margin:0 0 2px}
+.set-card .field{flex-direction:column;align-items:stretch;gap:6px;width:100%}
+.set-card .field label{white-space:normal}
+.set-card .field input,.set-card .field select{width:100%;flex:none;min-width:0;max-width:none}
+.set-card .field-check{flex-direction:row;align-items:center;gap:10px}
+.set-card .field-check input{width:auto;flex:none}
+.set-card .set-save-row,.set-save-row{justify-content:flex-end;margin-bottom:18px}
+.set-card .hint{color:var(--muted);font-size:.8rem;line-height:1.45;margin-top:-2px}
   #nav{min-width:0;flex:1 1 100%}
   #nav a{flex:0 0 auto;white-space:nowrap}
   th,td{white-space:nowrap}
@@ -676,22 +685,25 @@ button,nav a,input,select{transition:background-color .15s ease,color .15s ease,
     <div class="cards" id="host-cards"></div>
     <h2 data-i18n="dev.title">Devices</h2>
     <div class="sub" data-i18n="dev.sub">Online LAN clients · IP/MAC · live throughput</div>
-    <div class="row">
+    <div class="card set-card">
+      <div class="field"><label class="muted field-label" for="dev-scope" data-i18n="a11y.devscope">Filter devices by side</label>
       <select id="dev-scope" data-i18n-aria="a11y.devscope" onchange="resortDevices()">
         <option value="all" data-i18n="dev.all">All</option>
         <option value="lan" data-i18n="dev.lan">LAN</option>
         <option value="wan" data-i18n="dev.wan">WAN</option>
-      </select>
+      </select></div>
+      <div class="field"><label class="muted field-label" for="dev-sort" data-i18n="a11y.devsort">Sort devices by</label>
       <select id="dev-sort" data-i18n-aria="a11y.devsort" onchange="resortDevices()">
         <option value="rate" data-i18n="dev.sort.rate">By rate</option>
         <option value="up" data-i18n="dev.sort.up">By upload</option>
         <option value="down" data-i18n="dev.sort.down">By download</option>
         <option value="seen" data-i18n="dev.sort.seen">By activity</option>
-      </select>
+      </select></div>
+      <div class="field"><label class="muted field-label" for="dev-dir" data-i18n="a11y.devdir">Sort direction</label>
       <select id="dev-dir" data-i18n-aria="a11y.devdir" onchange="resortDevices()">
         <option value="desc" data-i18n="dev.desc">Descending</option>
         <option value="asc" data-i18n="dev.asc">Ascending</option>
-      </select>
+      </select></div>
     </div>
     <div class="tablewrap"><table id="dev-table"><caption class="sr-only" data-i18n="dev.title">Devices</caption><thead>
       <tr><th scope="col" data-i18n="dev.ip">IP address</th><th scope="col" data-i18n="dev.mac">MAC address</th><th scope="col" data-i18n="dev.up">Up</th><th scope="col" data-i18n="dev.down">Down</th><th scope="col" data-i18n="dev.seen">Seen</th><th scope="col" data-i18n="dev.lan">LAN</th></tr>
@@ -700,42 +712,54 @@ button,nav a,input,select{transition:background-color .15s ease,color .15s ease,
   <section id="page-portmap" hidden>
     <h1 data-i18n="pm.title">Port Mapping</h1>
     <div class="sub" data-i18n="pm.sub">Forward host ports to LAN clients (virtual servers)</div>
-    <div class="row">
-      <input id="pm-proto" class="w90" data-i18n-aria="a11y.pmproto" placeholder="tcp">
-      <input id="pm-wan" class="w120" inputmode="numeric" data-i18n-ph="pm.wanph" data-i18n-aria="pm.wanph">
-      <input id="pm-lanip" class="w150" data-i18n-ph="pm.lanip" data-i18n-aria="pm.lanip" placeholder="LAN IP">
-      <input id="pm-lanport" class="w120" inputmode="numeric" data-i18n-ph="pm.lanph" data-i18n-aria="pm.lanph">
-      <button id="pm-add" onclick="addMapping()" data-i18n="pm.add">Add rule</button>
+    <div class="card set-card">
+      <div class="field"><label class="muted field-label" for="pm-proto" data-i18n="a11y.pmproto">Protocol</label>
+      <input id="pm-proto" data-i18n-aria="a11y.pmproto" placeholder="tcp"></div>
+      <div class="field"><label class="muted field-label" for="pm-wan" data-i18n="pm.wanph">WAN port</label>
+      <input id="pm-wan" inputmode="numeric" data-i18n-ph="pm.wanph" data-i18n-aria="pm.wanph"></div>
+      <div class="field"><label class="muted field-label" for="pm-lanip" data-i18n="pm.lanip">LAN IP</label>
+      <input id="pm-lanip" data-i18n-ph="pm.lanip" data-i18n-aria="pm.lanip" placeholder="LAN IP"></div>
+      <div class="field"><label class="muted field-label" for="pm-lanport" data-i18n="pm.lanph">LAN port</label>
+      <input id="pm-lanport" inputmode="numeric" data-i18n-ph="pm.lanph" data-i18n-aria="pm.lanph"></div>
+      <div class="row"><button id="pm-add" onclick="addMapping()" data-i18n="pm.add">Add rule</button></div>
     </div>
     <div class="tablewrap"><table id="pm-table"><caption class="sr-only" data-i18n="pm.title">Port Mapping</caption><thead>
       <tr><th scope="col" data-i18n="pm.colproto">Protocol</th><th scope="col" data-i18n="pm.colwan">WAN port</th><th scope="col" data-i18n="pm.collan">LAN target</th><th scope="col"><span class="sr-only" data-i18n="pm.del">Remove</span></th></tr>
     </thead><tbody></tbody></table></div>
   </section>
+
   <section id="page-firewall" hidden>
     <h1 data-i18n="fw.title">Firewall</h1>
     <div class="sub" data-i18n="fw.sub">Block traffic by MAC or IP</div>
-    <div class="row">
-      <select id="ban-kind" data-i18n-aria="a11y.bankind"><option value="mac">MAC</option><option value="ip">IP</option></select>
-      <input id="ban-value" data-i18n-ph="fw.valueph" data-i18n-aria="a11y.banvalue" placeholder="AA:BB:CC:DD:EE:FF or 192.168.0.50">
-      <button id="ban-add" onclick="addBan()" data-i18n="fw.block">Block</button>
+    <div class="card set-card">
+      <div class="field"><label class="muted field-label" for="ban-kind" data-i18n="a11y.bankind">Match type</label>
+      <select id="ban-kind" data-i18n-aria="a11y.bankind"><option value="mac">MAC</option><option value="ip">IP</option></select></div>
+      <div class="field"><label class="muted field-label" for="ban-value" data-i18n="a11y.banvalue">Value to block</label>
+      <input id="ban-value" data-i18n-ph="fw.valueph" data-i18n-aria="a11y.banvalue" placeholder="AA:BB:CC:DD:EE:FF or 192.168.0.50"></div>
+      <div class="row"><button id="ban-add" onclick="addBan()" data-i18n="fw.block">Block</button></div>
     </div>
     <div class="tablewrap"><table id="ban-table"><caption class="sr-only" data-i18n="fw.title">Firewall</caption><thead>
       <tr><th scope="col" data-i18n="fw.colkind">Kind</th><th scope="col" data-i18n="fw.colval">Value</th><th scope="col"><span class="sr-only" data-i18n="fw.unblock">Unblock</span></th></tr>
     </thead><tbody></tbody></table></div>
   </section>
+
   <section id="page-ratelimit" hidden>
     <h1 data-i18n="rl.title">Rate Limit</h1>
     <div class="sub" data-i18n="rl.sub">Per-client bandwidth caps (token bucket)</div>
-    <div class="row">
-      <input id="rl-mac" class="w160" data-i18n-aria="a11y.rlmac" placeholder="AA:BB:CC:DD:EE:FF">
-      <input id="rl-up" class="w110" inputmode="numeric" data-i18n-ph="rl.uph" data-i18n-aria="rl.uph">
-      <input id="rl-down" class="w110" inputmode="numeric" data-i18n-ph="rl.downph" data-i18n-aria="rl.downph">
-      <button id="rl-add" onclick="addRateLimit()" data-i18n="rl.limit">Limit</button>
+    <div class="card set-card">
+      <div class="field"><label class="muted field-label" for="rl-mac" data-i18n="a11y.rlmac">Client MAC</label>
+      <input id="rl-mac" data-i18n-aria="a11y.rlmac" placeholder="AA:BB:CC:DD:EE:FF"></div>
+      <div class="field"><label class="muted field-label" for="rl-up" data-i18n="rl.colup">Uplink</label>
+      <input id="rl-up" inputmode="numeric" data-i18n-ph="rl.uph" data-i18n-aria="rl.uph"></div>
+      <div class="field"><label class="muted field-label" for="rl-down" data-i18n="rl.coldown">Downlink</label>
+      <input id="rl-down" inputmode="numeric" data-i18n-ph="rl.downph" data-i18n-aria="rl.downph"></div>
+      <div class="row"><button id="rl-add" onclick="addRateLimit()" data-i18n="rl.limit">Limit</button></div>
     </div>
     <div class="tablewrap"><table id="rl-table"><caption class="sr-only" data-i18n="rl.title">Rate Limit</caption><thead>
       <tr><th scope="col">MAC</th><th scope="col" data-i18n="rl.colup">Uplink</th><th scope="col" data-i18n="rl.coldown">Downlink</th><th scope="col"><span class="sr-only" data-i18n="rl.remove">Remove</span></th></tr>
     </thead><tbody></tbody></table></div>
   </section>
+
   <section id="page-console" hidden>
     <h1 data-i18n="cl.title">Console</h1>
     <div class="sub" data-i18n="cl.sub">Captured stdout/stderr (read-only, token lines filtered)</div>
@@ -784,82 +808,120 @@ button,nav a,input,select{transition:background-color .15s ease,color .15s ease,
     <h1 data-i18n="set.title">Settings</h1>
     <span id="set-dirty" class="badge warn" data-i18n="set.dirty" hidden>unsaved changes</span>
     <div class="sub" data-i18n="set.sub">Runtime configuration (persisted to vgww.json)</div>
-    <div class="row row-tight">
+    <div class="card set-card">
       <div class="field"><label class="muted field-label" for="set-adapter" data-i18n="set.adapter">Adapter</label>
-      <input id="set-adapter" class="w150" data-i18n-ph="set.ph.adapter" data-i18n-title="set.tt.adapter"></div>
+      <input id="set-adapter" data-i18n-ph="set.ph.adapter" data-i18n-title="set.tt.adapter"></div>
       <div class="field"><label class="muted field-label" for="set-gw" data-i18n="set.gw">Gateway IPv4</label>
-      <input id="set-gw" class="w120" data-i18n-ph="set.ph.gw" data-i18n-title="set.tt.gw"></div>
+      <input id="set-gw" data-i18n-ph="set.ph.gw" data-i18n-title="set.tt.gw"></div>
       <div class="field"><label class="muted field-label" for="set-mask" data-i18n="set.mask">Netmask</label>
-      <input id="set-mask" class="w120" data-i18n-ph="set.ph.mask" data-i18n-title="set.tt.mask"></div>
+      <input id="set-mask" data-i18n-ph="set.ph.mask" data-i18n-title="set.tt.mask"></div>
       <div class="field"><label class="muted field-label" for="set-mac" data-i18n="set.mac">Virtual MAC</label>
-      <input id="set-mac" class="w130" data-i18n-ph="set.ph.mac" data-i18n-title="set.tt.mac"></div>
-    </div>
-    <div class="row row-tight">
-      <div class="field"><label class="muted field-label" for="set-workers" data-i18n="set.workers">Workers</label>
-      <input id="set-workers" class="w70" inputmode="numeric" data-i18n-ph="set.ph.workers"></div>
-      <div class="field"><label class="muted field-label" for="set-maxconns" data-i18n="set.maxconns">Max connections</label>
-      <input id="set-maxconns" class="w90" inputmode="numeric" data-i18n-ph="set.ph.maxconns"></div>
-      <div class="field"><label class="muted field-label" for="set-vlan" data-i18n="set.vlanid">VLAN id</label>
-      <input id="set-vlan" class="w70" inputmode="numeric" data-i18n-ph="set.ph.vlan" data-i18n-title="set.tt.vlan"></div>
+      <input id="set-mac" data-i18n-ph="set.ph.mac" data-i18n-title="set.tt.mac"></div>
       <div class="field"><label class="muted field-label" for="set-mode" data-i18n="set.mode">Mode</label>
-      <select id="set-mode" class="w120">
+      <select id="set-mode">
         <option value="bypass">bypass</option>
         <option value="main">main</option>
-      </select></div>
+      </select>
+      <div class="hint" data-i18n="set.desc.mode"></div></div>
       <div class="field"><label class="muted field-label" for="set-webport" data-i18n="set.webport">Web port</label>
-      <input id="set-webport" class="w70" inputmode="numeric" data-i18n-ph="set.ph.webport"></div>
-      <div class="field"><label class="muted field-label" for="set-bridge-enabled" data-i18n="set.bridge">Bridge</label>
-      <input type="checkbox" id="set-bridge-enabled"></div>
-      <div class="field"><label class="muted field-label" for="set-bridge-up" data-i18n="set.bridge.up">Upstream</label>
-      <input id="set-bridge-up" class="w120" data-i18n-ph="set.ph.bridge"></div>
-      <div class="field"><label class="muted field-label" for="set-bridge-down" data-i18n="set.bridge.down">Downstream</label>
-      <input id="set-bridge-down" class="w120" data-i18n-ph="set.ph.bridge"></div>
-      <div class="field"><label class="muted field-label" for="set-bridge-macs" data-i18n="set.bridge.macs">MAC table size</label>
-      <input id="set-bridge-macs" class="w70" inputmode="numeric" data-i18n-ph="set.ph.macs"></div>
-      <div class="field"><label class="muted field-label" for="set-dhcp-enabled" data-i18n="set.dhcp">DHCP</label>
-      <input type="checkbox" id="set-dhcp-enabled"></div>
-      <div class="field"><label class="muted field-label" for="set-dhcp-poolstart" data-i18n="set.dhcp.poolstart">Pool start</label>
-      <input id="set-dhcp-poolstart" class="w120" data-i18n-ph="set.ph.pool"></div>
-      <div class="field"><label class="muted field-label" for="set-dhcp-poolend" data-i18n="set.dhcp.poolend">Pool end</label>
-      <input id="set-dhcp-poolend" class="w120" data-i18n-ph="set.ph.pool"></div>
-      <div class="field"><label class="muted field-label" for="set-dhcp-lease" data-i18n="set.dhcp.lease">Lease (hours)</label>
-      <input id="set-dhcp-lease" class="w70" inputmode="numeric" data-i18n-ph="set.ph.lease"></div>
-      <div class="field"><label class="muted field-label" for="set-dhcp-dns" data-i18n="set.dhcp.dns">DNS servers</label>
-      <input id="set-dhcp-dns" class="w150" data-i18n-ph="set.ph.dns"></div>
-      <div class="field"><label class="muted field-label" for="set-ipv6-enabled" data-i18n="set.ipv6">IPv6</label>
-      <input type="checkbox" id="set-ipv6-enabled"></div>
-      <div class="field"><label class="muted field-label" for="set-ipv6-ula" data-i18n="set.ipv6.ula">ULA prefix</label>
-      <input id="set-ipv6-ula" class="w150" data-i18n-ph="set.ph.ula"></div>
-      <div class="field"><label class="muted field-label" for="set-ipv6-prefix" data-i18n="set.ipv6.prefix">Prefix length</label>
-      <input id="set-ipv6-prefix" class="w70" inputmode="numeric" data-i18n-ph="set.ph.prefix"></div>
-      <div class="field"><label class="muted field-label" for="set-ipv6-ra" data-i18n="set.ipv6.ra">RA lifetime (s)</label>
-      <input id="set-ipv6-ra" class="w70" inputmode="numeric" data-i18n-ph="set.ph.ra"></div>
-      <div class="field"><label class="muted field-label" for="set-dhcp6-enabled" data-i18n="set.dhcpv6">DHCPv6</label>
-      <input type="checkbox" id="set-dhcp6-enabled"></div>
-      <div class="field"><label class="muted field-label" for="set-dhcp6-poolstart" data-i18n="set.dhcpv6.poolstart">DHCPv6 pool start</label>
-      <input id="set-dhcp6-poolstart" class="w150" data-i18n-ph="set.ph.pool6"></div>
-      <div class="field"><label class="muted field-label" for="set-dhcp6-poolend" data-i18n="set.dhcpv6.poolend">DHCPv6 pool end</label>
-      <input id="set-dhcp6-poolend" class="w150" data-i18n-ph="set.ph.pool6"></div>
-      <div class="field"><label class="muted field-label" for="set-dhcp6-lease" data-i18n="set.dhcpv6.lease">DHCPv6 lease (s)</label>
-      <input id="set-dhcp6-lease" class="w70" inputmode="numeric" data-i18n-ph="set.ph.lease6"></div>
-      <button id="set-save" onclick="saveSettings()" data-i18n="set.save" class="btn-ok">Save</button>
+      <input id="set-webport" inputmode="numeric" data-i18n-ph="set.ph.webport">
+      <div class="hint" data-i18n="set.desc.webport"></div></div>
+      <div class="field"><label class="muted field-label" for="set-vlan" data-i18n="set.vlanid">VLAN id</label>
+      <input id="set-vlan" inputmode="numeric" data-i18n-ph="set.ph.vlan" data-i18n-title="set.tt.vlan"></div>
+      <div class="field"><label class="muted field-label" for="set-workers" data-i18n="set.workers">Workers</label>
+      <input id="set-workers" inputmode="numeric" data-i18n-ph="set.ph.workers">
+      <div class="hint" data-i18n="set.desc.workers"></div></div>
+      <div class="field"><label class="muted field-label" for="set-maxconns" data-i18n="set.maxconns">Max connections</label>
+      <input id="set-maxconns" inputmode="numeric" data-i18n-ph="set.ph.maxconns">
+      <div class="hint" data-i18n="set.desc.maxconns"></div></div>
     </div>
-    <div class="row">
+    <div class="card set-card">
+      <h2 data-i18n="set.bridge">Bridge</h2>
+      <div class="field field-check"><label class="muted field-label" for="set-bridge-enabled" data-i18n="set.bridge">Bridge</label>
+      <input type="checkbox" id="set-bridge-enabled">
+      <div class="hint" data-i18n="set.desc.bridge.enabled"></div></div>
+      <div class="field"><label class="muted field-label" for="set-bridge-up" data-i18n="set.bridge.up">Upstream</label>
+      <input id="set-bridge-up" data-i18n-ph="set.ph.bridge">
+      <div class="hint" data-i18n="set.desc.bridge.up"></div></div>
+      <div class="field"><label class="muted field-label" for="set-bridge-down" data-i18n="set.bridge.down">Downstream</label>
+      <input id="set-bridge-down" data-i18n-ph="set.ph.bridge">
+      <div class="hint" data-i18n="set.desc.bridge.down"></div></div>
+      <div class="field"><label class="muted field-label" for="set-bridge-macs" data-i18n="set.bridge.macs">MAC table size</label>
+      <input id="set-bridge-macs" inputmode="numeric" data-i18n-ph="set.ph.macs">
+      <div class="hint" data-i18n="set.desc.bridge.macs"></div></div>
+    </div>
+    <div class="card set-card">
+      <h2 data-i18n="set.dhcp">DHCP</h2>
+      <div class="field field-check"><label class="muted field-label" for="set-dhcp-enabled" data-i18n="set.dhcp">DHCP</label>
+      <input type="checkbox" id="set-dhcp-enabled">
+      <div class="hint" data-i18n="set.desc.dhcp.enabled"></div></div>
+      <div class="field"><label class="muted field-label" for="set-dhcp-poolstart" data-i18n="set.dhcp.poolstart">Pool start</label>
+      <input id="set-dhcp-poolstart" data-i18n-ph="set.ph.pool">
+      <div class="hint" data-i18n="set.desc.dhcp.poolstart"></div></div>
+      <div class="field"><label class="muted field-label" for="set-dhcp-poolend" data-i18n="set.dhcp.poolend">Pool end</label>
+      <input id="set-dhcp-poolend" data-i18n-ph="set.ph.pool">
+      <div class="hint" data-i18n="set.desc.dhcp.poolend"></div></div>
+      <div class="field"><label class="muted field-label" for="set-dhcp-lease" data-i18n="set.dhcp.lease">Lease (hours)</label>
+      <input id="set-dhcp-lease" inputmode="numeric" data-i18n-ph="set.ph.lease">
+      <div class="hint" data-i18n="set.desc.dhcp.lease"></div></div>
+      <div class="field"><label class="muted field-label" for="set-dhcp-dns" data-i18n="set.dhcp.dns">DNS servers</label>
+      <input id="set-dhcp-dns" data-i18n-ph="set.ph.dns">
+      <div class="hint" data-i18n="set.desc.dhcp.dns"></div></div>
+    </div>
+    <div class="card set-card">
+      <h2 data-i18n="set.ipv6">IPv6</h2>
+      <div class="field field-check"><label class="muted field-label" for="set-ipv6-enabled" data-i18n="set.ipv6">IPv6</label>
+      <input type="checkbox" id="set-ipv6-enabled">
+      <div class="hint" data-i18n="set.desc.ipv6.enabled"></div></div>
+      <div class="field"><label class="muted field-label" for="set-ipv6-ula" data-i18n="set.ipv6.ula">ULA prefix</label>
+      <input id="set-ipv6-ula" data-i18n-ph="set.ph.ula">
+      <div class="hint" data-i18n="set.desc.ipv6.ula"></div></div>
+      <div class="field"><label class="muted field-label" for="set-ipv6-prefix" data-i18n="set.ipv6.prefix">Prefix length</label>
+      <input id="set-ipv6-prefix" inputmode="numeric" data-i18n-ph="set.ph.prefix">
+      <div class="hint" data-i18n="set.desc.ipv6.prefix"></div></div>
+      <div class="field"><label class="muted field-label" for="set-ipv6-ra" data-i18n="set.ipv6.ra">RA lifetime (s)</label>
+      <input id="set-ipv6-ra" inputmode="numeric" data-i18n-ph="set.ph.ra">
+      <div class="hint" data-i18n="set.desc.ipv6.ra"></div></div>
+    </div>
+    <div class="card set-card">
+      <h2 data-i18n="set.dhcpv6">DHCPv6</h2>
+      <div class="field field-check"><label class="muted field-label" for="set-dhcp6-enabled" data-i18n="set.dhcpv6">DHCPv6</label>
+      <input type="checkbox" id="set-dhcp6-enabled">
+      <div class="hint" data-i18n="set.desc.dhcp6.enabled"></div></div>
+      <div class="field"><label class="muted field-label" for="set-dhcp6-poolstart" data-i18n="set.dhcpv6.poolstart">DHCPv6 pool start</label>
+      <input id="set-dhcp6-poolstart" data-i18n-ph="set.ph.pool6">
+      <div class="hint" data-i18n="set.desc.dhcp6.poolstart"></div></div>
+      <div class="field"><label class="muted field-label" for="set-dhcp6-poolend" data-i18n="set.dhcpv6.poolend">DHCPv6 pool end</label>
+      <input id="set-dhcp6-poolend" data-i18n-ph="set.ph.pool6">
+      <div class="hint" data-i18n="set.desc.dhcp6.poolend"></div></div>
+      <div class="field"><label class="muted field-label" for="set-dhcp6-lease" data-i18n="set.dhcpv6.lease">DHCPv6 lease (s)</label>
+      <input id="set-dhcp6-lease" inputmode="numeric" data-i18n-ph="set.ph.lease6">
+      <div class="hint" data-i18n="set.desc.dhcp6.lease"></div></div>
+    </div>
+    <div class="card set-card">
+      <h2 data-i18n="set.theme">Theme</h2>
       <div class="field"><label class="muted field-label" for="theme-sel" data-i18n="set.theme">Theme</label>
       <select id="theme-sel">
         <option value="auto" data-i18n="set.theme.auto">Follow system</option>
         <option value="light" data-i18n="set.theme.light">Light</option>
         <option value="dark" data-i18n="set.theme.dark">Dark</option>
-      </select></div>
+      </select>
+      <div class="hint" data-i18n="set.desc.theme"></div></div>
+    </div>
+    <div class="card set-card">
+      <h2 data-i18n="st.maint">Maintenance</h2>
+      <div class="field field-check"><label class="muted field-label" for="maint-autostart" data-i18n="st.autostart">Start with Windows</label>
+      <input type="checkbox" id="maint-autostart">
+      <div class="hint" data-i18n="set.desc.autostart"></div></div>
+      <div class="field"><button id="maint-repair" class="btn-ok" data-i18n="st.repair">Repair driver</button>
+      <div class="hint" data-i18n="set.desc.repair"></div></div>
+    </div>
+    <div class="row set-save-row">
+      <button id="set-save" onclick="saveSettings()" data-i18n="set.save" class="btn-ok">Save</button>
     </div>
     <div class="tablewrap"><table id="cfg-table"><caption class="sr-only" data-i18n="set.applied">Applied configuration</caption><tbody></tbody></table></div>
-    <div class="row">
-      <div class="field"><label class="muted field-label" data-i18n="st.maint">Maintenance</label>
-      <button id="maint-repair" class="btn-ok" data-i18n="st.repair">Repair driver</button>
-      <label class="muted"><input type="checkbox" id="maint-autostart"> <span data-i18n="st.autostart">Start with Windows</span></label>
-      </div>
-    </div>
   </section>
+
 </main>
 <div id="toast" role="status" aria-live="polite"></div>
 <script>
@@ -887,6 +949,30 @@ const I18N = {
     "set.title":"Settings","set.sub":"Runtime configuration (persisted to vgww.json)",
     "set.adapter":"Adapter","set.gw":"Gateway IPv4","set.mask":"Netmask","set.mac":"Virtual MAC","set.workers":"Workers","set.maxconns":"Max connections","set.vlan":"VLAN","set.off":"Off","set.tt.adapter":"Network adapter (e.g. Intel I225 · blank = auto)","set.tt.gw":"Gateway IPv4 (e.g. 192.168.0.1)","set.tt.mask":"Netmask (e.g. 255.255.255.0)","set.tt.mac":"Virtual MAC (e.g. 02:00:00:00:00:01)","set.tt.vlan":"VLAN id 1-4094 · 0 = off","set.ph.adapter":"Intel I225","set.ph.gw":"192.168.0.1","set.ph.mask":"255.255.255.0","set.ph.mac":"02:00:00:00:00:01","set.ph.workers":"1-8","set.ph.maxconns":"1-1048576","set.ph.vlan":"1-4094",
     "set.mode":"Mode","set.webport":"Web port","set.ph.webport":"1024-65535","set.bridge":"Bridge","set.bridge.up":"Upstream","set.bridge.down":"Downstream","set.bridge.macs":"MAC table size","set.ph.bridge":"adapter name","set.ph.macs":"1-65536","set.dhcp":"DHCP","set.dhcp.poolstart":"Pool start","set.dhcp.poolend":"Pool end","set.dhcp.lease":"Lease (hours)","set.dhcp.dns":"DNS servers","set.ph.pool":"192.168.0.100","set.ph.lease":"1-8760","set.ph.dns":"8.8.8.8, 8.8.4.4","set.ipv6":"IPv6","set.ipv6.ula":"ULA prefix","set.ipv6.prefix":"Prefix length","set.ipv6.ra":"RA lifetime (s)","set.dhcpv6":"DHCPv6","set.dhcpv6.poolstart":"DHCPv6 pool start","set.dhcpv6.poolend":"DHCPv6 pool end","set.dhcpv6.lease":"DHCPv6 lease (s)","set.ph.ula":"fd00::","set.ph.prefix":"64","set.ph.ra":"1800","set.ph.pool6":"fd00::1000","set.ph.lease6":"3600","nav.leases":"Leases","le.title":"Leases","le.sub":"DHCP leases and static bindings (read-only)","le.mac":"MAC","le.ip":"IP","le.ip6":"IPv6","le.duid":"DUID","le.expires":"Expires","le.static":"Static","le.host":"Hostname","le.yes":"yes","le.no":"no","nav.bridge":"Bridge","br.title":"Bridge","br.sub":"Layer-2 bridge state (read-only)","br.state":"State","br.enabled":"Enabled","br.up":"Upstream","br.down":"Downstream","br.maccount":"MAC table entries","br.yes":"yes","br.no":"no","nav.about":"About","ab.title":"About","ab.sub":"Build and runtime identity","ab.version":"Version","ab.memory":"Memory backend","ab.memory.default":"System default","ab.config":"Config file","ab.uptime":"Uptime","ab.driver":"Driver state","drv.running":"Running","drv.stopped":"Stopped","nav.console":"Console","cl.title":"Console","cl.sub":"Captured stdout/stderr (read-only, token lines filtered)","cl.copy":"Copy","cl.copied":"copied","cl.copyfail":"copy failed","cl.empty":"(no output)","st.maint":"Maintenance","st.repair":"Repair driver","st.repair.confirm":"Reinstall/repair the capture driver now? Windows will ask for administrator rights.","st.repair.ok":"Repair requested","st.autostart":"Start with Windows","st.autostart.on":"Start VGWW automatically with Windows?","st.autostart.off":"Stop starting VGWW with Windows?","st.ok":"Done","st.fail":"Action failed","dev.lanYes":"Yes","dev.lanNo":"No","lang.name":"Language", "set.vlanid":"VLAN id","set.theme":"Theme","set.theme.auto":"Follow system","set.theme.light":"Light","set.theme.dark":"Dark","set.save":"Save","set.saved":"Config saved — applies on restart","set.moved":"Web console moved to:","set.saved.applied":"Saved and applied","set.saved.pending":"Saved to the file, but the live apply was not confirmed - check the log before relying on it","set.savefail":"save failed: ","set.badnum":"not a number: ","set.badrange":"out of range: ","set.dirty":"unsaved changes","err.binding exists":"binding exists","err.binding not found":"binding not found","err.busy":"busy","err.body too large":"body too large","err.duid and ip required":"duid and ip required","err.duid required":"duid required","err.duplicate header field":"duplicate header field","err.enabled must be boolean":"enabled must be boolean","err.enabled required":"enabled required","err.index or id required":"index or id required","err.internal error":"internal error","err.invalid content-length":"invalid content-length","err.invalid duid":"invalid duid","err.invalid duid/ip or hostname too long":"invalid duid/ip or hostname too long","err.invalid http version":"invalid http version","err.invalid id":"invalid id","err.invalid mac":"invalid mac","err.invalid mac/ip or hostname too long":"invalid mac/ip or hostname too long","err.invalid replace_mac":"invalid replace_mac","err.mac and ip required":"mac and ip required","err.malformed header field":"malformed header field","err.malformed header field name":"malformed header field name","err.malformed percent-encoding in query":"malformed percent-encoding in query","err.method not allowed":"method not allowed","err.no such id":"no such id","err.query param too long":"query param too long","err.request timeout":"request timeout","err.short body":"short body","err.too many bindings":"too many bindings","err.unauthorized":"unauthorized","err.unavailable":"unavailable","err.unsupported transfer-encoding":"unsupported transfer-encoding","err.invalid kbps":"invalid kbps","err.lan_ip required":"LAN IP required","err.port out of range":"port out of range","err.ports must be non-zero":"ports must be non-zero","err.too many portmaps":"too many portmaps","err.index required":"index required","err.invalid index":"invalid index","err.no such index":"no such index","err.kind and value required":"kind and value required","err.kind must be ip or mac":"kind must be ip or mac","err.invalid ip address":"invalid IP address","err.invalid mac address":"invalid MAC address","err.too many bans":"too many bans","err.mac required":"MAC required","err.at least one direction > 0":"at least one direction must be > 0","err.too many ratelimits":"too many rate limits","err.only tcp port-forwarding is supported":"only TCP port-forwarding is supported","err.wan endpoint already mapped":"WAN endpoint already mapped","err.invalid configuration rejected":"invalid configuration rejected","err.cannot open config":"cannot open config","err.config write failed":"config write failed","err.config save failed":"config save failed","err.service not running":"service not running","err.read failed":"read failed","err.headers too large":"headers too large","err.malformed request line":"malformed request line","err.path too long":"path too long","err.query too many parameters":"query too many parameters","err.malformed percent-encoding in path":"malformed percent-encoding in path","err.no such route":"no such route","err.not found":"not found","err.forbidden":"forbidden","err.network":"Network error: cannot reach the server","a11y.token":"Auth token field","a11y.langs":"Filter languages","a11y.devscope":"Filter devices by side","a11y.devsort":"Sort devices by","a11y.devdir":"Sort direction","a11y.pmproto":"Protocol","a11y.bankind":"Match type","a11y.banvalue":"Value to block","a11y.rlmac":"Client MAC","le.v4":"DHCPv4 leases","le.v6":"DHCPv6 leases","le.bind4":"Static IPv4 bindings","le.bind6":"Static IPv6 bindings","set.applied":"Applied configuration",
+    "set.desc.mode":"Changes how this PC identifies itself on the network. Keep Automatic (recommended) for normal use.",
+    "set.desc.webport":"Port of the management web page. After changing it, open the page at IP:port.",
+    "set.desc.workers":"Worker threads processing traffic. More uses more CPU; keep the default normally.",
+    "set.desc.maxconns":"Upper limit of simultaneous connections. More uses more memory; home networks rarely need it.",
+    "set.desc.bridge.enabled":"Turns this PC into a bridge between two adapters. Only enable it to chain networks.",
+    "set.desc.bridge.up":"The adapter facing the internet (router). Picking the wrong one disconnects every device.",
+    "set.desc.bridge.down":"The adapter facing your devices. Picking the wrong one disconnects every device.",
+    "set.desc.bridge.macs":"How many devices the bridge remembers. More uses more memory; only needed with many devices.",
+    "set.desc.dhcp.enabled":"Turned off, other devices get no address and must be set by hand. Keep it on unless sure.",
+    "set.desc.dhcp.poolstart":"First address handed out. It must be on the same subnet as this PC or devices get nothing.",
+    "set.desc.dhcp.poolend":"Last address handed out. Must be above the start; a wider range allows more devices.",
+    "set.desc.dhcp.lease":"How long an address stays valid. Shorter means more renewals; longer keeps it occupied.",
+    "set.desc.dhcp.dns":"Name servers devices use. Empty keeps the default; a wrong entry breaks web pages.",
+    "set.desc.ipv6.enabled":"Turned off, other devices get no IPv6 address and use IPv4 only.",
+    "set.desc.ipv6.ula":"IPv6 prefix. It must match your upstream network or devices cannot get online.",
+    "set.desc.ipv6.prefix":"Usually 64. A wrong length prevents IPv6 addresses from being generated.",
+    "set.desc.ipv6.ra":"How long the router advertisement stays valid. Shorter makes devices refresh more often.",
+    "set.desc.dhcp6.enabled":"Turned off, devices get no IPv6 address. Only turn it off if you do not need IPv6.",
+    "set.desc.dhcp6.poolstart":"First IPv6 address handed out. It must lie inside the prefix above.",
+    "set.desc.dhcp6.poolend":"Last IPv6 address handed out. Must be above the start address.",
+    "set.desc.dhcp6.lease":"How long an IPv6 address stays valid. Shorter means more renewals.",
+    "set.desc.theme":"Switches the light/dark look. Appearance only; the service is unaffected.",
+    "set.desc.autostart":"Start this app automatically when Windows starts. Appearance only; the service is unaffected.",
+    "set.desc.repair":"Reinstalls the packet driver if the network stops working after a driver update.",
   },
   "zh-CN": {
     "nav.dashboard":"仪表盘","nav.portmap":"端口映射","nav.firewall":"防火墙","nav.ratelimit":"限速","nav.settings":"设置",
@@ -917,6 +1003,30 @@ const I18N = {
     "st.maint":"维护","st.repair":"修复驱动","st.autostart":"随 Windows 启动","st.repair.confirm":"立即重新安装/修复抓包驱动？Windows 会请求管理员权限。","st.repair.ok":"已请求修复","st.fail":"操作失败","st.ok":"完成","st.autostart.on":"要设置 VGWW 随 Windows 自动启动吗？","st.autostart.off":"要停止 VGWW 随 Windows 自动启动吗？",
     "dev.lanYes":"是","dev.lanNo":"否",
     "err.invalid kbps":"无效的 kbps 值","err.read failed":"读取失败","err.headers too large":"请求头过大","err.malformed request line":"请求行格式错误","err.path too long":"路径过长","err.query too many parameters":"查询参数过多","err.malformed percent-encoding in path":"路径中的百分号编码无效","err.no such route":"不存在该路由","err.not found":"未找到","err.forbidden":"禁止访问","a11y.token":"认证令牌字段","a11y.langs":"筛选语言","a11y.devscope":"按侧筛选设备","a11y.devsort":"设备排序依据","a11y.devdir":"排序方向","a11y.pmproto":"协议","a11y.bankind":"匹配类型","a11y.banvalue":"要封禁的值","a11y.rlmac":"客户端 MAC","le.v4":"DHCPv4 租约","le.v6":"DHCPv6 租约","le.bind4":"IPv4 静态绑定","le.bind6":"IPv6 静态绑定","set.applied":"已应用的配置",
+    "set.desc.mode":"改这里会让本机以另一种身份上网,普通上网请保持「自动分配(推荐)」。",
+    "set.desc.webport":"管理网页的端口。改成别的端口后,要用新地址(IP:端口)才能打开。",
+    "set.desc.workers":"同时处理数据的线程数。调大更吃 CPU,一般保持默认。",
+    "set.desc.maxconns":"同时能建立的连接上限。调大更占内存,普通家庭网络不用改。",
+    "set.desc.bridge.enabled":"开启后本机变成两台网卡之间的桥;只有需要串接网络时才开。",
+    "set.desc.bridge.up":"接外网(路由器)的那块网卡;选错会导致所有设备断网。",
+    "set.desc.bridge.down":"接内网设备的那块网卡;选错会导致所有设备断网。",
+    "set.desc.bridge.macs":"桥接能记住多少设备;调大更占内存,设备多时才需要。",
+    "set.desc.dhcp.enabled":"关掉后其他设备拿不到地址,只能手动设置;不确定就保持开启。",
+    "set.desc.dhcp.poolstart":"自动分配的起始地址,必须和本机地址在同一网段,否则设备拿不到地址。",
+    "set.desc.dhcp.poolend":"自动分配的结束地址,要比起始地址大,范围越大可接入设备越多。",
+    "set.desc.dhcp.lease":"地址能用多久。调短会让设备更频繁地续约,调长则占用更久。",
+    "set.desc.dhcp.dns":"设备上网时用的解析服务器;留空就用默认,填错会导致打不开网页。",
+    "set.desc.ipv6.enabled":"关掉后其他设备拿不到 IPv6 地址,只用 IPv4 上网。",
+    "set.desc.ipv6.ula":"IPv6 地址的前缀,必须和上联网段一致,否则设备无法上网。",
+    "set.desc.ipv6.prefix":"前缀长度一般固定 64;改错会让 IPv6 地址无法生成。",
+    "set.desc.ipv6.ra":"路由器通告的有效时长,调小设备会更频繁地重新获取地址。",
+    "set.desc.dhcp6.enabled":"关掉后设备拿不到 IPv6 地址;只有确认不需要 IPv6 时才关。",
+    "set.desc.dhcp6.poolstart":"IPv6 自动分配的起始地址,必须在上面前缀范围内。",
+    "set.desc.dhcp6.poolend":"IPv6 自动分配的结束地址,要比起始地址大。",
+    "set.desc.dhcp6.lease":"IPv6 地址有效期;调短设备会频繁续约,调长则地址占用更久。",
+    "set.desc.theme":"切换界面深浅色,只影响外观,不影响服务。",
+    "set.desc.autostart":"开机时自动启动本程序;只影响启动方式,不影响服务。",
+    "set.desc.repair":"网络在驱动更新后失效时,用它重新安装抓包驱动。",
   },
   "zh-TW": {
     "nav.dashboard":"儀表板","nav.portmap":"連接埠對映","nav.firewall":"防火牆","nav.ratelimit":"限速","nav.settings":"設定",
@@ -948,6 +1058,30 @@ const I18N = {
     "st.maint":"維護","st.repair":"修復驅動程式","st.autostart":"隨 Windows 啟動","st.repair.confirm":"立即重新安裝/修復抓取驅動程式？Windows 會要求系統管理員權限。","st.repair.ok":"已要求修復","st.fail":"操作失敗","st.ok":"完成","st.autostart.on":"要設定 VGWW 隨 Windows 自動啟動嗎？","st.autostart.off":"要停止 VGWW 隨 Windows 自動啟動嗎？",
     "dev.lanYes":"是","dev.lanNo":"否",
     "err.invalid kbps":"無效的 kbps 值","err.read failed":"讀取失敗","err.headers too large":"請求標頭過大","err.malformed request line":"請求行格式錯誤","err.path too long":"路徑過長","err.query too many parameters":"查詢參數過多","err.malformed percent-encoding in path":"路徑中的百分號編碼無效","err.no such route":"不存在該路由","err.not found":"找不到","err.forbidden":"禁止存取","a11y.token":"驗證權杖欄位","a11y.langs":"篩選語言","a11y.devscope":"依側篩選裝置","a11y.devsort":"裝置排序依據","a11y.devdir":"排序方向","a11y.pmproto":"協定","a11y.bankind":"比對類型","a11y.banvalue":"要封鎖的值","a11y.rlmac":"用戶端 MAC","le.v4":"DHCPv4 租約","le.v6":"DHCPv6 租約","le.bind4":"IPv4 靜態綁定","le.bind6":"IPv6 靜態綁定","set.applied":"已套用的設定",
+    "set.desc.mode":"改這裡會讓本機以另一種身分上網,一般上網請保持「自動分配(推薦)」。",
+    "set.desc.webport":"管理網頁的連接埠。改成別的連接埠後,要用新位址(IP:連接埠)才能開啟。",
+    "set.desc.workers":"同時處理資料的執行緒數。調大更吃 CPU,一般保持預設。",
+    "set.desc.maxconns":"同時能建立的連線上限。調大更佔記憶體,一般家庭網路不用改。",
+    "set.desc.bridge.enabled":"開啟後本機變成兩張網卡之間的橋;只有需要串接網路時才開。",
+    "set.desc.bridge.up":"接外網(路由器)的那張網卡;選錯會導致所有裝置斷網。",
+    "set.desc.bridge.down":"接內網裝置的那張網卡;選錯會導致所有裝置斷網。",
+    "set.desc.bridge.macs":"橋接能記住多少裝置;調大更佔記憶體,裝置多時才需要。",
+    "set.desc.dhcp.enabled":"關掉後其他裝置拿不到位址,只能手動設定;不確定就保持開啟。",
+    "set.desc.dhcp.poolstart":"自動分配的起始位址,必須和本機位址在同一網段,否則裝置拿不到位址。",
+    "set.desc.dhcp.poolend":"自動分配的結束位址,要比起始位址大,範圍越大可接入裝置越多。",
+    "set.desc.dhcp.lease":"位址能用多久。調短會讓裝置更頻繁地續約,調長則佔用更久。",
+    "set.desc.dhcp.dns":"裝置上網時用的解析伺服器;留空就用預設,填錯會導致打不開網頁。",
+    "set.desc.ipv6.enabled":"關掉後其他裝置拿不到 IPv6 位址,只用 IPv4 上網。",
+    "set.desc.ipv6.ula":"IPv6 位址的前綴,必須和上聯網段一致,否則裝置無法上網。",
+    "set.desc.ipv6.prefix":"前綴長度一般固定 64;改錯會讓 IPv6 位址無法產生。",
+    "set.desc.ipv6.ra":"路由器通告的有效時長,調小裝置會更頻繁地重新取得位址。",
+    "set.desc.dhcp6.enabled":"關掉後裝置拿不到 IPv6 位址;只有確認不需要 IPv6 時才關。",
+    "set.desc.dhcp6.poolstart":"IPv6 自動分配的起始位址,必須在上面前綴範圍內。",
+    "set.desc.dhcp6.poolend":"IPv6 自動分配的結束位址,要比起始位址大。",
+    "set.desc.dhcp6.lease":"IPv6 位址有效期;調短裝置會頻繁續約,調長則位址佔用更久。",
+    "set.desc.theme":"切換介面深淺色,只影響外觀,不影響服務。",
+    "set.desc.autostart":"開機時自動啟動本程式;只影響啟動方式,不影響服務。",
+    "set.desc.repair":"網路在驅動更新後失效時,用它重新安裝擷取封包驅動。",
   },
   "ja": {
     "nav.dashboard":"ダッシュボード","nav.portmap":"ポート転送","nav.firewall":"ファイアウォール","nav.ratelimit":"レート制限","nav.settings":"設定",
@@ -2861,7 +2995,10 @@ const themeMedia = window.matchMedia ? window.matchMedia("(prefers-color-scheme:
 
 function themePref() {
   const saved = localStorage.getItem(THEME_KEY);
-  return (saved === "light" || saved === "dark") ? saved : "auto";
+  // batch202: the default is dark (matching the native shell). "auto" is
+  // still selectable and then follows the OS; an absent value must not
+  // silently follow the OS, or a light desktop turns the whole console light.
+  return (saved === "auto" || saved === "light" || saved === "dark") ? saved : "dark";
 }
 
 function applyTheme() {

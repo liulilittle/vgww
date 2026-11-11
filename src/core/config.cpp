@@ -38,6 +38,11 @@ namespace vgww {
             std::function<bool(std::intptr_t)> g_flush_hook;
             std::mutex g_open_hook_mutex;
             std::function<unsigned long(const std::string&)> g_open_hook;
+            // batch203: runs just before a temp file is deleted on a failure
+            // path (after the writer closed it), so a test can hold the file
+            // open and prove the delete retries instead of leaking it.
+            std::mutex g_predelete_hook_mutex;
+            std::function<void(const std::string&)> g_predelete_hook;
 
             // batch94: one write lock per document path. Config::UpdateFile
             // holds it across load->mutate->publish, and whole-document
@@ -2224,6 +2229,46 @@ namespace vgww {
 #endif
         }
 
+        namespace {
+            /// batch203: delete a temp/aside file with the same bounded retry
+            /// the publish path uses. An indexer or AV scanner can hold the
+            /// just-written file open with no delete sharing, and a bare
+            /// DeleteFileW then fails (ERROR_ACCESS_DENIED), leaving
+            /// `<path>.tmp.<pid>.<seq>` behind forever. Every failure path that
+            /// removes a temp file must use this, not a bare DeleteFileW.
+            void DeleteFileWithRetry(const std::string& path) noexcept {
+                if (path.empty()) {
+                    return;
+                }
+                {
+                    std::function<void(const std::string&)> hook;
+                    {
+                        std::lock_guard<std::mutex> lock(g_predelete_hook_mutex);
+                        hook = g_predelete_hook;
+                    }
+                    if (hook) {
+                        hook(path);
+                    }
+                }
+                const std::wstring wpath = ToWideLongPath(path);
+                if (wpath.empty()) {
+                    return;
+                }
+                const auto deadline = std::chrono::steady_clock::now() +
+                                      std::chrono::milliseconds(200);
+                for (int attempt = 0;; ++attempt) {
+                    if (0 != ::DeleteFileW(wpath.c_str())) {
+                        return;
+                    }
+                    const DWORD del_error = ::GetLastError();
+                    if (ERROR_FILE_NOT_FOUND == del_error ||
+                        std::chrono::steady_clock::now() >= deadline) {
+                        return;
+                    }
+                    ::Sleep(attempt < 4 ? 0 : 1);
+                }
+            }
+        }  // namespace
         bool Config::PublishConfigTempFile(const std::string& tmp,
                                            const std::string& path,
                                            std::string& error) {
@@ -2239,7 +2284,7 @@ namespace vgww {
             const std::wstring wpath = ToWideLongPath(path);
             if (wtmp.empty() || wpath.empty()) {
                 error = "config path conversion failed";
-                ::DeleteFileW(wtmp.c_str());
+                DeleteFileWithRetry(tmp);
                 return false;
             }
             // batch80: a fixed attempt count is a poor budget - measured
@@ -2272,7 +2317,18 @@ namespace vgww {
             }
             error = "atomic replace failed: " + path +
                     " (error " + std::to_string(last_error) + ")";
-            ::DeleteFileW(wtmp.c_str());
+            // batch164: the cleanup itself is not guaranteed. An indexer or AV
+            // scanner can hold the just-written temp file open with no delete
+            // sharing, and a bare DeleteFileW then fails (ERROR_ACCESS_DENIED)
+            // leaving `<path>.tmp.<pid>.<seq>` behind forever - the sibling
+            // sequence grows monotonically, so every failed write adds one more
+            // permanent neighbour (measured: u1cross.json.tmp.<pid>.0/1 and
+            // test_cfg_b97_bindings.json.tmp.<pid>.31 left in the repository
+            // root after a full ctest run). Retry the delete on the same time
+            // budget the publish already used: the hold is transient for a
+            // scanner, and a permanent failure is still reported to the caller.
+            // batch203: shared with every other temp-removal failure path.
+            DeleteFileWithRetry(tmp);
             return false;
 #else
             (void)tmp;
@@ -2307,6 +2363,12 @@ namespace vgww {
         void SetFileFlushHookForTest(std::function<bool(std::intptr_t)> hook) {
             std::lock_guard<std::mutex> lock(g_flush_hook_mutex);
             g_flush_hook = std::move(hook);
+        }
+
+        void SetPreDeleteHookForTest(
+            std::function<void(const std::string& path)> hook) {
+            std::lock_guard<std::mutex> lock(g_predelete_hook_mutex);
+            g_predelete_hook = std::move(hook);
         }
 
         void SetConfigOpenFailureHookForTest(
@@ -2378,7 +2440,7 @@ namespace vgww {
             }
             // Replace the previous aside copy: the latest unreadable file is
             // the one worth keeping, and the pile must stay bounded to one.
-            ::DeleteFileW(waside.c_str());
+            DeleteFileWithRetry(aside);
             return 0 != ::MoveFileExW(wpath.c_str(), waside.c_str(),
                                       MOVEFILE_WRITE_THROUGH);
 #else
@@ -2435,12 +2497,12 @@ namespace vgww {
             const int close_ok = ::fclose(f);
             if (written != data.size() || !flushed || !synced ||
                 0 != close_ok) {
-                ::DeleteFileW(wtmp.c_str());
+                DeleteFileWithRetry(tmp);
                 error = "short write, flush or close error: " + tmp;
                 return AtomicWriteOutcome::kIoError;
             }
             if (validator && !validator(tmp)) {
-                ::DeleteFileW(wtmp.c_str());
+                DeleteFileWithRetry(tmp);
                 error = "validation rejected the temporary file: " + tmp;
                 return AtomicWriteOutcome::kValidationFailed;
             }

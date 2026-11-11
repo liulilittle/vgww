@@ -171,6 +171,13 @@ namespace vgww {
         /// function to restore the real FlushFileBuffers.
         void SetFileFlushHookForTest(std::function<bool(std::intptr_t)> hook);
 
+        /// Test seam: runs just before a temp file is deleted on a failure
+        /// path (after the writer closed its handle). A test can hold the file
+        /// open here to prove the delete retries instead of leaking
+        /// `<path>.tmp.<pid>.<seq>`. Pass an empty function to clear it.
+        void SetPreDeleteHookForTest(
+            std::function<void(const std::string& path)> hook);
+
         /// Moves `path` aside to `path + suffix`, replacing any previous
         /// aside copy (one bounded file, never a growing pile). Used to
         /// preserve a file a loader found unreadable so the next snapshot

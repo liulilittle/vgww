@@ -109,6 +109,9 @@ namespace vgww {
             /// on a registry failure.
             bool SetAutostart(bool enabled, std::string& error);
             bool IsAutostartEnabled();
+            /// batch164 P1-2 test seam: force SetAutostart to return ok/fail
+            /// regardless of the registry (nullptr restores the real setter).
+            void SetAutostartHookForTest(std::function<bool(bool, std::string&)> hook) noexcept;
 
             /// Programmatic icon: rounded dark square + cyan "V"; falls back
             /// to IDI_APPLICATION when GDI creation fails. Parameter names

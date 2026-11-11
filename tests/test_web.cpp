@@ -2667,6 +2667,10 @@ static void TestP102WebBindingPersistFailureIsAudited() {
     CHECK(dp.Stop(stop_error));
     std::filesystem::remove_all(path, ec);
     std::remove(lease_path);
+    // batch164: the v6 lease store is derived from the v4 path (LeaseFile6), so
+    // a v6-enabled Dataplane leaves `<lease>.leases6` beside it (measured:
+    // p102/p107/p123/p124_leases.json.leases6 in the repository root).
+    std::remove((std::string(lease_path) + ".leases6").c_str());
 }
 
 // P107: the binding routes answered 404/409 without an audit line - only the
@@ -2927,6 +2931,8 @@ static void TestP107WebBindingRefusalIsAudited() {
     api.Stop();
     std::remove(path);
     std::remove(lease_path);
+    // batch164: the v6 lease store is derived from the v4 path (LeaseFile6).
+    std::remove((std::string(lease_path) + ".leases6").c_str());
 }
 
 // P113: the rule add refusals (duplicate WAN endpoint, per-kind cap) used to
@@ -3177,6 +3183,8 @@ static void TestP122WebConfigBindingCapRefusalIsAudited() {
     CHECK(dp.Stop(stop_error));
     std::remove(path);
     std::remove("p122_leases.json");
+    // batch164: the v6 lease store is derived from the v4 path (LeaseFile6).
+    std::remove("p122_leases.json.leases6");
     std::filesystem::remove_all(rules, ec);
 }
 
@@ -3279,6 +3287,8 @@ static void TestP123WebConfigMergeMatchesDuidByValue() {
     CHECK(dp.Stop(stop_error));
     std::remove(path);
     std::remove("p123_leases.json");
+    // batch164: the v6 lease store is derived from the v4 path (LeaseFile6).
+    std::remove("p123_leases.json.leases6");
     std::error_code ec;
     std::filesystem::remove_all(rules, ec);
 }
@@ -3392,6 +3402,8 @@ static void TestP124WebConfigV6BindingCapRefusalIsAudited() {
     CHECK(dp.Stop(stop_error));
     std::remove(path);
     std::remove("p124_leases.json");
+    // batch164: the v6 lease store is derived from the v4 path (LeaseFile6).
+    std::remove("p124_leases.json.leases6");
     std::error_code ec2;
     std::filesystem::remove_all(rules, ec2);
 }
@@ -3641,6 +3653,11 @@ static void TestB34oCorruptRuleFileIsNotSilentEmpty() {
         CHECK(RuleStore::Instance().PortMaps().size() == 1);
         std::remove(path.c_str());
     }
+    // batch164: a corrupt document is quarantined as `<path>.corrupt` by
+    // SetAsideFile; the loop above removed only the original, so the aside copy
+    // survived every run (measured: b34o_corrupt.json.corrupt in the
+    // repository root). Preserve is the product contract; the test must clean up.
+    std::remove("b34o_corrupt.json.corrupt");
     // A missing file is NOT an error: first run has no rules yet.
     {
         const std::string path = "b34o_missing.json";
@@ -4411,6 +4428,11 @@ static void TestB93DhcpBindingPersistsToConfig() {
     dp.Stop(stop_error);
     std::remove(cfg_path);
     std::remove(lease_path);
+    // batch164: the v6 lease store is derived from the v4 path (LeaseFile6),
+    // so a v6-enabled Dataplane writes `<path>.leases6` beside the v4 file.
+    // The test removed only the v4 path (measured: b93_leases.json.leases6,
+    // p102/p107/p123/p124_leases.json.leases6 left in the repository root).
+    std::remove((std::string(lease_path) + ".leases6").c_str());
 }
 
 // Rules read from the FILE must satisfy the same semantic contract the API
@@ -5353,6 +5375,80 @@ static void TestB80PublishSurvivesBusyDestination() {
     CHECK(std::string("original") == read_back());
     // The temp file is cleaned up on the failure path.
     CHECK(!std::filesystem::exists(kTmp));
+    std::remove(kPath);
+}
+
+// batch164: the temp file cleanup itself must be retried. An indexer or AV
+// scanner can hold the just-written temp open with no delete sharing, so a bare
+// DeleteFileW fails (ERROR_ACCESS_DENIED) and the temp survives forever. The
+// sibling sequence is monotonic, so every failed publish leaves one more
+// permanent `<path>.tmp.<pid>.<seq>` neighbour - measured in the repository
+// root after a full ctest run (u1cross.json.tmp.<pid>.0/1,
+// test_cfg_b97_bindings.json.tmp.<pid>.31).
+//
+// This test holds BOTH the destination (so the publish fails) and the temp (so
+// the cleanup's first DeleteFileW fails), releases the temp from another thread
+// while the publish is still retrying, and asserts the temp is gone once the
+// hold lets go. Without the cleanup retry the publish gives up after its first
+// delete attempt and the temp stays (the assertion goes red).
+static void TestB164TempCleanupSurvivesBusyHolder() {
+    using namespace vgww::core;
+    const char* kPath = "b164publish.json";
+    const std::string kTmp = std::string(kPath) + ".tmp." +
+                             std::to_string(::GetCurrentProcessId()) + ".b164";
+    std::remove(kPath);
+    std::remove(kTmp.c_str());
+
+    // Seed the destination so the publish has something to replace.
+    {
+        FILE* f = nullptr;
+        const std::wstring w(kPath, kPath + std::strlen(kPath));
+        ::_wfopen_s(&f, w.c_str(), L"wb");
+        if (nullptr != f) {
+            ::fwrite("original", 1, 8, f);
+            ::fclose(f);
+        }
+    }
+    // Seed the temp.
+    {
+        FILE* f = nullptr;
+        const std::wstring w(kTmp.begin(), kTmp.end());
+        ::_wfopen_s(&f, w.c_str(), L"wb");
+        if (nullptr != f) {
+            ::fwrite("payload", 1, 7, f);
+            ::fflush(f);
+            ::fclose(f);
+        }
+    }
+    // Hold the TEMP denying delete sharing (a scanner's read-only hold) and the
+    // DESTINATION denying write/delete sharing (so the publish must fail).
+    const HANDLE htmp = ::CreateFileA(
+        kTmp.c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING,
+        FILE_ATTRIBUTE_NORMAL, nullptr);
+    CHECK(INVALID_HANDLE_VALUE != htmp);
+    const HANDLE hdst = ::CreateFileA(
+        kPath, GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING,
+        FILE_ATTRIBUTE_NORMAL, nullptr);
+    CHECK(INVALID_HANDLE_VALUE != hdst);
+    std::thread releaser([&] {
+        // Release AFTER the publish's 200 ms retry budget is spent (the publish
+        // must have failed by then), but BEFORE the cleanup's own 200 ms budget
+        // expires. The mutant (no cleanup retry) deletes once at ~200 ms while
+        // the hold is still active and leaves the temp behind.
+        ::Sleep(300);
+        ::CloseHandle(htmp);
+    });
+    std::string err;
+    const bool published = Config::PublishConfigTempFile(kTmp, kPath, err);
+    releaser.join();
+    ::CloseHandle(hdst);
+    std::printf("B164 temp-hold published=%d temp_exists=%d err=[%s]\n",
+                published ? 1 : 0, std::filesystem::exists(kTmp) ? 1 : 0,
+                err.c_str());
+    CHECK(!published);   // the destination is held: the publish must fail
+    CHECK(!std::filesystem::exists(kTmp));   // ... and the temp must not survive
+    ::CloseHandle(htmp);
+    std::remove(kTmp.c_str());
     std::remove(kPath);
 }
 
@@ -7623,6 +7719,9 @@ static void TestP82CrossProcessDeleteNotResurrected() {
     store.AttachFile("");
     store.Clear();
     std::remove(path.c_str());
+    // batch164: the worker's side file outlives the test (measured:
+    // p82worker2/p82worker3.json.rules.json.worker_id in the repository root).
+    std::remove((path + ".worker_id").c_str());
 #else
     (void)0;
 #endif
@@ -7645,6 +7744,7 @@ int main(int argc, char** argv) {
     TestB88RemoveBanCheckedIsAtomic();
     TestB89CapsEnforcedInsideTheLock();
     TestB80PublishSurvivesBusyDestination();
+    TestB164TempCleanupSurvivesBusyHolder();
     TestB108DeleteIndexMustBeAllDigits();
     HttpServer server;
     server.Route("GET", "/api/status",
@@ -9427,6 +9527,15 @@ int main(int argc, char** argv) {
         store.AttachFile("");
         store.Clear();
     }
+
+    // batch164: an oversize rules document is quarantined as `<path>.corrupt`
+    // by SetAsideFile, and every earlier case in this block only removed
+    // `kPath` - the aside copy survived every ctest run (measured:
+    // oversize.json.rules.json.corrupt, 254 KB, in the repository root).
+    // A rejected document is preserved for the operator to inspect; the TEST
+    // must not leave it behind, or the working tree accumulates one permanent
+    // neighbour per run.
+    std::remove((std::string("oversize.json.rules.json") + ".corrupt").c_str());
 
     // ---- P8 deviation 1 (audit B): legacy persisted rules may hold
     //      non-canonical

@@ -109,6 +109,60 @@ namespace vgww {
             ip_out[11] = static_cast<uint8_t>(ip_ck & 0xFF);
         }
 
+        size_t BuildEchoReplyFrame(const uint8_t* request_ip,
+                                   size_t request_len,
+                                   const net::WireMac& gateway_mac,
+                                   const net::WireMac& client_mac,
+                                   std::array<uint8_t, kMaxEchoReplyFrameBytes>& out) {
+            IcmpEchoView echo;
+            if (!ParseIcmpEcho(request_ip, request_len, echo)) {
+                return 0;
+            }
+            const uint8_t ihl = request_ip[0] & 0x0F;
+            const size_t header_len = static_cast<size_t>(ihl) * 4;
+            const size_t icmp_len = kIcmpHeaderLen + echo.payload_len;
+            const size_t total_len =
+                net::kEthernetHeaderLen + header_len + icmp_len;
+            if (total_len > kMaxEchoReplyFrameBytes) {
+                return 0;
+            }
+            uint8_t* frame = out.data();
+
+            // Ethernet: reply to the client's MAC from the gateway MAC.
+            net::BuildEthHeader(frame, client_mac, gateway_mac, net::kEthertypeIpv4);
+
+            // IPv4: swap addresses; ident/flags/TTL copied, checksum rebuilt.
+            uint8_t* ip_out = frame + net::kEthernetHeaderLen;
+            std::memcpy(ip_out, request_ip, header_len);
+            std::memcpy(ip_out + 12, request_ip + 16, 4);  // src = original dst
+            std::memcpy(ip_out + 16, request_ip + 12, 4);  // dst = original src
+            ip_out[8] = 63;                                // TTL 64 for local answer
+            ip_out[10] = 0;
+            ip_out[11] = 0;
+
+            // ICMP: type flips to reply; identifier/sequence/payload copied.
+            uint8_t* icmp_out = ip_out + header_len;
+            std::memcpy(icmp_out, request_ip + header_len, icmp_len);
+            icmp_out[0] = kIcmpEchoReply;
+            icmp_out[2] = 0;
+            icmp_out[3] = 0;
+
+            // Checksums (ICMP first so the IP header covers the final bytes).
+            const uint16_t icmp_ck = net::InternetChecksum(icmp_out, icmp_len);
+            icmp_out[2] = static_cast<uint8_t>(icmp_ck >> 8);
+            icmp_out[3] = static_cast<uint8_t>(icmp_ck & 0xFF);
+
+            const uint16_t total_len_field =
+                static_cast<uint16_t>(header_len + icmp_len);
+            ip_out[2] = static_cast<uint8_t>(total_len_field >> 8);
+            ip_out[3] = static_cast<uint8_t>(total_len_field & 0xFF);
+            const uint16_t ip_ck = net::InternetChecksum(ip_out, header_len);
+            ip_out[10] = static_cast<uint8_t>(ip_ck >> 8);
+            ip_out[11] = static_cast<uint8_t>(ip_ck & 0xFF);
+
+            return total_len;
+        }
+
         void BuildRelayedEchoReplyFrame(const uint8_t remote_ip[4],
                                         const uint8_t client_ip[4],
                                         const net::WireMac& gateway_mac,
