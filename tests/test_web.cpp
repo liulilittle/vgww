@@ -6799,6 +6799,35 @@ static void TestP82ReadRuleDocumentAndMerge() {
         std::remove(path.c_str());
     }
 
+    // --- a container key of the wrong TYPE must be corrupt, not silently empty
+    // batch206: "removed" being a non-array is kCorrupt, but portmaps / bans /
+    // ratelimits used to be skipped by `it->is_array()` with no count and no
+    // outcome change. A file that "has rules" then loaded zero of them while
+    // DiscardedOnLastLoad stayed 0 - the operator saw nothing wrong.
+    {
+        const char* keys[] = {"portmaps", "bans", "ratelimits"};
+        for (const char* key : keys) {
+            const std::string text =
+                std::string("{\"") + key + "\":{\"not\":\"an array\"}}";
+            const std::string name =
+                std::string("p82_badtype_") + key + ".json";
+            const std::string path = WriteRuleFile(name, text);
+            RuleDocument doc;
+            CHECK(RuleStore::LoadOutcome::kCorrupt ==
+                  RuleStore::ReadRuleDocument(path, doc));
+            std::remove(path.c_str());
+        }
+        // The valid forms still load unchanged.
+        const std::string ok_path = WriteRuleFile(
+            "p82_goodtype.json",
+            R"({"portmaps":[],"bans":[],"ratelimits":[]})");
+        RuleDocument ok_doc;
+        CHECK(RuleStore::LoadOutcome::kOk ==
+              RuleStore::ReadRuleDocument(ok_path, ok_doc));
+        CHECK(ok_doc.discarded == 0);
+        std::remove(ok_path.c_str());
+    }
+
     // --- MergeRuleDocuments: disk-only entries are adopted -----------------
     {
         RuleDocument memory;

@@ -1166,6 +1166,9 @@ namespace vgww {
             std::set<uint64_t> seen_port_ids;
             std::set<uint64_t> seen_ban_ids;
             std::set<uint64_t> seen_rate_ids;
+            if (auto it = j.find("portmaps"); it != j.end() && !it->is_array()) {
+                return LoadOutcome::kCorrupt;
+            }
             if (auto it = j.find("portmaps");
                 it != j.end() && it->is_array()) {
                 for (const auto& e : *it) {
@@ -1254,6 +1257,9 @@ namespace vgww {
                     doc.port_maps.push_back(std::move(m));
                 }
             }
+            if (auto it = j.find("bans"); it != j.end() && !it->is_array()) {
+                return LoadOutcome::kCorrupt;
+            }
             if (auto it = j.find("bans"); it != j.end() && it->is_array()) {
                 // batch144: collapse duplicates exactly like the port-forward
                 // loader does (batch131). The API cannot create them any more
@@ -1326,6 +1332,9 @@ namespace vgww {
                     b.id = raw_id;
                     doc.bans.push_back(std::move(b));
                 }
+            }
+            if (auto it = j.find("ratelimits"); it != j.end() && !it->is_array()) {
+                return LoadOutcome::kCorrupt;
             }
             if (auto it = j.find("ratelimits");
                 it != j.end() && it->is_array()) {
