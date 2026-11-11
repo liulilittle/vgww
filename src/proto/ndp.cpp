@@ -184,10 +184,21 @@ namespace vgww {
             uint8_t* d = ip + 24;
             d[0] = 0xFF;
             d[1] = 0x02;
-            d[15] = target_addr[15];
-            d[12] = 0x01;  // ff02::1:ff
-            d[13] = 0xFF;
+            // batch206: RFC 4291 section 2.7.1 places the solicited-node
+            // multicast address at ff02::1:ffXX:XXXX - bytes 11..15 hold
+            // 01 FF and the target's LOW 24 BITS (target[13..15]). The old
+            // layout wrote 01/FF at 12/13 and copied only target[14..15],
+            // producing ff02::1ff:XXYY (and never setting byte 11): the frame
+            // left with the right Ethernet MAC but an IPv6 destination no node
+            // is a member of, so the Neighbor Advertisement never came back and
+            // an aged-out v6 client could not be re-learnt. Byte 11 is part of
+            // the 0x01 (the "1:" group); d[12]=0xFF and d[13..15] are the
+            // low 24 bits.
+            d[11] = 0x01;
+            d[12] = 0xFF;
+            d[13] = target_addr[13];
             d[14] = target_addr[14];
+            d[15] = target_addr[15];
             const uint16_t payload_len = static_cast<uint16_t>(icmp_len);
             ip[4] = static_cast<uint8_t>(payload_len >> 8);
             ip[5] = static_cast<uint8_t>(payload_len & 0xFF);

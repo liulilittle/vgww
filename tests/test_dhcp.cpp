@@ -1858,6 +1858,81 @@ void TestLeaseHostnameLearnt() {
         std::remove(path.c_str());
     }
 
+    // batch206: a client served DURING the blocked window must keep the
+    // address it actually holds after the recovery re-read. LoadLeases
+    // replaces the whole table with the disk snapshot, so without live entries
+    // winning, the previous session's address for that MAC overwrote the live
+    // one and the live address became free for the next DISCOVER (duplicate
+    // address on the wire). The existing recovery test used DIFFERENT macs,
+    // so a same-MAC overwrite was invisible to it.
+    void TestB206BlockedRecoveryKeepsLiveAddressForSameMac() {
+        vgww::core::Config config;
+        config.gateway.ipv4 = kGatewayIp;
+        config.dhcp.pool_start = kPoolStart;
+        config.dhcp.pool_end = kPoolEnd;
+        const auto t0 = std::chrono::steady_clock::now();
+        const std::string path = "b206-same-mac-dhcp-leases.json";
+        std::remove(path.c_str());
+        const WireMac mac{0xA6, 6, 6, 6, 6, 6};
+
+        // Session 1: the client holds some address and it reaches the file.
+        uint32_t disk_ip = 0;
+        {
+            DhcpServer writer(config);
+            disk_ip = writer.Acquire(mac, t0, DhcpServer::OfferStage::kAck);
+            CHECK(0 != disk_ip);
+            CHECK(writer.DumpLeases(path, t0));
+        }
+
+        // Session 2 starts with the file unreadable -> persistence blocked.
+        DhcpServer server(config);
+        vgww::core::SetConfigOpenFailureHookForTest(
+            [](const std::string&) -> unsigned long { return 32u; });
+        CHECK(server.LoadLeases(path, t0, nullptr) ==
+              DhcpServer::LoadOutcome::kUnreadable);
+        vgww::core::SetConfigOpenFailureHookForTest(
+            std::function<unsigned long(const std::string&)>());
+        CHECK(server.PersistBlocked());
+        CHECK(server.LeaseCount() == 0);
+
+        // During the block the SAME client gets an address from the live pool.
+        // The pool walk is sequential, so occupy the first address with a
+        // different client first: the target MAC then lands on a DIFFERENT
+        // address than the stale disk one, which is the case the old cleanup
+        // missed (it only dropped disk entries whose MAC was not live).
+        const WireMac blocker{0xA5, 5, 5, 5, 5, 5};
+        const uint32_t blocker_ip =
+            server.Acquire(blocker, t0, DhcpServer::OfferStage::kAck);
+        CHECK(0 != blocker_ip);
+        const uint32_t live_ip = server.Acquire(mac, t0, DhcpServer::OfferStage::kAck);
+        CHECK(0 != live_ip);
+        CHECK(live_ip != disk_ip);
+
+        // The next dump re-reads the file and merges. The live address must
+        // survive - it is what the client is using right now.
+        CHECK(server.DumpLeases(path, t0 + std::chrono::seconds(60)));
+        CHECK(!server.PersistBlocked());
+        {
+            const auto leases = server.Leases(t0);
+            uint32_t got = 0;
+            for (const auto& l : leases) {
+                if (l.mac == mac) {
+                    got = l.ip;
+                }
+            }
+            CHECK(got == live_ip);
+            CHECK(got != disk_ip);
+        }
+        // Nothing else may still claim the live address, and the stale address
+        // must not be handed out to a second client while the first holds it.
+        {
+            const WireMac other{0xA7, 7, 7, 7, 7, 7};
+            const uint32_t other_ip =
+                server.Acquire(other, t0, DhcpServer::OfferStage::kAck);
+            CHECK(other_ip != live_ip);
+        }
+        std::remove(path.c_str());
+    }
     void TestLeaseSaveFailureReported() {
         vgww::core::Config config;
         config.gateway.ipv4 = kGatewayIp;
@@ -2745,6 +2820,7 @@ int main() {
     TestLeaseLoadTransientLockIsNotCorrupt();
     TestLeaseLoadUnreadablePausesDump();
     TestLeaseDumpRecoversFromBlocked();
+    TestB206BlockedRecoveryKeepsLiveAddressForSameMac();
     TestPoolExhaustionCounted();
     TestReleaseWrongServerIdIgnored();
     TestParseOptionStreamBoundaries();

@@ -7226,6 +7226,105 @@ static void TestP82TombstoneFullRefusesDelete() {
     store.Clear();
     std::remove(p.c_str());
 }
+// batch206: two VGWW processes sharing one rules file each accumulate their
+// own tombstone ids (ids embed a per-process salt/pid, so the sets do not
+// overlap). Merging must converge to kMaxTombstones: the loader rejects a
+// longer "removed" array as corrupt, so an unbounded union would write a
+// document its own loader cannot read - and every later flush would set the
+// doc aside, merge the same oversized union again and bump recovery_count_
+// forever. The newest tombstones survive (a concurrent writer is least likely
+// to have seen those, so they are what keeps a deletion from resurrecting).
+// batch206: SetPortMap is a public insert path and used to bypass BOTH the
+// kMaxPortMaps ceiling and the proto:wan_port duplicate check that
+// AddPortMapTracked enforces. Two rules for one WAN endpoint means the second
+// acceptor never binds (PortMapManager keys on that pair), and an unbounded
+// list defeats the cap the API relies on. It must now behave exactly like the
+// validated insert path.
+static void TestB206SetPortMapHonoursCapAndDuplicates() {
+    using namespace vgww::web;
+    auto& store = RuleStore::Instance();
+    store.AttachFile("");
+    store.Clear();
+
+    PortMappingRule first;
+    first.proto = "tcp";
+    first.wan_port = 8801;
+    first.lan_ip = "192.168.0.51";
+    first.lan_port = 80;
+    store.SetPortMap(first);
+    CHECK(store.PortMapCount() == 1);
+
+    // Same WAN endpoint is refused (no second rule for one port).
+    PortMappingRule dup;
+    dup.proto = "tcp";
+    dup.wan_port = 8801;
+    dup.lan_ip = "192.168.0.52";
+    dup.lan_port = 81;
+    store.SetPortMap(dup);
+    CHECK(store.PortMapCount() == 1);
+
+    // The cap is honoured: fill to the ceiling, then one more is refused.
+    PortMappingRule filler;
+    filler.proto = "udp";
+    filler.lan_ip = "192.168.0.60";
+    filler.lan_port = 80;
+    for (uint16_t p = 0; store.PortMapCount() <
+                             ::vgww::core::limits::kMaxPortMaps; ++p) {
+        filler.wan_port = static_cast<uint16_t>(9000 + p);
+        const size_t before = store.PortMapCount();
+        store.SetPortMap(filler);
+        if (store.PortMapCount() == before) {
+            break;  // pool of distinct ports exhausted first (not our failure)
+        }
+    }
+    const size_t at_cap = store.PortMapCount();
+    CHECK(at_cap <= ::vgww::core::limits::kMaxPortMaps);
+    PortMappingRule over;
+    over.proto = "tcp";
+    over.wan_port = 65000;
+    over.lan_ip = "192.168.0.61";
+    over.lan_port = 80;
+    store.SetPortMap(over);
+    CHECK(store.PortMapCount() == at_cap);
+    CHECK(store.PortMapCount() <= ::vgww::core::limits::kMaxPortMaps);
+
+    store.AttachFile("");
+    store.Clear();
+}
+static void TestB206MergeTombstonesConvergesToCap() {
+    using namespace vgww::web;
+    RuleDocument memory;
+    RuleDocument disk;
+    // Two disjoint halves that together exceed the ceiling.
+    const size_t half = kMaxTombstones / 2 + 100;
+    for (size_t i = 0; i < half; ++i) {
+        const uint64_t id = 1000 + i;
+        memory.tombstones.insert(id);
+        memory.tombstone_order.push_back(id);
+    }
+    for (size_t i = 0; i < half; ++i) {
+        const uint64_t id = 900000 + i;
+        disk.tombstones.insert(id);
+        disk.tombstone_order.push_back(id);
+    }
+    CHECK(memory.tombstone_order.size() + disk.tombstone_order.size() >
+          kMaxTombstones);
+    SeqMinter minter;
+    const size_t dropped = RuleStore::MergeRuleDocuments(memory, disk, minter);
+    // The union is capped and the overflow is reported, never silent.
+    CHECK(memory.tombstone_order.size() == kMaxTombstones);
+    CHECK(memory.tombstones.size() == kMaxTombstones);
+    CHECK(dropped >= half + half - kMaxTombstones);
+    // The set and the order list must agree (the writer emits the order list).
+    for (const uint64_t id : memory.tombstone_order) {
+        CHECK(memory.tombstones.count(id) != 0);
+    }
+    // The NEWEST ids survive: the disk half is appended after the memory half,
+    // so the tail of the merged order must still hold the disk ids.
+    CHECK(memory.tombstone_order.back() == 900000 + half - 1);
+    // A document this merge produced must parse back (the whole point).
+    CHECK(memory.tombstone_order.size() <= kMaxTombstones);
+}
 
 // P82: HTTP DELETE must separate "no such rule" (404) from "refused because
 // the tombstone store is full" (500) - a caller must not read 500 as success
@@ -9930,6 +10029,8 @@ int main(int argc, char** argv) {
     TestP82DiskInjectionMergesForeignRules();
     TestP82DeleteIsNotResurrected();
     TestP82TombstoneFullRefusesDelete();
+    TestB206MergeTombstonesConvergesToCap();
+    TestB206SetPortMapHonoursCapAndDuplicates();
     TestP82HttpDeleteDistinguishes404And500();
     TestP82LockReentrantSameThread();
     TestP82OuterLockBlocksTheFlush();

@@ -862,6 +862,14 @@ namespace vgww {
                 {
                     std::lock_guard<std::mutex> lock(
                         const_cast<std::mutex&>(mutex_));
+                    // batch206: same defect and fix as the v4 sibling - the
+                    // disk re-read replaces the table, so a client served
+                    // during the blocked window must keep the address it
+                    // actually holds; otherwise the stale disk mapping wins
+                    // and the live address becomes free for a second client.
+                    for (const auto& kv : live) {
+                        leases_[kv.first] = kv.second;
+                    }
                     std::set<std::array<uint8_t, 16>> live_ips;
                     for (const auto& kv : live) {
                         live_ips.insert(kv.second.ip);
@@ -982,7 +990,17 @@ namespace vgww {
             // next 60 s snapshot used to overwrite it, destroying both the
             // chance of manual recovery and the evidence of the loss.
             const auto corrupt = [&path, this]() {
-                core::SetAsideFile(path, ".corrupt");
+                // batch206: same as the v4 sibling - a failed preserve must
+                // pause persistence, not let the next dump overwrite the only
+                // copy of the unreadable document.
+                if (!core::SetAsideFile(path, ".corrupt")) {
+                    persist_blocked_.store(true,
+                                       std::memory_order_relaxed);
+                    std::fprintf(stderr,
+                                 "[vgww] dhcp6: corrupt lease file could not "
+                                 "be preserved; persistence paused\n");
+                    return LoadOutcome::kUnreadable;
+                }
                 lease_file_corrupt_.store(true, std::memory_order_relaxed);
                 return LoadOutcome::kCorrupt;
             };

@@ -320,6 +320,73 @@ for (const f of setFields) {
   if (type === 'integer' && !covered) fieldIssues.push(`SET_FIELDS path "${f.path}" is integer-typed in src/core/config.cpp but the save path never converts it to a JSON number (kind=${f.kind ?? 'none'})`);
   if (type === 'non-integer' && f.kind === 'number') fieldIssues.push(`SET_FIELDS path "${f.path}" is not an integer field in src/core/config.cpp but is coerced as a number`);
 }
+// ------------------------------------------------ GET /api/config coverage (batch206)
+// The settings form is a LOAD-then-SAVE round trip: it reads the current
+// document from GET /api/config, edits it, and posts the whole thing back. A
+// field the form edits but the GET never emits arrives as undefined, and the
+// next save writes the DEFAULT over whatever the operator had. That happened
+// to perf.rx_poll_ms: persisted and validated in config.cpp, absent from the
+// GET body, silently reset on every save. The SET_FIELDS list is the set of
+// fields the form edits, so every one of its paths must appear as a JSON key
+// inside the GET /api/config response builder.
+let apiCpp = '';
+try { apiCpp = readFileSync(join(resolve(root), 'src', 'web', 'web_api.cpp'), 'utf8'); } catch (e) { fail(`cannot read src/web/web_api.cpp: ${e.message} (needed for the GET /api/config coverage cross-check)`); }
+// Only the GET /api/config handler body: from its Route(...) to the next Route(
+// (or EOF). Scanning the whole file would match the POST parser and hide a
+// missing GET field.
+// Locate the GET /api/config handler. The Route call is written across lines
+// ("GET", then "/api/config"), so anchor on the path literal that precedes the
+// request lambda, then bound the body at the next route registration.
+const getCfgPathAt = apiCpp.indexOf('"/api/config"');
+const getCfgAt = getCfgPathAt < 0 ? -1 : apiCpp.lastIndexOf('"GET"', getCfgPathAt);
+if (getCfgAt < 0) fail('cannot find GET /api/config route in src/web/web_api.cpp');
+const getCfgNext = apiCpp.indexOf('Route(', getCfgPathAt);
+const getCfgBody = apiCpp.slice(getCfgAt, getCfgNext < 0 ? apiCpp.length : getCfgNext);
+for (const f of setFields) {
+  const parts = f.path.split('.');
+  const leaf = parts[parts.length - 1];
+  // dhcp.pool.0 / dhcp.pool.1 are array elements of the "pool" key.
+  const key = /^\d+$/.test(leaf) ? parts[parts.length - 2] : leaf;
+  // Every emitted key appears as "\"<key>\":" inside a C++ string literal
+  // that is streamed into the response (json << "..."). Match the escaped
+  // form the source actually contains.
+  const emitted = getCfgBody.includes(`\\"${key}\\":`);
+  if (!emitted) {
+    fieldIssues.push(`SET_FIELDS path "${f.path}" is edited by the settings form but GET /api/config never emits "${key}" - a save writes the default over the operator value`);
+  }
+}
+// ---------------------------------------- ToJsonString vs GET /api/config (batch206)
+// The strongest form of the round-trip contract: every key the PERSISTER emits
+// (Config::ToJsonString) must also be emitted by GET /api/config, or a Web save
+// silently resets it to the default. This catches fields the settings form does
+// not even edit (perf.rx_flush_eager was exactly that). Secrets are exempt: the
+// GET must never hand a credential back.
+let cfgToJson = '';
+try { cfgToJson = readFileSync(join(resolve(root), 'src', 'core', 'config.cpp'), 'utf8'); } catch (e) { fail(`cannot read src/core/config.cpp: ${e.message} (needed for the ToJsonString key cross-check)`); }
+const toJsonAt = cfgToJson.indexOf('ToJsonString');
+if (toJsonAt < 0) fail('cannot find Config::ToJsonString in src/core/config.cpp');
+const toJsonBody = cfgToJson.slice(toJsonAt, toJsonAt + 6000);
+// Keys appear either as json{{"k", v}, ...} or root["k"] = ... or [[ "k", x ]].
+const persistKeys = new Set();
+for (const mm of toJsonBody.matchAll(/\["([A-Za-z_][A-Za-z0-9_]*)"\]/g)) persistKeys.add(mm[1]);
+for (const mm of toJsonBody.matchAll(/\{\{"([A-Za-z_][A-Za-z0-9_]*)"/g)) persistKeys.add(mm[1]);
+// `{"key", perf.field}` inside a json{...} initializer (comma form).
+for (const mm of toJsonBody.matchAll(/\{"([A-Za-z_][A-Za-z0-9_]*)",\s*[A-Za-z_]/g)) persistKeys.add(mm[1]);
+// Root-level containers are emitted as objects; their children are checked too
+// through the same scan, so only the leaf-key set matters here.
+const SECRET_KEYS = new Set(['token']);  // never returned by GET
+for (const key of persistKeys) {
+  if (SECRET_KEYS.has(key)) continue;
+  // Skip the container names themselves (perf/web/vlan/bridge/dhcp/ipv6).
+  if (['root', 'json', 'perf', 'web', 'vlan', 'bridge', 'dhcp', 'ipv6',
+       'dhcpv6', 'static_bindings', 'dns'].includes(key)) continue;
+  const emitted = getCfgBody.includes(`\\"${key}\\":`) || getCfgBody.includes(`\\"${key}\\"`);
+  if (!emitted) {
+    fieldIssues.push(`Config::ToJsonString emits "${key}" but GET /api/config never does - a Web save silently resets it to the default`);
+  }
+}
+
+
 // ------------------------------------------------- range hint agreement (batch163)
 // A numeric field's min/max is the bound the form now enforces; its placeholder
 // (set.ph.*) is the range the operator is TOLD. If the two disagree the UI lies:

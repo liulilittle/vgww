@@ -695,6 +695,13 @@ namespace vgww {
             auto* req = reinterpret_cast<ETH_M_REQUEST*>(request.data());
             req->hAdapterHandle = adapter_handle;
             req->dwPacketsNumber = max_packets;
+            // batch206: this request buffer is thread_local and REUSED across
+            // calls, and dwPacketsSuccess is an OUTPUT field. The official SDK
+            // zeroes it before every READ_PACKETS (simple_packet_filter.h:396,
+            // queued_packet_filter.h:567, ...); without that, a driver that
+            // returns TRUE without writing the count leaves the PREVIOUS
+            // batch's number here and the caller re-dispatches stale buffers.
+            req->dwPacketsSuccess = 0;
             for (uint32_t i = 0; i < max_packets; ++i) {
                 req->EthPacket[i].Buffer = &buffers[i];
             }
@@ -718,7 +725,11 @@ namespace vgww {
             }
             // The driver reports the number of frames actually dequeued in
             // dwPacketsSuccess (verified against CNdisApi::ReadPackets).
-            return req->dwPacketsSuccess;
+            // batch206: clamp to the number of buffers we handed over. The
+            // caller indexes its ib_read array by this value
+            // (dataplane.cpp RxTxLoop), so a driver that over-reports would
+            // walk past the batch and dispatch garbage INTERMEDIATE_BUFFERs.
+            return (std::min)(req->dwPacketsSuccess, max_packets);
         }
 
         bool NdisrdClient::SendPacketsToAdapter(void* adapter_handle,

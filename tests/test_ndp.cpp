@@ -280,8 +280,16 @@ namespace vgww {
         const uint8_t* ns_ip = ns.data() + net::kEthernetHeaderLen;
         CHECK(ns_ip[6] == 58 && ns_ip[7] == 255);
         CHECK(ns_ip[24] == 0xFF && ns_ip[25] == 0x02);
-        CHECK(ns_ip[36] == 0x01 && ns_ip[37] == 0xFF && ns_ip[38] == 0xAB &&
-              ns_ip[39] == 0xCD);
+        // batch206: RFC 4291 2.7.1 - the solicited-node address is
+        // ff02::1:ffXX:XXXX, i.e. bytes 11..15 = 01 FF target[13..15]. The
+        // old assertion pinned the WRONG layout (01/FF at 12/13, target[13]
+        // dropped), which is why the bug shipped green.
+        CHECK(ns_ip[35] == 0x01 && ns_ip[36] == 0xFF && ns_ip[37] == 0x00 &&
+              ns_ip[38] == 0xAB && ns_ip[39] == 0xCD);
+        // Byte 11 is the "1:" group; bytes 26..34 must stay zero.
+        for (int i = 26; i < 35; ++i) {
+            CHECK(ns_ip[i] == 0x00);
+        }
         CHECK(0 == std::memcmp(ns_ip + 8, ll_addr, 16));
         const uint16_t ns_plen = static_cast<uint16_t>((ns_ip[4] << 8) | ns_ip[5]);
         CHECK(ns_plen == 32);

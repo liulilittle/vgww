@@ -378,7 +378,22 @@ const document = {
   getElementById(id) { return nodeFor(`#${id}`); },
   querySelector(selector) { return nodeFor(selector); },
   querySelectorAll(selector) { return lists.get(selector) || []; },
-  createElement(tag) { return makeElement(tag); },
+  // batch206: the real createElement() throws InvalidCharacterError for a
+  // name that is not a valid HTML tag (a caller that passes a DOM nodeName
+  // such as "#text" was silently accepted here, so the browser crash this
+  // gate exists to catch was never observed). Reject the same names the
+  // platform does, so such a bug fails the suite instead of the page.
+  createElement(tag) {
+    const name = String(tag == null ? '' : tag);
+    if (!/^[A-Za-z][A-Za-z0-9-]*$/.test(name)) {
+      const err = new Error(
+        "Failed to execute 'createElement': the tag name '" + name +
+        "' is not a valid element name");
+      err.name = 'InvalidCharacterError';
+      throw err;
+    }
+    return makeElement(name);
+  },
   addEventListener(type, fn) { recordWindowListener(type, fn); },
 };
 

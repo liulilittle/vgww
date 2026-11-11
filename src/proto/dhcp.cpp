@@ -1023,6 +1023,22 @@ namespace vgww {
                 {
                     std::lock_guard<std::mutex> lock(
                         const_cast<std::mutex&>(mutex_));
+                    // batch206: LoadLeases REPLACED the whole table with the
+                    // disk snapshot (leases_[mac] = lease), so a client that
+                    // was issued an address DURING the blocked window (file
+                    // briefly unreadable) lost it: the table went back to the
+                    // previous session's mapping for that MAC, and the address
+                    // that client actually holds became free for the next
+                    // DISCOVER (duplicate address on the wire). The cleanup
+                    // below only dropped a disk entry whose MAC is NOT live and
+                    // whose address IS live-held - a MAC that is live on both
+                    // sides was skipped, so the stale disk address silently
+                    // won. Restore live entries over the freshly loaded ones:
+                    // what the client is holding now is the truth, the disk is
+                    // a best-effort recovery source.
+                    for (const auto& kv : live) {
+                        leases_[kv.first] = kv.second;
+                    }
                     std::unordered_set<uint32_t> live_ips;
                     for (const auto& kv : live) {
                         live_ips.insert(kv.second.ip);
@@ -1148,7 +1164,20 @@ namespace vgww {
             // next dump. Otherwise a torn/garbage file destroyed every future
             // restart's mappings AND erased the only evidence of the loss.
             const auto corrupt = [&path, this]() {
-                core::SetAsideFile(path, ".corrupt");
+                // batch206: SetAsideFile can fail (the copy is held without a
+                // delete share, the path is a directory, the cross-process
+                // lock is unavailable). Reporting kCorrupt and letting the
+                // 60 s dump write over the file then destroyed the ONLY
+                // forensic copy. Pause persistence instead, exactly like the
+                // rules path does (web_api.cpp checks the same return).
+                if (!core::SetAsideFile(path, ".corrupt")) {
+                    persist_blocked_.store(true,
+                                       std::memory_order_relaxed);
+                    std::fprintf(stderr,
+                                 "[vgww] dhcp: corrupt lease file could not "
+                                 "be preserved; persistence paused\n");
+                    return LoadOutcome::kUnreadable;
+                }
                 lease_file_corrupt_.store(true, std::memory_order_relaxed);
                 return LoadOutcome::kCorrupt;
             };

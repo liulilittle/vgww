@@ -418,21 +418,14 @@ namespace vgww {
         }
 
         void RuleStore::SetPortMap(PortMappingRule rule) {
-            {
-                std::lock_guard<std::mutex> lock(mutex_);
-
-                // P82: SetPortMap is a public insert path; without an id the
-                // rule could never be removed by identity (id 0 matches
-                // nothing).
-                rule.id = MintRuleIdLocked();
-                port_maps_.push_back(std::move(rule));
-                port_map_snapshot_ =
-                    std::make_shared<std::vector<PortMappingRule>>(
-                        port_maps_);
-
-                StagePersistLocked();
-            }
-            FlushPersist();
+            // batch206: this public insert path bypassed BOTH the
+            // kMaxPortMaps ceiling and the proto:wan_port duplicate check that
+            // AddPortMapTracked enforces, so a caller could exceed the cap and
+            // create two rules for one WAN endpoint (the PortMapManager builds
+            // its acceptor key from that pair, so the second acceptor never
+            // binds). Delegate to the single validated insert path; the id it
+            // mints is discarded here because this signature returns void.
+            (void)AddPortMapTracked(std::move(rule));
         }
 
         void RuleStore::AttachFile(const std::string& path) {
@@ -1576,6 +1569,34 @@ namespace vgww {
                     copy.id = mint_id();
                 }
                 memory.rate_limits.push_back(std::move(copy));
+            }
+            // batch206: the tombstone union above is unbounded, but the loader
+            // treats a "removed" array longer than kMaxTombstones as CORRUPT
+            // (see the parser) and AddTombstoneLocked refuses to grow past the
+            // same ceiling. Two VGWW processes sharing one rules file (a
+            // --headless WebUI run, which config.h documents as supported)
+            // each accumulate their own non-overlapping ids, so the union can
+            // exceed the cap even though neither process did. Writing that
+            // document would make it unreadable to its own loader: every
+            // FlushPersist would then see kCorrupt, set the doc aside, merge
+            // the same oversized union again and bump recovery_count_ forever,
+            // losing every rule on the next restart. Converge to the cap by
+            // dropping the OLDEST tombstones (insertion order): the newest
+            // deletions are the ones a concurrent writer is least likely to
+            // have observed, so keeping them is what preserves the
+            // no-resurrection guarantee.
+            if (memory.tombstone_order.size() > ::vgww::web::kMaxTombstones) {
+                const size_t excess =
+                    memory.tombstone_order.size() -
+                    ::vgww::web::kMaxTombstones;
+                for (size_t i = 0; i < excess; ++i) {
+                    memory.tombstones.erase(memory.tombstone_order[i]);
+                }
+                memory.tombstone_order.erase(
+                    memory.tombstone_order.begin(),
+                    memory.tombstone_order.begin() +
+                        static_cast<std::ptrdiff_t>(excess));
+                dropped += excess;
             }
             return dropped;
         }
@@ -2898,6 +2919,17 @@ namespace vgww {
                          << config.perf.ring_capacity
                          << ",\"dial_timeout_ms\":"
                          << config.perf.dial_timeout_ms
+                         // batch206: rx_poll_ms was persisted and validated
+                         // (config.cpp:2194) but never emitted here, so the
+                         // settings form loaded it as absent and a save wrote
+                         // the default back over the operator value.
+                         << ",\"rx_poll_ms\":" << config.perf.rx_poll_ms
+                         // batch206: same contract gap for rx_flush_eager -
+                         // Config::ToJsonString emits it (config.cpp:2193),
+                         // this GET did not, so a Web save silently reset an
+                         // operator's `false` back to the default `true`.
+                         << ",\"rx_flush_eager\":"
+                         << (config.perf.rx_flush_eager ? "true" : "false")
                          << "},\"web\":{\"port\":" << config.web.port
                          << ",\"bind\":\"" << JsonEscaped(config.web.bind)
                          << "\"}";
