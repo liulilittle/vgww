@@ -2254,6 +2254,19 @@ namespace vgww {
                                bool from_bridge = false) {
                 const uint8_t* data = ib.m_IBuffer;
                 size_t len = ib.m_Length;
+                // batch205: m_Length comes from the kernel driver and is a
+                // DWORD with no bound of its own. Every consumer below
+                // (classifier, VLAN memmove, ARP/ICMP/DHCP parsers, relay
+                // copies) trusts it as a length into m_IBuffer, which is a
+                // fixed MAX_ETHER_FRAME array. A reported length past that
+                // array reads out of bounds, so clamp against the real buffer
+                // size before anything touches the frame. The TX path
+                // (AppendDown) already refuses len > its cap; the RX path did
+                // not, which is the asymmetry this closes.
+                if (len > MAX_ETHER_FRAME) {
+                    ++stats->rx_dropped;
+                    return;
+                }
                 const bool inbound =
                     (PACKET_FLAG_ON_RECEIVE == ib.m_dwDeviceFlags);
 

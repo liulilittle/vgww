@@ -117,6 +117,10 @@ namespace {
             /// in LISTEN mode; the data plane keys its entire host-vs-LAN
             /// split on this flag.
             bool host_sent = false;
+            /// batch205: when non-zero, reported as m_Length instead of the
+            /// real byte count, so a test can prove the data plane rejects a
+            /// driver-reported length past the INTERMEDIATE_BUFFER array.
+            DWORD forced_length = 0;
         };
 
         TestDriverClient() : TestDriverClient(L"\\\\TestNIC") {}
@@ -157,6 +161,25 @@ namespace {
         /// Test API: enqueue a frame available on the very next read.
         void InjectNow(std::vector<uint8_t> bytes) {
             ScriptInbound(std::move(bytes), 0);
+        }
+
+        /// batch205: enqueue a frame whose driver-reported m_Length is
+        /// `forced_len` (larger than the real bytes) so a test can prove the
+        /// data plane refuses an out-of-range length instead of reading past
+        /// the INTERMEDIATE_BUFFER array.
+        void InjectNowForcedLength(std::vector<uint8_t> bytes,
+                                  DWORD forced_len) {
+            bool due_now = false;
+            {
+                std::lock_guard<std::mutex> lock(mutex_);
+                inbound_.push_back({std::move(bytes),
+                                    std::chrono::steady_clock::now(), false,
+                                    forced_len});
+                due_now = true;
+            }
+            if (due_now) {
+                SignalRxEvent();
+            }
         }
 
         /// Batch-24-D: enqueue a HOST-ORIGINATED frame (PACKET_FLAG_ON_SEND):
@@ -280,7 +303,10 @@ namespace {
                                              ? PACKET_FLAG_ON_SEND
                                              : PACKET_FLAG_ON_RECEIVE;
                     ib.m_hAdapter = adapters_[0].handle;
-                    ib.m_Length = static_cast<DWORD>(inbound_.front().bytes.size());
+                    ib.m_Length = inbound_.front().forced_length != 0
+                                      ? inbound_.front().forced_length
+                                      : static_cast<DWORD>(
+                                            inbound_.front().bytes.size());
                     std::memcpy(ib.m_IBuffer, inbound_.front().bytes.data(),
                                 inbound_.front().bytes.size());
                     inbound_.erase(inbound_.begin());
@@ -1798,6 +1824,42 @@ namespace {
         std::fprintf(stderr, "[vlan] tagged rx/tx and cross-VLAN isolation OK\n");
     }
 
+    // batch205: the driver-reported m_Length is a DWORD with no bound. A
+    // length past the fixed INTERMEDIATE_BUFFER array must be rejected (drop),
+    // never used to index the frame, or the RX path reads out of bounds. The
+    // TX path already refuses an over-long frame in AppendDown; this pins the
+    // RX-side symmetry.
+    void RunOverlongReportedLengthIsDroppedScenario() {
+        vgww::core::Config cfg;
+        cfg.adapter = "TestNIC";
+        cfg.gateway.ipv4 = kGatewayIp;
+        cfg.gateway.mask = (0u) | (0u << 8) | (255u << 16) | (255u << 24);
+        cfg.gateway.mac = kGatewayMac;
+        cfg.perf.workers = 2;
+        cfg.perf.ring_capacity = 256;
+        cfg.perf.max_conns = 64;
+        cfg.perf.dial_timeout_ms = 400;
+        auto fake = std::make_unique<TestDriverClient>();
+        TestDriverClient* raw = fake.get();
+        vgww::runtime::Dataplane dataplane(cfg);
+        dataplane.SetDriverClient(std::move(fake));
+        std::string error;
+        CHECK(dataplane.Start(error));
+        const uint64_t dropped_before =
+            dataplane.GetStats().rx_dropped.load();
+        // A real 60-byte ARP frame but a length the driver could never
+        // legitimately report (past the 1514-byte buffer).
+        raw->InjectNowForcedLength(BuildArpRequest(), 4000);
+        CHECK(WaitFor(
+            [&] { return dataplane.GetStats().rx_dropped.load() >
+                       dropped_before; },
+            3000));
+        // It must never be answered as a valid ARP request.
+        CHECK(0 == dataplane.GetStats().arp_replies.load());
+        dataplane.Stop();
+        std::fprintf(stderr, "[rx-len] overlong reported length dropped OK\n");
+    }
+
     // RA-1 (G-5 F1): an adapter hint that arrives as UTF-8 bytes (config
     // JSON / WebUI / wWinMain path) must be widened as UTF-8 before matching.
     // Byte-wise widening turns the zh-CN name (9 UTF-8 bytes) into 9 garbage
@@ -2358,6 +2420,7 @@ int main() {
     RunAdapterDiagnosticsScenario();
     RunAdapterLinkDiagnosticsScenario();
     RunVlanScenarios();
+    RunOverlongReportedLengthIsDroppedScenario();
     RunHostOriginatedScenario();
     RunRxRingOverflowCountedScenario();
     RunRateTableBoundedUnderForgedMacFloodScenario();
