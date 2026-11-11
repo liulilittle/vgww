@@ -2813,6 +2813,113 @@ void TestLeaseHostnameLearnt() {
         }
     }
 
+    // batch: StaticBindings() merged the config and runtime tables with a
+    // NESTED scan: for every runtime entry it walked the whole config list to
+    // decide "already listed". The merged view is capped at
+    // kMaxStaticBindings (1024), so the worst legal shape is 512 config + 512
+    // runtime = 262144 MAC comparisons per call - all of it under mutex_, the
+    // same lock Acquire() takes on the RX thread. GET /api/dhcp/bindings polls
+    // this every 3 s, so every poll stalled the DHCP server for the whole
+    // merge. The fix builds one unordered_set of the config MACs and turns the
+    // inner scan into an O(1) lookup.
+    //
+    // The assertion is a SAME-PROCESS RATIO of per-call cost, not an absolute
+    // millisecond bound (batch78: absolute time is meaningless on a shared
+    // host). The nested scan is O(n^2): 512x512 vs 32x32 is a 256x jump. The
+    // fixed version is O(n): 1024 vs 64 entries is a 16x jump. A 50x bound
+    // sits between the two with a wide margin on both sides. Each measurement
+    // is the MINIMUM of three runs, so a scheduler hiccup cannot inflate it.
+    void TestStaticBindingsMergeIsNotQuadratic() {
+        const auto make_config = [](size_t n) {
+            vgww::core::Config config;
+            bool ok = false;
+            config.gateway.ipv4 = vgww::core::ParseIpv4("10.0.0.1", ok);
+            config.gateway.mask = vgww::core::ParseIpv4("255.0.0.0", ok);
+            config.dhcp.lease_seconds = 3600;
+            for (size_t i = 1; i <= n; ++i) {
+                vgww::core::StaticBinding b;
+                b.mac = WireMac{0x02, 0x01,
+                                static_cast<uint8_t>((i >> 16) & 0xFF),
+                                static_cast<uint8_t>((i >> 8) & 0xFF),
+                                static_cast<uint8_t>(i & 0xFF), 0x01};
+                b.ip = vgww::core::ParseIpv4(
+                    "10.1." + std::to_string((i >> 8) & 0xFF) + "." +
+                        std::to_string(i & 0xFF),
+                    ok);
+                b.hostname = "cfg";
+                config.dhcp.static_bindings.push_back(b);
+            }
+            return config;
+        };
+        const auto fill_runtime = [](DhcpServer& server, size_t n) {
+            bool ok = false;
+            for (size_t i = 1; i <= n; ++i) {
+                const WireMac mac{0x02, 0x02,
+                                  static_cast<uint8_t>((i >> 16) & 0xFF),
+                                  static_cast<uint8_t>((i >> 8) & 0xFF),
+                                  static_cast<uint8_t>(i & 0xFF), 0x02};
+                const uint32_t ip = vgww::core::ParseIpv4(
+                    "10.2." + std::to_string((i >> 8) & 0xFF) + "." +
+                        std::to_string(i & 0xFF),
+                    ok);
+                if (!server.UpsertBinding(mac, ip, "rt")) {
+                    std::fprintf(stderr,
+                                 "b-merge setup: upsert %zu refused\n", i);
+                    ++g_failures;
+                    return;
+                }
+            }
+        };
+        const auto time_calls = [](DhcpServer& server, int iters) {
+            const auto t0 = std::chrono::steady_clock::now();
+            size_t sink = 0;
+            for (int i = 0; i < iters; ++i) {
+                sink += server.StaticBindings().size();
+            }
+            const auto ns =
+                std::chrono::duration_cast<std::chrono::nanoseconds>(
+                    std::chrono::steady_clock::now() - t0)
+                    .count();
+            if (0 == sink) {
+                std::fprintf(stderr, "b-merge: empty view\n");
+            }
+            return ns;
+        };
+        const auto best_of = [&time_calls](DhcpServer& server, int iters,
+                                           int reps) {
+            long long best = -1;
+            for (int r = 0; r < reps; ++r) {
+                const long long ns = time_calls(server, iters);
+                if (best < 0 || ns < best) {
+                    best = ns;
+                }
+            }
+            return best;
+        };
+
+        vgww::core::Config small_cfg = make_config(32);
+        DhcpServer small(small_cfg);
+        fill_runtime(small, 32);
+        vgww::core::Config large_cfg = make_config(512);
+        DhcpServer large(large_cfg);
+        fill_runtime(large, 512);
+        CHECK(small.StaticBindings().size() == 64);
+        CHECK(large.StaticBindings().size() == 1024);
+
+        constexpr int kSmallIters = 2000;
+        constexpr int kLargeIters = 200;
+        const long long small_ns = best_of(small, kSmallIters, 3);
+        const long long large_ns = best_of(large, kLargeIters, 3);
+        const double small_per =
+            static_cast<double>(small_ns) / static_cast<double>(kSmallIters);
+        const double large_per =
+            static_cast<double>(large_ns) / static_cast<double>(kLargeIters);
+        const double ratio = large_per / (small_per > 0.0 ? small_per : 1.0);
+        std::printf("b-merge small_per_ns=%.1f large_per_ns=%.1f ratio=%.1f\n",
+                    small_per, large_per, ratio);
+        CHECK(ratio <= 50.0);
+    }
+
 int main() {
     TestFrameIpOptionBytes();
     TestParseAndOffer();
@@ -2824,6 +2931,7 @@ int main() {
     TestRuntimeBindingWithoutPool();
     TestUpsertBindingRejectsGatewayAndDuplicate();
     TestB137ReplaceBindingIsAtomic();
+    TestStaticBindingsMergeIsNotQuadratic();
     TestB109RuntimeBindingObeysPlacementRules();
     TestB109RuntimeBindingReservesPoolAddress();
     TestB110RuntimeBindingCapIsEnforcedInTheStore();

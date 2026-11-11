@@ -2541,6 +2541,214 @@ static void TestB81DumpLeasesDoesNotStallLockHolders() {
             CHECK(server.StaticBindings().size() == cap);
         }
     }
+
+    // batch: same defect class as the v4 sibling. StaticBindings() decided
+    // "already listed" with a nested scan of the whole config list per runtime
+    // entry - O(config x runtime) DUID comparisons under mutex_ (the lock
+    // Acquire() takes on the RX thread). At the kMaxStaticBindings6 cap that is
+    // ~1e6 compares per call, and the WebUI polls the binding list. The fix
+    // builds one unordered_set of the config DUIDs so the inner test is O(1);
+    // output order and content are unchanged.
+    //
+    // Same-process RATIO assertion (batch78: absolute time is meaningless on a
+    // shared host). Nested scan: 512x512 vs 32x32 is a 256x jump. Fixed: 1024
+    // vs 64 entries is a 16x jump. A 50x bound sits between them with margin.
+    // Each measurement is the MINIMUM of three runs.
+    void TestStaticBindings6MergeIsNotQuadratic() {
+        const auto make_config = [](size_t n) {
+            Config config = MakeConfig();
+            for (size_t i = 1; i <= n; ++i) {
+                Dhcp6StaticBinding b;
+                b.duid = {0x00, 0x03, 0x00, 0x01, 0x01,
+                          static_cast<uint8_t>((i >> 16) & 0xFF),
+                          static_cast<uint8_t>((i >> 8) & 0xFF),
+                          static_cast<uint8_t>(i & 0xFF)};
+                b.ip = kPrefix;
+                b.ip[13] = static_cast<uint8_t>((i >> 16) & 0xFF);
+                b.ip[14] = static_cast<uint8_t>((i >> 8) & 0xFF);
+                b.ip[15] = static_cast<uint8_t>(i & 0xFF);
+                b.hostname = "cfg";
+                config.ipv6.dhcpv6.static_bindings.push_back(b);
+            }
+            return config;
+        };
+        const auto fill_runtime = [](Dhcp6Server& server, size_t n) {
+            for (size_t i = 1; i <= n; ++i) {
+                const std::vector<uint8_t> duid = {
+                    0x00, 0x03, 0x00, 0x01, 0x02,
+                    static_cast<uint8_t>((i >> 16) & 0xFF),
+                    static_cast<uint8_t>((i >> 8) & 0xFF),
+                    static_cast<uint8_t>(i & 0xFF)};
+                std::array<uint8_t, 16> ip = kPrefix;
+                ip[12] = 0x01;  // distinct from the config range
+                ip[13] = static_cast<uint8_t>((i >> 16) & 0xFF);
+                ip[14] = static_cast<uint8_t>((i >> 8) & 0xFF);
+                ip[15] = static_cast<uint8_t>(i & 0xFF);
+                if (!server.UpsertBinding(duid, ip, "rt")) {
+                    std::fprintf(stderr,
+                                 "b-merge6 setup: upsert %zu refused\n", i);
+                    ++g_failures;
+                    return;
+                }
+            }
+        };
+        const auto time_calls = [](Dhcp6Server& server, int iters) {
+            const auto t0 = std::chrono::steady_clock::now();
+            size_t sink = 0;
+            for (int i = 0; i < iters; ++i) {
+                sink += server.StaticBindings().size();
+            }
+            const auto ns =
+                std::chrono::duration_cast<std::chrono::nanoseconds>(
+                    std::chrono::steady_clock::now() - t0)
+                    .count();
+            if (0 == sink) {
+                std::fprintf(stderr, "b-merge6: empty view\n");
+            }
+            return ns;
+        };
+        const auto best_of = [&time_calls](Dhcp6Server& server, int iters,
+                                           int reps) {
+            long long best = -1;
+            for (int r = 0; r < reps; ++r) {
+                const long long ns = time_calls(server, iters);
+                if (best < 0 || ns < best) {
+                    best = ns;
+                }
+            }
+            return best;
+        };
+
+        Config small_cfg = make_config(32);
+        Dhcp6Server small(small_cfg);
+        fill_runtime(small, 32);
+        Config large_cfg = make_config(512);
+        Dhcp6Server large(large_cfg);
+        fill_runtime(large, 512);
+        CHECK(small.StaticBindings().size() == 64);
+        CHECK(large.StaticBindings().size() == 1024);
+
+        constexpr int kSmallIters = 2000;
+        constexpr int kLargeIters = 200;
+        const long long small_ns = best_of(small, kSmallIters, 3);
+        const long long large_ns = best_of(large, kLargeIters, 3);
+        const double small_per =
+            static_cast<double>(small_ns) / static_cast<double>(kSmallIters);
+        const double large_per =
+            static_cast<double>(large_ns) / static_cast<double>(kLargeIters);
+        const double ratio = large_per / (small_per > 0.0 ? small_per : 1.0);
+        std::printf(
+            "b-merge6 small_per_ns=%.1f large_per_ns=%.1f ratio=%.1f\n",
+            small_per, large_per, ratio);
+        CHECK(ratio <= 50.0);
+    }
+
+    // batch: StaticBindingCount() had the SAME nested scan as StaticBindings()
+    // - for every runtime entry it walked the whole config list to decide
+    // "already counted". It only counts (no strings), so the cost is pure DUID
+    // comparison, but a DUID is a std::vector<uint8_t> (a length check plus a
+    // memcmp), so it is dearer per compare than a MAC. The merged view is
+    // capped at kMaxStaticBindings6 (1024), so the worst legal shape is 512
+    // config + 512 runtime = 262144 comparisons per call, all under mutex_ (the
+    // lock Acquire() takes on the RX thread). /api/status polls this every 2 s
+    // (web_api.cpp:2496-2497 -> dataplane.cpp:4570), i.e. MORE often than the
+    // 3 s binding list. The fix builds one unordered_set of the config DUIDs
+    // and turns the inner scan into an O(1) lookup; the returned count is
+    // unchanged (config entries + runtime entries whose DUID is not in config).
+    //
+    // Same-process RATIO assertion (batch78: absolute time is meaningless on a
+    // shared host). Nested scan: 512x512 vs 32x32 is a 256x jump. Fixed: 1024
+    // vs 64 entries is a 16x jump. A 50x bound sits between them with margin.
+    // Each measurement is the MINIMUM of three runs.
+    void TestStaticBindingCount6IsNotQuadratic() {
+        const auto make_config = [](size_t n) {
+            Config config = MakeConfig();
+            for (size_t i = 1; i <= n; ++i) {
+                Dhcp6StaticBinding b;
+                b.duid = {0x00, 0x03, 0x00, 0x01, 0x01,
+                          static_cast<uint8_t>((i >> 16) & 0xFF),
+                          static_cast<uint8_t>((i >> 8) & 0xFF),
+                          static_cast<uint8_t>(i & 0xFF)};
+                b.ip = kPrefix;
+                b.ip[13] = static_cast<uint8_t>((i >> 16) & 0xFF);
+                b.ip[14] = static_cast<uint8_t>((i >> 8) & 0xFF);
+                b.ip[15] = static_cast<uint8_t>(i & 0xFF);
+                b.hostname = "cfg";
+                config.ipv6.dhcpv6.static_bindings.push_back(b);
+            }
+            return config;
+        };
+        const auto fill_runtime = [](Dhcp6Server& server, size_t n) {
+            for (size_t i = 1; i <= n; ++i) {
+                const std::vector<uint8_t> duid = {
+                    0x00, 0x03, 0x00, 0x01, 0x02,
+                    static_cast<uint8_t>((i >> 16) & 0xFF),
+                    static_cast<uint8_t>((i >> 8) & 0xFF),
+                    static_cast<uint8_t>(i & 0xFF)};
+                std::array<uint8_t, 16> ip = kPrefix;
+                ip[12] = 0x01;  // distinct from the config range
+                ip[13] = static_cast<uint8_t>((i >> 16) & 0xFF);
+                ip[14] = static_cast<uint8_t>((i >> 8) & 0xFF);
+                ip[15] = static_cast<uint8_t>(i & 0xFF);
+                if (!server.UpsertBinding(duid, ip, "rt")) {
+                    std::fprintf(stderr,
+                                 "b-count6 setup: upsert %zu refused\n", i);
+                    ++g_failures;
+                    return;
+                }
+            }
+        };
+        const auto time_calls = [](Dhcp6Server& server, int iters) {
+            const auto t0 = std::chrono::steady_clock::now();
+            size_t sink = 0;
+            for (int i = 0; i < iters; ++i) {
+                sink += server.StaticBindingCount();
+            }
+            const auto ns =
+                std::chrono::duration_cast<std::chrono::nanoseconds>(
+                    std::chrono::steady_clock::now() - t0)
+                    .count();
+            if (0 == sink) {
+                std::fprintf(stderr, "b-count6: zero count\n");
+            }
+            return ns;
+        };
+        const auto best_of = [&time_calls](Dhcp6Server& server, int iters,
+                                           int reps) {
+            long long best = -1;
+            for (int r = 0; r < reps; ++r) {
+                const long long ns = time_calls(server, iters);
+                if (best < 0 || ns < best) {
+                    best = ns;
+                }
+            }
+            return best;
+        };
+
+        Config small_cfg = make_config(32);
+        Dhcp6Server small(small_cfg);
+        fill_runtime(small, 32);
+        Config large_cfg = make_config(512);
+        Dhcp6Server large(large_cfg);
+        fill_runtime(large, 512);
+        CHECK(small.StaticBindingCount() == 64);
+        CHECK(large.StaticBindingCount() == 1024);
+
+        constexpr int kSmallIters = 20000;
+        constexpr int kLargeIters = 2000;
+        const long long small_ns = best_of(small, kSmallIters, 3);
+        const long long large_ns = best_of(large, kLargeIters, 3);
+        const double small_per =
+            static_cast<double>(small_ns) / static_cast<double>(kSmallIters);
+        const double large_per =
+            static_cast<double>(large_ns) / static_cast<double>(kLargeIters);
+        const double ratio = large_per / (small_per > 0.0 ? small_per : 1.0);
+        std::printf(
+            "b-count6 small_per_ns=%.1f large_per_ns=%.1f ratio=%.1f\n",
+            small_per, large_per, ratio);
+        CHECK(ratio <= 50.0);
+    }
+
 int main() {
     TestParseDhcp6Malformed();
     TestBuildReplyLayout();
@@ -2559,6 +2767,8 @@ int main() {
     TestRemoveConfigBinding6();
     TestUpsertBindingRejectsDuplicate();
     TestB137ReplaceBinding6IsAtomic();
+    TestStaticBindings6MergeIsNotQuadratic();
+    TestStaticBindingCount6IsNotQuadratic();
     TestB110RuntimeBinding6CapIsEnforcedInTheStore();
     TestB111RuntimeBinding6RejectsOversizedHostname();
     TestB123UpsertBinding6RejectsIllFormedUtf8Hostname();

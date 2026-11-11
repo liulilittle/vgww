@@ -21,6 +21,7 @@ leases.json
 dump-leases.json
 *.leases6
 *.rules.json
+*.corrupt
 
 # Local machine configs (never commit real NIC/gateway setups)
 config.json

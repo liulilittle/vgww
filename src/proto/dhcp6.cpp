@@ -1528,15 +1528,20 @@ namespace vgww {
                 }
                 result.push_back(std::move(view));
             }
+            // batch: the "already listed" test used to be a nested scan of the
+            // whole config list per runtime entry - O(config x runtime) DUID
+            // comparisons, all under mutex_ (the lock Acquire() takes on the
+            // RX thread). At the kMaxStaticBindings6 cap that is ~1e6 compares
+            // per call, and the WebUI polls the binding list. One unordered_set
+            // of the config DUIDs makes the inner test O(1); the output order
+            // and content are unchanged.
+            std::unordered_set<std::vector<uint8_t>, DuidHash> config_duids;
+            config_duids.reserve(config_.ipv6.dhcpv6.static_bindings.size());
+            for (const auto& cfg : config_.ipv6.dhcpv6.static_bindings) {
+                config_duids.insert(cfg.duid);
+            }
             for (const auto& rt : runtime_bindings_) {
-                bool already = false;
-                for (const auto& cfg : config_.ipv6.dhcpv6.static_bindings) {
-                    if (cfg.duid == rt.first) {
-                        already = true;
-                        break;
-                    }
-                }
-                if (!already) {
+                if (0 == config_duids.count(rt.first)) {
                     core::Dhcp6StaticBinding view;
                     view.duid = rt.first;
                     view.ip = rt.second.ip;
@@ -1554,15 +1559,20 @@ namespace vgww {
             // runtime override replaces, never duplicates).
             std::lock_guard<std::mutex> lock(const_cast<std::mutex&>(mutex_));
             size_t count = config_.ipv6.dhcpv6.static_bindings.size();
+            // batch: the "already counted" test used to be a nested scan of the
+            // whole config list per runtime entry - O(config x runtime) DUID
+            // comparisons, all under mutex_ (the lock Acquire() takes on the
+            // RX thread). At the kMaxStaticBindings6 cap that is ~1e6 compares
+            // per call, and /api/status polls this every 2 s. One unordered_set
+            // of the config DUIDs makes the inner test O(1); the returned count
+            // is unchanged.
+            std::unordered_set<std::vector<uint8_t>, DuidHash> config_duids;
+            config_duids.reserve(config_.ipv6.dhcpv6.static_bindings.size());
+            for (const auto& cfg : config_.ipv6.dhcpv6.static_bindings) {
+                config_duids.insert(cfg.duid);
+            }
             for (const auto& rt : runtime_bindings_) {
-                bool already = false;
-                for (const auto& cfg : config_.ipv6.dhcpv6.static_bindings) {
-                    if (cfg.duid == rt.first) {
-                        already = true;
-                        break;
-                    }
-                }
-                if (!already) {
+                if (0 == config_duids.count(rt.first)) {
                     ++count;
                 }
             }

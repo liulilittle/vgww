@@ -935,15 +935,20 @@ namespace vgww {
                 }
                 result.push_back(std::move(view));
             }
+            // batch: the "already listed" test used to be a nested scan of the
+            // whole config list per runtime entry - O(config x runtime) MAC
+            // comparisons, all under mutex_ (the lock Acquire() takes on the
+            // RX thread). At the kMaxStaticBindings cap that is ~1e6 compares
+            // per call, and GET /api/dhcp/bindings polls it every 3 s. One
+            // unordered_set of the config MACs makes the inner test O(1); the
+            // output order and content are unchanged.
+            std::unordered_set<net::WireMac, net::WireMacHash> config_macs;
+            config_macs.reserve(config_.dhcp.static_bindings.size());
+            for (const auto& cfg : config_.dhcp.static_bindings) {
+                config_macs.insert(cfg.mac);
+            }
             for (const auto& rt : runtime_bindings_) {
-                bool already = false;
-                for (const auto& cfg : config_.dhcp.static_bindings) {
-                    if (cfg.mac == rt.first) {
-                        already = true;
-                        break;
-                    }
-                }
-                if (!already) {
+                if (0 == config_macs.count(rt.first)) {
                     StaticView view;
                     view.mac = rt.first;
                     view.ip = rt.second.ip;
