@@ -62,6 +62,7 @@ namespace vgww {
                 L"上行",  // DashUp
                 L"下行",  // DashDown
                 L"已连接设备",  // DashClients
+                L"暂无客户端。启动服务后显示流量。",  // DashClientsEmpty
                 L"全部",  // DashFilterAll
                 L"局域网",  // DashFilterLan
                 L"外网",  // DashFilterWan
@@ -460,6 +461,7 @@ namespace vgww {
                 L"Upload",  // DashUp
                 L"Download",  // DashDown
                 L"Connected devices",  // DashClients
+                L"No clients yet. Start the service to see traffic.",  // DashClientsEmpty
                 L"All",  // DashFilterAll
                 L"LAN",  // DashFilterLan
                 L"WAN",  // DashFilterWan

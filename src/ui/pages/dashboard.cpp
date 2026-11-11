@@ -1255,7 +1255,13 @@ namespace vgww {
                                          ? ClientFilter::Lan
                                          : (value == L"wan" ? ClientFilter::Wan
                                                             : ClientFilter::All);
-
+                    // batch331: an explicit view change must repaint even while
+                    // the table is frozen by a stopped service. Update()'s
+                    // rebuild gate is `dataplane_running ||
+                    // !clients_rows_shown_`, and nothing else ever clears that
+                    // flag - so a filter picked after Stop stayed inert until
+                    // the service was restarted.
+                    clients_rows_shown_ = false;
                 };
                 sort_ = static_cast<SelectElement*>(toolbar_raw->Add(std::make_unique<SelectElement>()));
                 sort_->id = "dash.sort";
@@ -1276,7 +1282,9 @@ namespace vgww {
                                               : (value == L"seen"
                                                      ? ClientSort::Seen
                                                      : ClientSort::Rate));
-
+                    // batch331: same reason as the filter above - a sort picked
+                    // while the service is stopped must still repaint.
+                    clients_rows_shown_ = false;
                 };
                 dir_ = static_cast<SelectElement*>(toolbar_raw->Add(std::make_unique<SelectElement>()));
                 dir_->id = "dash.sort.dir";
@@ -1288,7 +1296,9 @@ namespace vgww {
                         return;
                     }
                     sort_desc_ = dir_->selected_value() != L"asc";
-
+                    // batch331: same reason as the filter above - a direction
+                    // flip picked while the service is stopped must repaint.
+                    clients_rows_shown_ = false;
                 };
 
                 // batch33 F: the client table no longer claims the leftover
@@ -1869,7 +1879,9 @@ namespace vgww {
                 // the residual 1 Hz repaint after Stop. While the service is
                 // stopped the last painted rows stay on screen (no new
                 // activity exists to report); an explicit filter/sort or a
-                // service restart refreshes them again.
+                // service restart refreshes them again. batch331: the filter,
+                // sort and direction handlers now clear clients_rows_shown_
+                // so that promise is actually kept.
                 //
                 // batch132: the placeholder and the tile used to be driven by
                 // THIS tick's snapshot even when the rows above were frozen.
@@ -1888,7 +1900,10 @@ namespace vgww {
                 empty_->visible = 0 == shown_count_;
                 // batch27 D3/P2-21: one plain sentence + one action instead of
                 // the bare "no data".
-                empty_->SetMessage(Str::LeasesEmptyHint);  // relabel on a language switch
+                // batch331: the dashboard has its own sentence now. It used to
+                // borrow LeasesEmptyHint, which talks about DHCP addresses and
+                // the Start button - a different page's data.
+                empty_->SetMessage(Str::DashClientsEmpty);  // relabel on a language switch
             }
 
             void DashboardPage::Relabel() {

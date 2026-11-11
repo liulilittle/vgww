@@ -79,6 +79,10 @@ namespace vgww {
             DashUp,
             DashDown,
             DashClients,
+            /// batch331: the dashboard's own "no clients" sentence. It used to
+            /// borrow LeasesEmptyHint, which talks about DHCP addresses and the
+            /// Start button - a different page's data.
+            DashClientsEmpty,
             // Batch22 A2: client-table filter + sort controls.
             DashFilterAll,
             DashFilterLan,

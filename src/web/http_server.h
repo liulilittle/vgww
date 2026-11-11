@@ -176,7 +176,7 @@ namespace vgww {
             }
 
         private:
-            void AcceptLoop();
+            void AcceptLoop(asio::io_context* ctx);
             void StartAccept();
             void WorkerLoop();
             void HandleConnection(asio::ip::tcp::socket socket);

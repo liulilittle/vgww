@@ -49,6 +49,14 @@ namespace vgww {
         /// spelling GetDhcp6Bindings() reports).
         std::string FormatDuidText(const std::vector<uint8_t>& duid);
 
+        /// True when `ip` sits on the gateway's own LAN: a v4 address inside
+        /// gateway.ipv4/mask, or a v6 address inside the advertised ULA
+        /// prefix. This is the ONE place the "is this a LAN client" rule
+        /// lives: the device list filters on it and the per-client `lan` flag
+        /// reports it, so the two can never disagree (C6).
+        bool IsLanClientAddress(const core::Config& config,
+                                const net::IpAddress& ip) noexcept;
+
         class Dataplane final {
         public:
             /// `lease_file` anchors DHCP lease persistence; production passes
@@ -249,7 +257,12 @@ namespace vgww {
                 uint64_t up_bps = 0;        ///< bytes/s off the wire toward WAN
                 uint64_t down_bps = 0;      ///< bytes/s toward the client
                 uint64_t last_seen_s = 0;   ///< seconds since last activity
-                bool lan = true;            ///< inside the gateway's own subnet
+                /// Inside the gateway's own subnet. Defaults to FALSE: a
+                /// client is not on the LAN until ClientRates() proves it with
+                /// IsLanClientAddress(). The old default was true, which made
+                /// an unassigned flag indistinguishable from a real LAN
+                /// verdict - the WebUI's WAN filter then always saw "LAN".
+                bool lan = false;
             };
 
             /// Latest published per-client throughput snapshot (empty before
@@ -272,8 +285,21 @@ namespace vgww {
                 uint32_t cpu_cores = 0;         ///< logical processors (for scaling context)
                 uint64_t proc_ws_bytes = 0;     ///< vgww working set bytes
                 uint64_t proc_virt_bytes = 0;   ///< vgww virtual memory bytes
+                /// batch208: ndisrd kernel-service state, sampled once per
+                /// second by the control thread (and once at construction).
+                /// The About/dashboard route used to call the SCM directly on
+                /// EVERY request - four SCM round-trips per poll from a page
+                /// that refreshes every 2 s, served by only two HTTP workers.
+                bool ndisrd_service_running = false;
             };
             SystemStats GetSystem() const noexcept;
+
+            /// batch208 test seam: replaces the SCM query the service-state
+            /// cache samples from, and re-samples immediately so the cache
+            /// reflects the injected value (a headless test may never Start()
+            /// the data plane). Call BEFORE Start(): the sampler reads it from
+            /// the control thread. Production leaves it unset.
+            void SetDriverServiceProbeForTest(std::function<bool()> probe);
 
             // ------------------------------------------------------------------
             // DHCPv4 (S2). The server is assembled only in main mode with

@@ -3085,6 +3085,158 @@ static void TestB132StoppedDashboardEmptyMatchesShownRows() {
     I18n::Instance().SetLang(Lang::ZhCN);
 }
 
+// batch331: the client table freezes its rows while the service is stopped (no
+// 1 Hz residual repaint), but the freeze must not swallow an EXPLICIT view
+// change. The three toolbar controls only wrote their field; the rebuild gate
+// (`dataplane_running || !clients_rows_shown_`) then stayed shut forever, so a
+// filter/sort picked after Stop did nothing until the service was restarted -
+// the opposite of what the code comment promises.
+static void TestB331StoppedDashboardFilterSortStillApplies() {
+    using namespace vgww::ui;
+    FixTextMetrics();
+    I18n::Instance().SetLang(Lang::ZhCN);
+
+    ShellFakeSource source;
+    ShellFakeExecutor executor;
+    UiController controller(source, executor);
+
+    UiSnapshot running;
+    running.seq = 1;
+    running.dataplane_running = true;
+    const auto add = [&running](uint8_t last_octet, bool lan, uint64_t up,
+                                uint64_t down, uint64_t seen) {
+        vgww::runtime::Dataplane::ClientRate c;
+        c.ip.family = vgww::net::Family::kV4;
+        c.ip.bytes = {0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 192, 168, 1, last_octet};
+        c.mac = {0x02, 0x00, 0x00, 0x00, 0x00, last_octet};
+        c.lan = lan;
+        c.up_bps = up;
+        c.down_bps = down;
+        c.last_seen_s = seen;
+        running.clients.push_back(c);
+    };
+    add(10, true, 100, 200, 5);    // A: rate 300, up 100, lan
+    add(20, false, 900, 10, 30);   // B: rate 910, up 900, wan
+    add(30, true, 0, 0, 0);        // C: rate 0,   up 0,   lan
+    add(40, true, 250, 0, 100);    // D: rate 250, up 250, lan
+
+    UiApp app;
+    app.Compose(controller, running);
+    app.root().Arrange({0.0f, 0.0f, 1280.0f, 900.0f});
+    app.router().Navigate("dashboard");
+    app.Update(running);
+    app.root().Arrange({0.0f, 0.0f, 1280.0f, 900.0f});
+
+    auto* table =
+        dynamic_cast<TableElement*>(FindById(app.root(), "dash.table.clients"));
+    auto* filter = dynamic_cast<SelectElement*>(FindById(app.root(), "dash.filter"));
+    auto* sort = dynamic_cast<SelectElement*>(FindById(app.root(), "dash.sort"));
+    auto* dir = dynamic_cast<SelectElement*>(FindById(app.root(), "dash.sort.dir"));
+    CHECK(table != nullptr && filter != nullptr && sort != nullptr &&
+          dir != nullptr);
+    if (table == nullptr || filter == nullptr || sort == nullptr ||
+        dir == nullptr) {
+        return;
+    }
+    const auto order = [&] {
+        std::vector<std::string> ids;
+        for (const auto& row : table->rows()) {
+            ids.push_back(row.row_id);
+        }
+        return ids;
+    };
+    const auto mac = [](const char* suffix) {
+        return std::string("02:00:00:00:00:") + suffix;
+    };
+
+    // Default view (all, rate desc): B, A, D, C.
+    CHECK(order().size() == 4);
+    CHECK(order()[0] == mac("14"));
+    CHECK(order()[1] == mac("0A"));
+    CHECK(order()[2] == mac("28"));
+    CHECK(order()[3] == mac("1E"));
+
+    // The service stops. The rows freeze (batch29), but the operator can still
+    // change the view: each control must repaint the frozen snapshot's rows.
+    UiSnapshot stopped = running;
+    stopped.seq = 2;
+    stopped.dataplane_running = false;
+
+    // (1) filter -> LAN: B (wan) drops out; rate desc keeps A, D, C.
+    filter->SetSelectedValue(L"lan");
+    app.Update(stopped);
+    app.root().Arrange({0.0f, 0.0f, 1280.0f, 900.0f});
+    CHECK(order().size() == 3);
+    CHECK(order()[0] == mac("0A"));
+    CHECK(order()[1] == mac("28"));
+    CHECK(order()[2] == mac("1E"));
+
+    // (2) sort -> upload desc: D(250), A(100), C(0).
+    sort->SetSelectedValue(L"up");
+    app.Update(stopped);
+    app.root().Arrange({0.0f, 0.0f, 1280.0f, 900.0f});
+    CHECK(order().size() == 3);
+    CHECK(order()[0] == mac("28"));
+    CHECK(order()[1] == mac("0A"));
+    CHECK(order()[2] == mac("1E"));
+
+    // (3) direction -> ascending: C(0), A(100), D(250).
+    dir->SetSelectedValue(L"asc");
+    app.Update(stopped);
+    app.root().Arrange({0.0f, 0.0f, 1280.0f, 900.0f});
+    CHECK(order().size() == 3);
+    CHECK(order()[0] == mac("1E"));
+    CHECK(order()[1] == mac("0A"));
+    CHECK(order()[2] == mac("28"));
+
+    // The freeze itself must survive: an unchanged stopped tick repaints
+    // nothing (the rows are the same objects, so the count is stable and no
+    // rebuild is requested).
+    const std::size_t frozen = table->row_count();
+    app.Update(stopped);
+    app.root().Arrange({0.0f, 0.0f, 1280.0f, 900.0f});
+    CHECK(table->row_count() == frozen);
+
+    I18n::Instance().SetLang(Lang::ZhCN);
+}
+
+// batch331: the dashboard's "no clients" placeholder borrowed the LEASES page
+// copy ("no device has an address yet - click Start service"), which describes
+// a different page's data. The dashboard needs its own sentence.
+static void TestB331DashboardEmptyUsesOwnHint() {
+    using namespace vgww::ui;
+    FixTextMetrics();
+    I18n::Instance().SetLang(Lang::ZhCN);
+
+    ShellFakeSource source;
+    ShellFakeExecutor executor;
+    UiController controller(source, executor);
+
+    UiSnapshot stopped;  // service not started, no clients
+    stopped.seq = 1;
+    stopped.dataplane_running = false;
+
+    UiApp app;
+    app.Compose(controller, stopped);
+    app.root().Arrange({0.0f, 0.0f, 1280.0f, 800.0f});
+    app.router().Navigate("dashboard");
+    app.Update(stopped);
+    app.root().Arrange({0.0f, 0.0f, 1280.0f, 800.0f});
+
+    auto* empty =
+        dynamic_cast<EmptyState*>(FindById(app.root(), "page.dashboard.empty"));
+    CHECK(empty != nullptr);
+    if (empty == nullptr) {
+        return;
+    }
+    CHECK(empty->visible);
+    CHECK(empty->message_key() == Str::DashClientsEmpty);
+    CHECK(empty->message_key() != Str::LeasesEmptyHint);
+    CHECK(empty->text() == I18n::Instance().T(Str::DashClientsEmpty));
+
+    I18n::Instance().SetLang(Lang::ZhCN);
+}
+
 static void TestLeasesPage() {
     using namespace vgww::ui;
     FixTextMetrics();
@@ -6403,7 +6555,10 @@ static void TestRelabelAcrossPages() {
     const B27EmptyCase empty_cases[] = {
         // batch27: dashboard and leases now explain what to do next instead of
         // the bare "no data" placeholder.
-        {"dashboard", "page.dashboard.empty", Str::LeasesEmptyHint},
+        // batch331: the dashboard has its own sentence; it used to borrow the
+        // LEASES copy (DHCP addresses + "click Start service"), which describes
+        // another page's data.
+        {"dashboard", "page.dashboard.empty", Str::DashClientsEmpty},
         {"leases", "leases.table.v4.empty", Str::LeasesEmptyHint},
         {"portmap", "page.portmap.empty", Str::PortmapEmptyHint},
         {"firewall", "page.firewall.empty", Str::FirewallEmptyHint},
@@ -17585,6 +17740,192 @@ static void TestB20SettingsNavigationKeepsScale() {
     snap.config.ui_scale = "200";
     app.Update(snap);
     CHECK(std::fabs(app.window().scale() - before) < 1e-6f);
+    I18n::Instance().SetLang(Lang::ZhCN);
+}
+
+// ============================================================================
+// batch330: the UI-scale select must honour the SAME unsaved-edit protection
+// as every other field. Update() used to rewrite the select (and the
+// auto-display flags) from the snapshot UNCONDITIONALLY, so an explicit user
+// pick was silently reverted on the next 200 ms tick; ReadDraft() then
+// equalled applied_ again, the "unsaved" badge vanished and Save persisted the
+// OLD value. Mirroring the snapshot is only correct while the operator has no
+// unsaved edits (the same gate FillControls already uses).
+// ============================================================================
+static vgww::ui::UiSnapshot MakeB330SettingsSnapshot(uint64_t seq) {
+    vgww::ui::UiSnapshot snapshot = MakeRulesSnapshot(seq, 1);
+    vgww::ui::ConfigView& view = snapshot.config;
+    view.adapter = "Ethernet 2";
+    view.mode = "bypass";
+    view.gateway_ip = "192.168.1.1";
+    view.gateway_mask = "255.255.255.0";
+    view.gateway_mac = "02:00:00:00:00:01";
+    view.dhcp_pool_start = "192.168.1.100";
+    view.dhcp_pool_end = "192.168.1.200";
+    view.dhcp_lease_s = 86400;
+    view.ula_prefix = "fd00:0000:0000:0000:0000:0000:0000:0000";
+    view.prefix_len = 64;
+    view.ra_lifetime_s = 1800;
+    view.dhcp6_pool_start = "fd00:0000:0000:0000:0000:0000:0000:1000";
+    view.dhcp6_pool_end = "fd00:0000:0000:0000:0000:0000:0000:1fff";
+    view.dhcp6_lease_s = 3600;
+    view.web_port = 8080;
+    view.web_bind = "127.0.0.1";
+    view.web_enabled = true;
+    view.vlan_id = 0;
+    view.bridge_up = "NIC 1";
+    view.bridge_down = "NIC 2";
+    view.bridge_table_size = 4096;
+    view.perf_workers = 4;
+    view.perf_max_conns = 2048;
+    view.perf_dial_timeout_ms = 5000;
+    return snapshot;
+}
+
+static void TestB330UiScaleUserPickSurvivesSnapshot() {
+    using namespace vgww::ui;
+    FixTextMetrics();
+    I18n::Instance().SetLang(Lang::ZhCN);
+
+    const auto shown_scale = [](UiApp& app) -> std::wstring {
+        auto* select = dynamic_cast<SelectElement*>(
+            FindById(app.root(), "settings.ui_scale"));
+        return select != nullptr ? select->selected_value()
+                                : std::wstring(L"<missing>");
+    };
+
+    // GIVEN the page is initialized from a snapshot carrying ui_scale=150,
+    // WHEN the operator picks 200 and a later tick re-delivers the SAME (old)
+    // snapshot, THEN the pick must survive, the unsaved badge must stay, and
+    // Save must persist the picked value - not the stale one.
+    {
+        ShellFakeSource source;
+        RecordingExecutor executor;
+        UiController controller(source, executor);
+        std::string err;
+        CHECK(controller.Start(err));
+        UiSnapshot snap = MakeB330SettingsSnapshot(1);
+        snap.config.ui_scale = "150";
+        UiApp app;
+        app.Compose(controller, snap);
+        app.root().Arrange({0.0f, 0.0f, 1280.0f, 800.0f});
+        app.router().Navigate("settings");
+        app.Update(snap);
+        app.root().Arrange({0.0f, 0.0f, 1280.0f, 800.0f});
+        auto* dirty = FindById(app.root(), "settings.dirty");
+        auto* save = dynamic_cast<Button*>(FindById(app.root(), "settings.save"));
+        CHECK(dirty != nullptr);
+        CHECK(save != nullptr);
+        CHECK(shown_scale(app) == L"150");  // entry mirrors the snapshot
+        CHECK(dirty != nullptr && !dirty->visible);
+
+        auto* scale = dynamic_cast<SelectElement*>(
+            FindById(app.root(), "settings.ui_scale"));
+        CHECK(scale != nullptr);
+        if (scale != nullptr) {
+            scale->SetSelectedValue(L"200");  // a real pick notifies on_changed
+            CHECK(scale->selected_value() == L"200");
+            CHECK(dirty != nullptr && dirty->visible);
+        }
+
+        // The next tick still reports the old 150 (the snapshot lags the pick).
+        app.Update(snap);
+        app.root().Arrange({0.0f, 0.0f, 1280.0f, 800.0f});
+        CHECK(shown_scale(app) == L"200");
+        CHECK(dirty != nullptr && dirty->visible);
+
+        if (save != nullptr) {
+            executor.commands.clear();
+            ClickElement(*save);
+            CHECK(WaitForCommands(executor, 1, controller));
+            CHECK(executor.commands.size() == 1);
+            if (executor.commands.size() == 1) {
+                const auto* cmd =
+                    std::get_if<SaveConfigCmd>(&executor.commands[0]);
+                CHECK(cmd != nullptr);
+                if (cmd != nullptr) {
+                    CHECK(cmd->config.ui_scale == "200");
+                }
+            }
+        }
+        executor.commands.clear();
+        controller.Stop();
+    }
+
+    // GIVEN the operator never edited the form, WHEN the snapshot's ui_scale
+    // changes, THEN the select still follows it (the mirror is unchanged).
+    {
+        ShellFakeSource source;
+        RecordingExecutor executor;
+        UiController controller(source, executor);
+        std::string err;
+        CHECK(controller.Start(err));
+        UiSnapshot snap = MakeB330SettingsSnapshot(1);
+        snap.config.ui_scale = "150";
+        UiApp app;
+        app.Compose(controller, snap);
+        app.root().Arrange({0.0f, 0.0f, 1280.0f, 800.0f});
+        app.router().Navigate("settings");
+        app.Update(snap);
+        app.root().Arrange({0.0f, 0.0f, 1280.0f, 800.0f});
+        CHECK(shown_scale(app) == L"150");
+
+        UiSnapshot next = MakeB330SettingsSnapshot(2);
+        next.config.ui_scale = "175";
+        app.Update(next);
+        app.root().Arrange({0.0f, 0.0f, 1280.0f, 800.0f});
+        CHECK(shown_scale(app) == L"175");
+        auto* dirty = FindById(app.root(), "settings.dirty");
+        CHECK(dirty != nullptr && !dirty->visible);
+        controller.Stop();
+    }
+
+    // GIVEN the snapshot is "auto", THEN the select shows the nearest
+    // 25-step percent of the effective (desktop) scale and the draft still
+    // reads "auto" (not a false fixed value): no dirty badge, Save posts auto.
+    {
+        ShellFakeSource source;
+        RecordingExecutor executor;
+        UiController controller(source, executor);
+        std::string err;
+        CHECK(controller.Start(err));
+        UiSnapshot snap = MakeB330SettingsSnapshot(1);
+        snap.config.ui_scale = "auto";
+        UiApp app;
+        app.Compose(controller, snap);
+        app.root().Arrange({0.0f, 0.0f, 1280.0f, 800.0f});
+        app.router().Navigate("settings");
+        app.window().SetDpiForTest(1.25f);  // desktop 125%
+        app.Update(snap);
+        app.root().Arrange({0.0f, 0.0f, 1280.0f, 800.0f});
+        CHECK(shown_scale(app) == L"125");
+        auto* dirty = FindById(app.root(), "settings.dirty");
+        CHECK(dirty != nullptr && !dirty->visible);
+
+        // The auto display keeps following the desktop (still no user edit).
+        app.window().SetDpiForTest(1.5f);
+        app.Update(snap);
+        CHECK(shown_scale(app) == L"150");
+
+        auto* save = dynamic_cast<Button*>(FindById(app.root(), "settings.save"));
+        CHECK(save != nullptr);
+        if (save != nullptr) {
+            executor.commands.clear();
+            ClickElement(*save);
+            CHECK(WaitForCommands(executor, 1, controller));
+            CHECK(executor.commands.size() == 1);
+            if (executor.commands.size() == 1) {
+                const auto* cmd =
+                    std::get_if<SaveConfigCmd>(&executor.commands[0]);
+                CHECK(cmd != nullptr);
+                if (cmd != nullptr) {
+                    CHECK(cmd->config.ui_scale == "auto");
+                }
+            }
+        }
+        executor.commands.clear();
+        controller.Stop();
+    }
     I18n::Instance().SetLang(Lang::ZhCN);
 }
 
@@ -35770,6 +36111,8 @@ int main() {
     TestB322KillFocusClosesContextMenu();
     TestB323WheelDoesNotScrollBehindOpenMenu();
     TestDashboardPage(); TestB132StoppedDashboardEmptyMatchesShownRows();
+    TestB331StoppedDashboardFilterSortStillApplies();
+    TestB331DashboardEmptyUsesOwnHint();
     TestLeasesPage(); TestLeasesValidation();
     TestB264PortmapValidators();
     TestPortmapPage(); TestFirewallPage(); TestRatelimitPage();
@@ -35991,6 +36334,7 @@ int main() {
     TestB20LanguagePickerExpandLayout();
     TestB20LayoutRequester();
     TestB20SettingsNavigationKeepsScale();
+    TestB330UiScaleUserPickSurvivesSnapshot();
     TestB20TextInputPlaceholder();
     TestB20ConsoleCopy();
     TestB284ConsoleCopyDoesNotSubstituteAFailedSelection();

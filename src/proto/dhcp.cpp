@@ -16,6 +16,7 @@
 #include <io.h>
 #endif
 
+#include <algorithm>
 #include <cerrno>
 #include <cstdio>
 #include <fstream>
@@ -891,10 +892,26 @@ namespace vgww {
         bool DhcpServer::RemoveBinding(const net::WireMac& client_mac) {
             std::lock_guard<std::mutex> lock(mutex_);
             const auto it = runtime_bindings_.find(client_mac);
-            if (it == runtime_bindings_.end()) {
+            if (it != runtime_bindings_.end()) {
+                runtime_bindings_.erase(it);
+                leases_.erase(client_mac);  // client reverts to the dynamic pool
+                return true;
+            }
+            // A binding that lives in the CONFIG document is just as real as a
+            // runtime one: StaticBindings() lists it and Acquire serves it, so
+            // the delete button the UI renders for that row must work. The
+            // runtime table was the only source consulted, so every
+            // config-managed row answered "no such binding" forever.
+            auto& list = config_.dhcp.static_bindings;
+            const auto cfg = std::find_if(
+                list.begin(), list.end(),
+                [&client_mac](const core::StaticBinding& b) {
+                    return b.mac == client_mac;
+                });
+            if (cfg == list.end()) {
                 return false;
             }
-            runtime_bindings_.erase(it);
+            list.erase(cfg);
             leases_.erase(client_mac);  // client reverts to the dynamic pool
             return true;
         }

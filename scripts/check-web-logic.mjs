@@ -3838,10 +3838,16 @@ cases.push(['saving a token proves it before reporting success', async () => {
   const origFetch = sandbox.fetch;
   let probed = 0;
   let seenAuth = null;
+  let probePath = null;
+  let probeMethod = null;
   sandbox.fetch = async (path, opt) => {
     const h = (opt && opt.headers) || {};
     seenAuth = h['x-auth-token'] === undefined ? null : h['x-auth-token'];
-    if (String(path).indexOf('/api/') === 0) probed++;
+    if (String(path).indexOf('/api/') === 0) {
+      probed++;
+      probePath = String(path);
+      probeMethod = (opt && opt.method) || 'GET';
+    }
     return { ok: true, status: 200, async json() { return { ok: true }; }, async text() { return '{}'; } };
   };
   try {
@@ -3851,6 +3857,14 @@ cases.push(['saving a token proves it before reporting success', async () => {
 
   ok(probed > 0, 'saving must ASK the server, not just write localStorage');
   eq(seenAuth, 'good-token', 'the probe must carry the token being saved');
+  // batch207: WHICH request proves the credential is the whole point. The
+  // guard authenticates non-GET/HEAD requests only, so a GET probe returns 200
+  // for ANY token - the old GET /api/config probe "verified" every typo. And
+  // POST /api/config must not be used either: it is a FULL replacement, so
+  // asking "is this token right?" would rewrite the configuration. Only a
+  // read-only write-guarded route answers the question without a side effect.
+  eq(probePath, '/api/auth/verify', 'the probe must be the read-only credential endpoint');
+  eq(probeMethod, 'POST', 'the probe must be a write request, else the guard never runs');
   eq(localStorage.getItem('vgww_token'), 'good-token', 'an accepted token is stored');
   const texts = nodeFor('#toast').children.map(c => c.textContent);
   const saved = vm.runInContext('t("auth.saved")', context);
@@ -4414,6 +4428,125 @@ cases.push(['a rate never prints a value that belongs to the next unit', async (
   eq(render(1048576), '1.0' + MIB, 'exactly a MiB');
 }]);
 
+// batch331: the MiB promotion threshold was wrong. fmtRate chose its unit from
+// tenths of a MiB (`Math.round(bps / 104857.6) >= 10`), which promotes at
+// 1 000 000 B - NOT at 1 MiB (1048576 B). So 996147 B (972.8 KiB) printed
+// "1.0 MiB/s", 5.3% high, and the whole 972.8-1023.9 KiB band was unreachable:
+// no input could ever produce those readings. The boundary must be where the
+// KiB DISPLAY rounds to 1024.0, i.e. 1023.95 KiB = 1048524.8 B.
+cases.push(['a rate below one MiB is never shown as "1.0 MiB"', async () => {
+  const render = (bps) => vm.runInContext('fmtRate(' + bps + ')', context);
+  const KIB = vm.runInContext('t("rate.kib")', context);
+  const MIB = vm.runInContext('t("rate.mib")', context);
+
+  // The live values the dashboard actually shows. 996147 B is 972.8 KiB and
+  // used to read "1.0 MiB/s" - a 5.3% overstatement.
+  eq(render(996147), '972.8' + KIB,
+     '996147 B is 972.8 KiB, got: ' + render(996147));
+  eq(render(1000000), '976.6' + KIB,
+     '1000000 B is 976.6 KiB, got: ' + render(1000000));
+  eq(render(1023 * 1024), '1023.0' + KIB,
+     'the top of the KiB band stays in KiB, got: ' + render(1023 * 1024));
+
+  // The boundary itself: the largest KiB that still rounds to 1023.9, then the
+  // first value whose KiB display would be 1024.0 (so it belongs to MiB).
+  eq(render(1048524), '1023.9' + KIB,
+     '1048524 B rounds to 1023.9 KiB, got: ' + render(1048524));
+  eq(render(1048524.8), '1.0' + MIB,
+     'the first value that rounds to 1024.0 KiB is 1.0 MiB, got: ' + render(1048524.8));
+
+  // The whole band below the boundary must never print a MiB unit - this is
+  // the range the old threshold made unreachable.
+  const offenders = [];
+  for (let v = 1024; v < 1048524.8; v += 613) {
+    const txt = render(v);
+    if (txt.indexOf(MIB) >= 0) offenders.push(v + ' -> ' + txt);
+  }
+  eq(offenders.length, 0,
+     'no rate under 1048524.8 B may print MiB: ' + offenders.slice(0, 4).join(', '));
+}]);
+
+// batch331: fmt() had no T bucket, so a counter at 1e12 printed "1000.00 G" -
+// exactly the self-contradictory reading the function's own comment says it
+// removes (1000 G IS 1 T). G is displayed to two decimals, so it promotes when
+// ITS display rounds to 1000.00, at 999.995 G = 999995000000 - the same
+// "choose the suffix from the ROUNDED display" rule K and M already follow.
+cases.push(['a counter at a trillion never prints "1000.00 G"', async () => {
+  const fmt = (n) => String(vm.runInContext('fmt(' + n + ')', context));
+
+  eq(fmt(1e12), '1.00 T', 'a trillion is 1.00 T, got: ' + fmt(1e12));
+  eq(fmt(5e12), '5.00 T', 'five trillion is 5.00 T, got: ' + fmt(5e12));
+  // The boundary as adjacent integers: just below it is still a legal G value.
+  eq(fmt(999994999999), '999.99 G',
+     'the value below the T boundary is 999.99 G, got: ' + fmt(999994999999));
+  eq(fmt(999995000000), '1.00 T',
+     'the first value that rounds to 1000.00 G is 1.00 T, got: ' + fmt(999995000000));
+
+  // The invariant over the whole magnitude: "1000" is never correct inside a
+  // scaled unit - it is always the next unit spelled wrong.
+  const offenders = [];
+  for (let v = 1e9; v <= 3e12; v += 1000003) {
+    const txt = fmt(v);
+    if (/1000(\.0+)?\s*[KMG]/.test(txt)) offenders.push(v + ' -> ' + txt);
+  }
+  for (let v = 999995000000 - 200; v < 999995000000 + 200; v += 7) {
+    const txt = fmt(v);
+    if (/1000(\.0+)?\s*[KMG]/.test(txt)) offenders.push(v + ' -> ' + txt);
+  }
+  eq(offenders.length, 0,
+     'no counter may print 1000 in a scaled unit: ' + offenders.slice(0, 4).join(', '));
+}]);
+
+// batch331: paintDevices() ran the scope predicate through Array.filter, and
+// the predicate itself called $("#dev-scope") on every invocation. The
+// neighbour table reaches 4096 rows, so a single 2 s tick issued 4096
+// whole-document selector queries for a value that never changes during the
+// paint. Read it once and hand it to the pure predicate.
+cases.push(['painting the device table reads the scope control once per paint', async () => {
+  const tbody = nodeFor('#dev-table tbody');
+  nodeFor('#dev-scope').value = 'lan';
+  // A full neighbour table: 4096 clients, as the product's own comment states
+  // is reachable.
+  clientList = [];
+  for (let i = 0; i < 4096; i++) {
+    clientList.push({
+      ip: '10.1.' + ((i >> 8) & 0xff) + '.' + (i & 0xff),
+      mac: 'AA:BB:CC:00:' + ((i >> 8) & 0xff).toString(16).padStart(2, '0') +
+           ':' + (i & 0xff).toString(16).padStart(2, '0'),
+      up_bps: 1000, down_bps: 1000, last_seen_s: 1, lan: (i & 1) === 0,
+    });
+  }
+
+  // Count document-level selector queries during ONE paint.
+  const realQuerySelector = document.querySelector;
+  const seen = [];
+  document.querySelector = function (sel) {
+    seen.push(String(sel));
+    return realQuerySelector.call(this, sel);
+  };
+  try {
+    sandbox.window.__clientList = clientList;
+    vm.runInContext('paintDevices();', context);
+  } finally {
+    document.querySelector = realQuerySelector;
+  }
+
+  const scopeReads = seen.filter((s) => s === '#dev-scope').length;
+  eq(scopeReads, 1,
+     'the scope control must be read once per paint, not once per client ' +
+     '(got ' + scopeReads + ' reads for ' + clientList.length + ' clients)');
+  // A per-client read would be 4096; a per-paint read is a handful, so the
+  // whole paint must stay far below the row count.
+  ok(seen.length < 16,
+     'a paint must not issue a document query per row (got ' + seen.length + ')');
+
+  // The filter still works: half the clients are LAN, so half the rows paint.
+  eq(tbody.children.length, 2048, 'the LAN filter must still select half the rows');
+
+  clientList = [];
+  nodeFor('#dev-scope').value = 'all';
+}]);
+
 cases.push(['an empty/error row spans every column of its table', async () => {
   eq(sandbox.tableSpan('dev-table'), 6, 'dev-table span');
   eq(sandbox.tableSpan('pm-table'), 4, 'pm-table span');
@@ -4851,7 +4984,7 @@ for (const [name, fn] of cases) {
 //
 // The number is a FLOOR, not an equality: adding cases must never require
 // editing it, only removing them.
-const MIN_CASES = 83;
+const MIN_CASES = 86;
 if (cases.length < MIN_CASES) {
   console.error(`FAIL ${NAME}: only ${cases.length} case(s) are registered, but at least ${MIN_CASES} are required.`);
   console.error('  A case was deleted (or never registered). Restore it, or - if the deletion was');

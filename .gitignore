@@ -19,6 +19,7 @@ b*_roundtrip*.json
 web-test.json
 leases.json
 dump-leases.json
+*.leases6
 *.rules.json
 
 # Local machine configs (never commit real NIC/gateway setups)

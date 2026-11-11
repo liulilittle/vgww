@@ -530,6 +530,97 @@ TEST(MainParity, TestCliFlagThreeLayerParity) {
     EXPECT_TRUE(combined_config.adapter == "Ethernet");
 }
 
+// --- --config path resolution (single authoritative parse) ---------------
+//
+// A "--config" carrying no value used to leave the path empty, which the boot
+// code read as "not given" and answered with the auto-discovery chain: the
+// explicit-but-broken flag silently ran on a DIFFERENT config file. The parse
+// must therefore distinguish "absent" from "present but unusable".
+
+TEST(MainConfigPath, EqualsFormTakesTheSuffix) {
+    const vgww::ConfigPathResult r =
+        vgww::ParseConfigPathArg({"--config=x.json"});
+    EXPECT_TRUE(r.status == vgww::ConfigPathStatus::kOk);
+    EXPECT_TRUE(r.path == "x.json");
+    EXPECT_TRUE(r.error.empty());
+}
+
+TEST(MainConfigPath, SeparateArgumentFormTakesTheValue) {
+    const vgww::ConfigPathResult r =
+        vgww::ParseConfigPathArg({"--config", "x.json"});
+    EXPECT_TRUE(r.status == vgww::ConfigPathStatus::kOk);
+    EXPECT_TRUE(r.path == "x.json");
+    EXPECT_TRUE(r.error.empty());
+}
+
+TEST(MainConfigPath, LoneFlagIsInvalid) {
+    const vgww::ConfigPathResult r = vgww::ParseConfigPathArg({"--config"});
+    EXPECT_TRUE(r.status == vgww::ConfigPathStatus::kInvalid);
+    EXPECT_TRUE(!r.error.empty());
+}
+
+TEST(MainConfigPath, EmptyEqualsValueIsInvalid) {
+    const vgww::ConfigPathResult r = vgww::ParseConfigPathArg({"--config="});
+    EXPECT_TRUE(r.status == vgww::ConfigPathStatus::kInvalid);
+    EXPECT_TRUE(!r.error.empty());
+}
+
+TEST(MainConfigPath, FlagFollowedByAnotherFlagIsInvalid) {
+    const vgww::ConfigPathResult r =
+        vgww::ParseConfigPathArg({"--config", "--web"});
+    EXPECT_TRUE(r.status == vgww::ConfigPathStatus::kInvalid);
+    EXPECT_TRUE(!r.error.empty());
+}
+
+TEST(MainConfigPath, AbsentFlagIsNotGiven) {
+    const vgww::ConfigPathResult web = vgww::ParseConfigPathArg({"--web"});
+    EXPECT_TRUE(web.status == vgww::ConfigPathStatus::kNotGiven);
+    EXPECT_TRUE(web.path.empty());
+    EXPECT_TRUE(web.error.empty());
+
+    const vgww::ConfigPathResult none = vgww::ParseConfigPathArg({});
+    EXPECT_TRUE(none.status == vgww::ConfigPathStatus::kNotGiven);
+    EXPECT_TRUE(none.path.empty());
+    EXPECT_TRUE(none.error.empty());
+}
+
+TEST(MainConfigPath, LastOccurrenceWins) {
+    // Last-occurrence-wins is the semantics the old "=" loop already had (a
+    // later assignment overwrote an earlier one), so it is kept instead of
+    // inventing a "first error fails" rule the previous code never applied.
+    const vgww::ConfigPathResult r =
+        vgww::ParseConfigPathArg({"--config=", "--config=y.json"});
+    EXPECT_TRUE(r.status == vgww::ConfigPathStatus::kOk);
+    EXPECT_TRUE(r.path == "y.json");
+    EXPECT_TRUE(r.error.empty());
+}
+
+TEST(MainConfigPath, ConsumedFormsAgreeWithTheWhitelist) {
+    // Every --config form the authoritative parse accepts must also be
+    // consumed by the post-load whitelist; otherwise the path reaches the
+    // whitelist as an unknown argument (the two rules must agree). The
+    // whitelist deliberately never validates the value - main has already
+    // rejected the unusable forms before the config is loaded.
+    const std::vector<std::vector<std::string>> accepted = {
+        {"--config=x.json"},
+        {"--config", "x.json"},
+        {"--config=", "--config=y.json"},
+    };
+    for (const std::vector<std::string>& args : accepted) {
+        EXPECT_TRUE(vgww::ParseConfigPathArg(args).status ==
+                    vgww::ConfigPathStatus::kOk);
+        vgww::core::Config config;
+        std::string error;
+        const bool ok = config.ApplyCliOverrides(args, error);
+        if (!ok) {
+            std::fprintf(stderr, "cli config: whitelist rejected a form the "
+                                 "parse accepts (%s)\n", error.c_str());
+        }
+        EXPECT_TRUE(ok);
+        EXPECT_TRUE(error.empty());
+    }
+}
+
 int main() {
     MainStartup_DefaultIsUiOnly();
     MainStartup_WebEnablesWebKeepsUi();
@@ -564,6 +655,14 @@ int main() {
     MainHelp_StatesTheWebUiDefaultAndPrecedence();
     MainParity_TestCliFlagThreeLayerParity();
 
+    MainConfigPath_EqualsFormTakesTheSuffix();
+    MainConfigPath_SeparateArgumentFormTakesTheValue();
+    MainConfigPath_LoneFlagIsInvalid();
+    MainConfigPath_EmptyEqualsValueIsInvalid();
+    MainConfigPath_FlagFollowedByAnotherFlagIsInvalid();
+    MainConfigPath_AbsentFlagIsNotGiven();
+    MainConfigPath_LastOccurrenceWins();
+    MainConfigPath_ConsumedFormsAgreeWithTheWhitelist();
     if (0 == g_failures) {
         std::puts("test_main: ALL PASS");
         return 0;

@@ -423,25 +423,20 @@ namespace {
             }
         } capture_guard{console_capture};
 
-        std::string config_path;
+        const vgww::ConfigPathResult config_arg =
+            vgww::ParseConfigPathArg(args);
 
-        for (size_t i = 0; i < args.size(); ++i) {
-            const std::string& arg = args[i];
-            static constexpr char kConfigEq[] = "--config=";
-
-            if (arg.rfind(kConfigEq, 0) == 0) {
-                config_path = arg.substr(sizeof(kConfigEq) - 1);
-            } else if ("--config" == arg && i + 1 < args.size()) {
-                const std::string& nxt = args[i + 1];
-                // Accept "--config path" form; reject if next is another flag.
-                if (!nxt.empty() && nxt.rfind("--", 0) != 0) {
-                    config_path = nxt;
-                    ++i;
-                }
-            }
+        // An explicit --config with no usable value must NOT reach the
+        // auto-discovery branch below: that branch answers "the operator said
+        // nothing", and running on some other config file hides the mistake.
+        if (config_arg.status == vgww::ConfigPathStatus::kInvalid) {
+            std::fprintf(stderr, "vgww: %s\n", config_arg.error.c_str());
+            return 1;
         }
 
-        if (config_path.empty()) {
+        std::string config_path = config_arg.path;
+
+        if (config_arg.status == vgww::ConfigPathStatus::kNotGiven) {
             // Super-large usability: double-click without --config should still
             // show the white native GUI. Try exe-dir/config.json then
             // exe-dir/config.example.json before bailing to usage.

@@ -27,6 +27,7 @@
   "StatusOk": "正常",
   "BridgeFailed": "橋接失敗",
   "DashClients": "用戶端",
+  "DashClientsEmpty": "尚無用戶端。啟動服務後顯示流量。",
   "DashUptime": "執行時間",
   "DashCpu": "CPU",
   "DashMem": "記憶體",

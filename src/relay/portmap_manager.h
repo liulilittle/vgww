@@ -173,12 +173,46 @@ namespace vgww {
                 return dropped_packets_.load(std::memory_order_relaxed);
             }
 
+            /// P1: hard byte bound for ONE relay's LAN->WAN write queue. The
+            /// transient 64-packet `data_queue_` bound above never applies to
+            /// `Relay::pending`: RunLoop drains it on every pass, so its
+            /// overflow branch can never fire while the WAN peer stalls and the
+            /// per-relay queue grew without bound (OOM by a remote peer that
+            /// simply stops reading). Over this cap a packet is dropped and
+            /// counted instead. 256 KiB ~= 170 full-size frames: enough to ride
+            /// out a normal receive-window stall without pinning memory.
+            static constexpr size_t kMaxPendingBytes = 256 * 1024;
+
+            /// Test/telemetry: the per-relay bound above.
+            static constexpr size_t MaxPendingBytes() noexcept {
+                return kMaxPendingBytes;
+            }
+
+            /// Test/telemetry: largest byte count ever queued in a single
+            /// relay's `pending` (relaxed reads; monotonic peak).
+            uint64_t PeakPendingBytes() const noexcept {
+                return peak_pending_bytes_.load(std::memory_order_relaxed);
+            }
+
+            /// Packets dropped because a relay's `pending` reached
+            /// kMaxPendingBytes (monotonic). Deliberately NOT added to the
+            /// /api/status portmap_health object: its key set is a contract the
+            /// dashboard reads, and this is an internal bound, not a health
+            /// signal the UI acts on.
+            uint64_t PendingDroppedPackets() const noexcept {
+                return pending_dropped_.load(std::memory_order_relaxed);
+            }
+
         private:
             PortMapManager() = default;
 
             struct Relay {
                 std::shared_ptr<asio::ip::tcp::socket> wan;
                 std::deque<core::PoolVector<uint8_t>> pending;  // lan -> wan
+                /// P1: bytes currently queued in `pending`. Kept incrementally
+                /// (emplace/pop paths only) so the bound check is O(1) rather
+                /// than summing the deque per packet.
+                size_t pending_bytes = 0;
                 bool established = false;
                 bool closed = false;
                 bool wan_read_armed = false;
@@ -238,6 +272,10 @@ namespace vgww {
             uint64_t applied_rule_rev_ = 0;
             bool have_applied_rules_ = false;
             std::atomic<uint64_t> dropped_packets_{0};
+            /// P1: per-relay pending cap refusals and the observed peak queue
+            /// depth (internal counters; see the accessors above).
+            std::atomic<uint64_t> pending_dropped_{0};
+            std::atomic<uint64_t> peak_pending_bytes_{0};
             std::atomic<uint64_t> last_relay_conn_id_{0};
             std::function<void()> accept_probe_;
             std::function<void()> loop_probe_;

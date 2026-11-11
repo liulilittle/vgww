@@ -3246,9 +3246,16 @@ async function setToken() {
     return;
   }
   try {
-    // Any authenticated read proves the credential. /api/config is the
-    // cheapest one that also exercises the write guard this page uses.
-    await api("/api/config");
+    // batch207: the probe must be a WRITE request, because that is the only
+    // kind the guard authenticates - every GET route is deliberately open (the
+    // page has to load before a token is known), so probing with
+    // GET /api/config answered 200 for any token and a typo was stored and
+    // announced as saved. POST /api/auth/verify exists for this question
+    // alone: the guard rejects a wrong token with 401 before its handler runs,
+    // and unlike POST /api/config (a FULL replacement) it touches no state.
+    // api() sends no body for a method-only call; the server frames that as
+    // Content-Length: 0 and the guard runs on the headers.
+    await api("/api/auth/verify", { method: "POST" });
   } catch (e) {
     // batch196: the rollback itself can throw for the same reason the write
     // can. Swallowing that must not replace the message the operator needs,
@@ -3300,6 +3307,14 @@ function fmt(n) {
   // next unit already rounds up to it: 999950 prints "1000.0 K" and therefore
   // belongs to M, and 999950000 prints "1000.0 M" and belongs to G. Below a
   // thousand the display is a plain integer, so nothing is promoted there.
+  //
+  // batch331: G is displayed to TWO decimals, so it promotes only when ITS
+  // display rounds to 1000.00 - i.e. at 999.995 G = 999995000000. Without this
+  // bucket 1e12 printed "1000.00 G" (the same self-contradictory reading this
+  // function exists to remove), and the counters grow monotonically over the
+  // life of the process, so it is reached in normal use. Same rule as K and M:
+  // the suffix is chosen from the ROUNDED display value (here, its hundredths).
+  if (Math.round(n / 1e7) >= 100000) return (n / 1e12).toFixed(2) + " T";
   if (n >= 1e9) return (n / 1e9).toFixed(2) + " G";
   if (Math.round(n / 1e5) >= 10000) return (n / 1e9).toFixed(2) + " G";
   if (n >= 1e6) return (n / 1e6).toFixed(1) + " M";
@@ -3432,13 +3447,18 @@ function fmtRate(bps) {
   // self-contradictory (1024 KiB IS 1 MiB). The unit is therefore chosen from
   // the ROUNDED tenths, so the printed number and the unit always agree.
   //
+  // batch331: the MiB test used tenths of a MiB (`Math.round(bps/104857.6) >=
+  // 10`), which promotes at 1 000 000 B - not 1 MiB. So 996147 B (972.8 KiB)
+  // printed "1.0 MiB/s" (5.3% high) and the whole 972.8-1023.9 KiB band was
+  // unreachable. The correct boundary is where the KiB DISPLAY rounds to
+  // 1024.0, i.e. bps/1024 reaching 1023.95 KiB = 1048524.8 B.
+  //
   // The byte range is deliberately excluded from that rule: below a KiB the
   // display is a whole number of bytes, not a rounded fraction, so 1023 B has
   // no "1.0 KiB" reading and must stay "1023 B". Applying the rounding rule
   // there would silently promote the last KiB-worth of byte counts a unit up.
   if (bps < 1024) return bps + t("rate.b");
-  const tenthsMiB = Math.round(bps / 104857.6);       // tenths of one MiB
-  if (tenthsMiB >= 10) return (bps / 1048576).toFixed(1) + t("rate.mib");
+  if (bps >= 1048524.8) return (bps / 1048576).toFixed(1) + t("rate.mib");
   // Still KiB: only the MiB display rounds, so 1023 KiB is a legal reading.
   return (bps / 1024).toFixed(1) + t("rate.kib");
 }
@@ -3499,8 +3519,12 @@ async function renderSystem() {
   }
 }
 
-function devScopeOf(c) {
-  const scope = $("#dev-scope").value;
+/// True when a client belongs to the selected scope. Pure: the scope is
+/// passed in, not read from the document. batch331: the predicate used to call
+/// $("#dev-scope").value itself, and paintDevices() runs it through
+/// Array.filter - the neighbour table reaches 4096 rows, so one tick meant 4096
+/// whole-document selector queries for a value that is read once.
+function devScopeOf(c, scope) {
   if (scope === "all") return true;
   const isLan = !!c.lan;
   return scope === "lan" ? isLan : !isLan;
@@ -3549,7 +3573,10 @@ function deviceCompare(key, a, b) {
 /// Paint the device table from the cached list using the current filter/sort.
 /// Synchronous: no ticket, because it reads nothing that can arrive late.
 function paintDevices() {
-  const list = (window.__clientList || []).filter(devScopeOf);
+  // batch331: read the scope ONCE per paint (see devScopeOf), then hand it to
+  // the pure predicate - the filter runs once per cached client.
+  const scope = $("#dev-scope").value;
+  const list = (window.__clientList || []).filter(c => devScopeOf(c, scope));
   const key = $("#dev-sort").value;
   const dir = $("#dev-dir").value === "asc" ? 1 : -1;
   // batch193: this comparator used the raw fields, so ONE client whose counter

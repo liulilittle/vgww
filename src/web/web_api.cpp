@@ -883,6 +883,28 @@ namespace vgww {
                                  RuleStore::Instance().PersistUpToDate());
             }
 
+            /// batch208: the console ring must never re-serve a credential,
+            /// but the old filter dropped every line containing the bare
+            /// words "token" or "x-auth", so ordinary diagnostics such as
+            /// "ratelimit token bucket refilled" disappeared from the WebUI
+            /// (and "Authorization: Bearer ..." leaked, since it contains
+            /// neither word). Match the SHAPES a credential takes instead:
+            ///   * a header name followed by ':' (x-auth-token:, x-auth:)
+            ///   * a key/value pair (token=, token:)
+            ///   * a Bearer credential
+            /// `lower` is the already lower-cased line.
+            bool ConsoleLineLeaksCredential(const std::string& lower) {
+                if (lower.find("x-auth-token:") != std::string::npos ||
+                    lower.find("x-auth:") != std::string::npos) {
+                    return true;
+                }
+                if (lower.find("token=") != std::string::npos ||
+                    lower.find("token:") != std::string::npos) {
+                    return true;
+                }
+                return lower.find("bearer ") != std::string::npos;
+            }
+
         }  // namespace
         bool RuleStore::RecoverBlockedLocked(bool& corrupt_detected) {
             // What the operator changed while persistence was paused. These
@@ -2300,6 +2322,21 @@ namespace vgww {
                         return pass;
                     });
             }
+            // batch207: read-only credential probe. The WebUI must answer "is
+            // this token right?" BEFORE it stores the token and reports
+            // success, but every GET route is deliberately unauthenticated
+            // (the page has to load before any token is known), so a GET
+            // proves nothing; and POST /api/config is a FULL REPLACEMENT, so
+            // probing with it would rewrite the configuration as a side
+            // effect. This route exists only to be refused: the write guard
+            // above answers before any handler runs, so a wrong token is 401
+            // here with no state touched, and the handler body below is
+            // reached only when the credential is already accepted (or none
+            // is configured, the same pass-through every write route has).
+            server.Route("POST", "/api/auth/verify",
+                         [](const Request&) {
+                             return Response::Json("{\"ok\":true}");
+                         });
             server.Route("GET", "/api/status",
                          [&dataplane, &config, &server](const Request&) {
                              const auto& stats = dataplane.GetStats();
@@ -2684,7 +2721,13 @@ namespace vgww {
                              std::string all = console_provider();
                              std::vector<std::string> kept;
                              std::size_t start = 0;
-                             while (start <= all.size()) {
+                             // batch208: `start <= all.size()` entered the
+                             // loop once more after the final line, so an
+                             // EMPTY snapshot produced one phantom empty line
+                             // (count 1) and every snapshot ending in '\n'
+                             // gained a trailing empty line. A line only
+                             // exists when there is a byte at `start`.
+                             while (start < all.size()) {
                                  const std::size_t nl = all.find('\n', start);
                                  const std::size_t end =
                                      (nl == std::string::npos) ? all.size()
@@ -2701,8 +2744,11 @@ namespace vgww {
                                      lower.push_back(static_cast<char>(
                                          ::tolower(static_cast<unsigned char>(c))));
                                  }
-                                 if (lower.find("token") == std::string::npos &&
-                                     lower.find("x-auth") == std::string::npos) {
+                                 // batch208: credential SHAPES only (see
+                                 // ConsoleLineLeaksCredential); the bare
+                                 // words "token"/"x-auth" used to drop
+                                 // legitimate diagnostics.
+                                 if (!ConsoleLineLeaksCredential(lower)) {
                                      kept.push_back(line);
                                  }
                                  if (nl == std::string::npos) break;
@@ -2764,15 +2810,18 @@ namespace vgww {
                              // a permanent dash for both because the API emitted
                              // neither field (comment said "no web-side source
                              // exists"). Uptime is the same steady-clock base
-                             // the dashboard uses; driver state is the same
-                             // NdisrdServiceRunning the UI snapshot carries.
+                             // the dashboard uses; driver state comes from the
+                             // data plane's 1 s service-state cache.
+                             // batch208: the cache replaced a per-request
+                             // OpenSCManager/OpenService/QueryServiceStatus
+                             // round-trip (4 SCM calls) on a route the
+                             // dashboard polls every 2 s with only 2 workers.
                              const uint64_t uptime_s = static_cast<uint64_t>(
                                  std::chrono::duration_cast<std::chrono::seconds>(
                                      std::chrono::steady_clock::now() -
                                      system_boot_time)
                                      .count());
-                             const bool driver_ok =
-                                 vgww::driver::NdisrdServiceRunning();
+                             const bool driver_ok = s.ndisrd_service_running;
                              json << ",\"uptime_s\":" << uptime_s;
                              json << ",\"driver\":\""
                                   << (driver_ok ? "running" : "stopped") << "\"";

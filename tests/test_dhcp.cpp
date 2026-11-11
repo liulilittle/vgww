@@ -420,6 +420,48 @@ void TestStaticBindingReservesPoolAddress() {
         CHECK(server2.Acquire(mac, now) == reserved);
     }
 
+    /// A static binding that lives in the CONFIG document (not the runtime
+    /// table) must be deletable. RemoveBinding only knew runtime_bindings_, so
+    /// the WebUI and the native UI both offered a delete that always failed
+    /// (404 / "no such binding") while StaticBindings() kept listing the
+    /// config entry - the row could never be removed.
+    void TestRemoveConfigBinding() {
+        vgww::core::Config config;
+        config.gateway.ipv4 = kGatewayIp;
+        config.dhcp.pool_start = kPoolStart;
+        config.dhcp.pool_end = kPoolEnd;
+        config.dhcp.lease_seconds = 3600;
+
+        const WireMac bound{0x11, 0x22, 0x33, 0x44, 0x55, 0x66};
+        const uint32_t reserved =
+            (77u) | (0u << 8) | (168u << 16) | (192u << 24);
+        StaticBinding binding;
+        binding.mac = bound;
+        binding.ip = reserved;
+        binding.hostname = "printer";
+        config.dhcp.static_bindings.push_back(binding);
+
+        DhcpServer server(config);
+        const auto now = std::chrono::steady_clock::now();
+        CHECK(server.StaticBindings().size() == 1);
+        CHECK(server.Acquire(bound, now) == reserved);
+
+        // The config entry is removable, and the removal is live.
+        CHECK(server.RemoveBinding(bound));
+        CHECK(server.StaticBindings().empty());
+        // The client reverts to the dynamic pool.
+        const uint32_t pooled = server.Acquire(bound, now);
+        CHECK(pooled != 0);
+        CHECK(pooled != reserved);
+        // The address is no longer reserved by the (deleted) config entry: a
+        // runtime binding may now claim it. Before the fix this was refused as
+        // a collision with the config binding that the user had just deleted.
+        const WireMac other{0x11, 0x22, 0x33, 0x44, 0x55, 0x77};
+        CHECK(server.UpsertBinding(other, reserved));
+        // A second delete has nothing left to remove.
+        CHECK(!server.RemoveBinding(bound));
+    }
+
     void TestRuntimeBindingWithoutPool() {
         // A static-only server (dynamic pool disabled) must still accept
         // manual DHCP bindings: the pool-set validation `(!in_pool &&
@@ -2778,6 +2820,7 @@ int main() {
     TestStaticBindingReservesPoolAddress();
     TestExhaustionAndRelease();
     TestRuntimeBindings();
+    TestRemoveConfigBinding();
     TestRuntimeBindingWithoutPool();
     TestUpsertBindingRejectsGatewayAndDuplicate();
     TestB137ReplaceBindingIsAtomic();

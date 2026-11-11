@@ -28,6 +28,27 @@ namespace vgww {
     StartupOptions ParseStartupOptions(
         const std::vector<std::string>& args) noexcept;
 
+    /// Outcome of ParseConfigPathArg. kNotGiven is the ONLY state that may
+    /// fall back to config auto-discovery; kInvalid means the operator asked
+    /// for a specific file and got the syntax wrong, which must fail loudly
+    /// instead of running on some other file.
+    enum class ConfigPathStatus { kNotGiven, kOk, kInvalid };
+
+    /// A --config parse that keeps "absent" and "present but unusable"
+    /// distinct (an empty path cannot stand for both). kInvalid carries a
+    /// ready-to-print error; the parse is pure and never touches the disk.
+    struct ConfigPathResult {
+        ConfigPathStatus status = ConfigPathStatus::kNotGiven;
+        std::string path;
+        std::string error;
+    };
+
+    /// Single authoritative --config parser for the entry point. Accepts
+    /// "--config=<path>" and "--config <path>"; a missing/empty/flag-valued
+    /// argument is kInvalid, and the last occurrence wins.
+    ConfigPathResult ParseConfigPathArg(
+        const std::vector<std::string>& args);
+
     /// True when this launch must bypass the single-instance gate. Only a
     /// headless run has no window to activate, so only it may coexist with
     /// another instance (--headless, and --web-only which implies headless).

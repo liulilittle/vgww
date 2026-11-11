@@ -1475,10 +1475,32 @@ namespace vgww {
         bool Dhcp6Server::RemoveBinding(const std::vector<uint8_t>& duid) {
             std::lock_guard<std::mutex> lock(mutex_);
             const auto it = runtime_bindings_.find(duid);
-            if (it == runtime_bindings_.end()) {
+            if (it != runtime_bindings_.end()) {
+                runtime_bindings_.erase(it);
+                for (auto l = leases_.begin(); l != leases_.end();) {
+                    if (l->first.duid == duid) {
+                        l = leases_.erase(l);  // client reverts to the pool
+                    } else {
+                        ++l;
+                    }
+                }
+                return true;
+            }
+            // Same defect class as the v4 sibling: a binding that lives in the
+            // CONFIG document is listed by StaticBindings() and served by
+            // Acquire, so its delete button must work. Only the runtime table
+            // was consulted, so every config-managed row answered "no such
+            // binding" forever.
+            auto& list = config_.ipv6.dhcpv6.static_bindings;
+            const auto cfg = std::find_if(
+                list.begin(), list.end(),
+                [&duid](const core::Dhcp6StaticBinding& b) {
+                    return b.duid == duid;
+                });
+            if (cfg == list.end()) {
                 return false;
             }
-            runtime_bindings_.erase(it);
+            list.erase(cfg);
             for (auto l = leases_.begin(); l != leases_.end();) {
                 if (l->first.duid == duid) {
                     l = leases_.erase(l);  // client reverts to the pool

@@ -903,8 +903,38 @@ namespace {
     }
 
     // --- 12b. runtime bindings reject duplicate / config-reserved IPs -----
-    void TestUpsertBindingRejectsDuplicate() {
-        // Two distinct DUIDs cannot share one bound address; a config static
+    /// Same defect class as the v4 sibling: a static binding that lives in the
+    /// CONFIG document (not the runtime table) must be deletable. RemoveBinding
+    /// only knew runtime_bindings_, so the WebUI/native delete always failed
+    /// while StaticBindings() kept listing the config entry.
+    void TestRemoveConfigBinding6() {
+        Config config = MakeConfig();
+        Dhcp6StaticBinding cfg;
+        cfg.duid = kStaticDuid;
+        cfg.ip = kPrefix;
+        cfg.ip[15] = 0x42;
+        cfg.hostname = "fixed-printer";
+        config.ipv6.dhcpv6.static_bindings.push_back(cfg);
+
+        Dhcp6Server server(config);
+        const auto now = std::chrono::steady_clock::now();
+        CHECK(server.StaticBindings().size() == 1);
+        CHECK(server.StaticBindingCount() == 1);
+        CHECK(server.Acquire(kStaticDuid, 1, now,
+                             Dhcp6Server::OfferStage::kAck) == cfg.ip);
+
+        // The config entry is removable, and the removal is live.
+        CHECK(server.RemoveBinding(kStaticDuid));
+        CHECK(server.StaticBindings().empty());
+        CHECK(server.StaticBindingCount() == 0);
+        // The address is no longer reserved by the (deleted) config entry: a
+        // runtime binding may now claim it.
+        CHECK(server.UpsertBinding(kOtherDuid, cfg.ip, ""));
+        // A second delete has nothing left to remove.
+        CHECK(!server.RemoveBinding(kStaticDuid));
+    }
+
+    void TestUpsertBindingRejectsDuplicate() {        // Two distinct DUIDs cannot share one bound address; a config static
         // binding reserves its address; the owner re-upserting stays legal.
         Dhcp6Server server(MakeConfig());
         std::array<uint8_t, 16> ip = kPrefix;
@@ -2526,6 +2556,7 @@ int main() {
     TestPoolExhaustion();
     TestStaticBindingPriority();
     TestStaticBindingCountIsO1AndConsistent();
+    TestRemoveConfigBinding6();
     TestUpsertBindingRejectsDuplicate();
     TestB137ReplaceBinding6IsAtomic();
     TestB110RuntimeBinding6CapIsEnforcedInTheStore();

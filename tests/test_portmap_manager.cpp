@@ -509,6 +509,223 @@ namespace {
         vgww::web::RuleStore::Instance().RemovePortMap(0);
     }
 
+    /// P1: the LAN->WAN write queue (`Relay::pending`) had NO bound of its own.
+    /// RunLoop drains the 64-packet `data_queue_` into `relay.pending` on EVERY
+    /// pass, so the "queue full -> OnStackData false -> window 0" backpressure
+    /// documented in portmap_manager.h never fires: pending grows at line rate
+    /// for as long as the WAN peer does not read, and every packet is up to a
+    /// link-frame of memory. That is an unbounded allocation driven by a remote
+    /// peer (OOM), not a slow reader.
+    ///
+    /// The test drives the real path: one WAN connection, established relay, and
+    /// a WAN peer that never reads. `receive_buffer_size` is pinned small so the
+    /// manager's socket send buffer fills fast and the 1-in-flight write stalls.
+    /// Packets are fed SLOWLY (12 per 15 ms, far below the manager's 64-packets-
+    /// per-pass drain), so the transient `data_queue_` never overflows: any drop
+    /// counted here is the PENDING bound refusing a packet, and any growth of
+    /// the pending byte counter past the bound is the unbounded queue itself.
+    void TestPendingQueueIsBounded() {
+        xtcp::buf::InitPools();
+        NullBackend backend;
+        xtcp::XtcpStack stack(&backend);
+        stack.SetMaxConnections(16);
+
+        vgww::core::Config config;
+        config.gateway.ipv4 = kGatewayIp;
+        config.gateway.mask = (0u) | (0u << 8) | (255u << 16) | (255u << 24);
+        config.gateway.mac = {0x30, 0xFC, 0x68, 0x88, 0xB4, 0xA9};
+
+        const uint16_t wan_port = ProbeFreePort();
+        CHECK(0 != wan_port);
+        vgww::web::RuleStore::Instance().AddPortMap(
+            {"tcp", wan_port, "127.0.0.1", 45678});
+
+        auto& manager = vgww::relay::PortMapManager::Instance();
+        manager.Stop();
+        const auto send_to_lan = [](uint64_t, const uint8_t*, uint32_t) {
+            return true;
+        };
+        const auto teardown = [](uint64_t, bool) {};
+        manager.Start(&stack, config, send_to_lan, teardown);
+        CHECK(WaitFor([&] { return manager.LiveAcceptLoops() >= 1; }, 3000));
+
+        asio::io_context io;
+        asio::ip::tcp::socket client(io);
+        std::error_code ec;
+        client.open(asio::ip::tcp::v4(), ec);
+        CHECK(!ec);
+        client.set_option(asio::socket_base::receive_buffer_size(1024), ec);
+        CHECK(!ec);
+        client.connect(asio::ip::tcp::endpoint(
+                           asio::ip::make_address("127.0.0.1"), wan_port),
+                       ec);
+        CHECK(!ec);
+        CHECK(WaitFor([&] { return 0 != manager.LastRelayConnId(); }, 5000));
+        const uint64_t conn_id = manager.LastRelayConnId();
+        manager.OnStackState(conn_id, 4);   // established: drain pumps to WAN
+        std::this_thread::sleep_for(std::chrono::milliseconds(300));
+
+        // The client never reads, so the WAN write chain stalls and `pending`
+        // accumulates. 1024-byte packets, 12 per round, 2 ms apart: ~6 MB/s,
+        // far above the ~800 KB/s a non-reading loopback peer drains at, so the
+        // queue reaches the cap and the bound must refuse packets.
+        constexpr size_t kPacketBytes = 1024;
+        const uint64_t dropped_before = manager.PendingDroppedPackets();
+        std::vector<uint8_t> payload(kPacketBytes, 0x5A);
+        bool overflowed = false;
+        size_t admitted = 0;
+        for (int round = 0; round < 400 && !overflowed; ++round) {
+            for (int i = 0; i < 12; ++i) {
+                if (manager.OnStackData(conn_id, payload.data(),
+                                        static_cast<uint32_t>(payload.size()))) {
+                    ++admitted;
+                }
+            }
+            std::this_thread::sleep_for(std::chrono::milliseconds(2));
+            if (manager.PendingDroppedPackets() > dropped_before) {
+                overflowed = true;
+            }
+        }
+        const uint64_t peak = manager.PeakPendingBytes();
+        std::printf(
+            "P1 pending-bounded: admitted=%zu pending_dropped=%llu "
+            "peak_bytes=%llu cap=%zu\n",
+            admitted,
+            static_cast<unsigned long long>(manager.PendingDroppedPackets() -
+                                           dropped_before),
+            static_cast<unsigned long long>(peak),
+            manager.MaxPendingBytes());
+        // The relay really carried data into `pending` (not a path that
+        // silently discarded everything).
+        CHECK(peak > 0);
+        // BOUNDED: one packet of slack covers the chunk already handed to the
+        // single in-flight async_write when the cap is tested.
+        CHECK(peak <= manager.MaxPendingBytes() + kPacketBytes);
+        // ... and the bound is ENFORCED by dropping, not by a lucky producer.
+        CHECK(overflowed);
+        CHECK(admitted > 0);
+
+        manager.Stop();
+        vgww::web::RuleStore::Instance().RemovePortMap(0);
+    }
+
+    /// P1b: the byte accounting must be SYMMETRIC. `pending_bytes` is raised
+    /// when a packet is queued and must fall when PumpOne hands a chunk to the
+    /// single in-flight async_write. Without the decrement the counter only
+    /// grows, so after 256 KiB of CUMULATIVE traffic (not queued traffic!) the
+    /// cap test is permanently true and the relay drops every later packet -
+    /// a total stall that is worse than the unbounded queue it replaced.
+    ///
+    /// The WAN peer READS here, so writes complete and the queue drains. Total
+    /// fed is 512 KiB, twice the cap: a leaking counter refuses the second half
+    /// and PendingDroppedPackets() becomes non-zero.
+    void TestPendingBytesDecrementOnDrain() {
+        xtcp::buf::InitPools();
+        NullBackend backend;
+        xtcp::XtcpStack stack(&backend);
+        stack.SetMaxConnections(16);
+
+        vgww::core::Config config;
+        config.gateway.ipv4 = kGatewayIp;
+        config.gateway.mask = (0u) | (0u << 8) | (255u << 16) | (255u << 24);
+        config.gateway.mac = {0x30, 0xFC, 0x68, 0x88, 0xB4, 0xA9};
+
+        const uint16_t wan_port = ProbeFreePort();
+        CHECK(0 != wan_port);
+        vgww::web::RuleStore::Instance().AddPortMap(
+            {"tcp", wan_port, "127.0.0.1", 45678});
+
+        auto& manager = vgww::relay::PortMapManager::Instance();
+        manager.Stop();
+        const auto send_to_lan = [](uint64_t, const uint8_t*, uint32_t) {
+            return true;
+        };
+        const auto teardown = [](uint64_t, bool) {};
+        manager.Start(&stack, config, send_to_lan, teardown);
+        CHECK(WaitFor([&] { return manager.LiveAcceptLoops() >= 1; }, 3000));
+
+        asio::io_context io;
+        asio::ip::tcp::socket client(io);
+        std::error_code ec;
+        client.connect(asio::ip::tcp::endpoint(
+                           asio::ip::make_address("127.0.0.1"), wan_port),
+                       ec);
+        CHECK(!ec);
+        CHECK(WaitFor([&] { return 0 != manager.LastRelayConnId(); }, 5000));
+        const uint64_t conn_id = manager.LastRelayConnId();
+        manager.OnStackState(conn_id, 4);
+        std::this_thread::sleep_for(std::chrono::milliseconds(300));
+
+        constexpr size_t kPacketBytes = 1024;
+        constexpr int kRounds = 32;      // 32 * 16 * 1 KiB = 512 KiB total
+        constexpr int kPerRound = 16;
+        const uint64_t dropped_before = manager.PendingDroppedPackets();
+        std::vector<uint8_t> payload(kPacketBytes, 0x33);
+        size_t admitted = 0;
+        size_t received = 0;
+        client.non_blocking(true, ec);
+        CHECK(!ec);
+        for (int round = 0; round < kRounds; ++round) {
+            for (int i = 0; i < kPerRound; ++i) {
+                if (manager.OnStackData(conn_id, payload.data(),
+                                        static_cast<uint32_t>(payload.size()))) {
+                    ++admitted;
+                }
+            }
+            // Drain the WAN side so the single in-flight write completes and
+            // PumpOne keeps popping chunks (the decrement path).
+            const auto until =
+                std::chrono::steady_clock::now() + std::chrono::milliseconds(20);
+            while (std::chrono::steady_clock::now() < until) {
+                std::array<uint8_t, 65536> buf{};
+                std::error_code e;
+                const size_t n = client.read_some(asio::buffer(buf), e);
+                if (!e && n > 0) {
+                    received += n;
+                } else if (e == asio::error::would_block ||
+                           e == asio::error::try_again) {
+                    std::this_thread::sleep_for(std::chrono::milliseconds(2));
+                } else {
+                    break;
+                }
+            }
+        }
+        // Let the tail drain.
+        const auto deadline =
+            std::chrono::steady_clock::now() + std::chrono::seconds(5);
+        while (received < admitted * kPacketBytes &&
+               std::chrono::steady_clock::now() < deadline) {
+            std::array<uint8_t, 65536> buf{};
+            std::error_code e;
+            const size_t n = client.read_some(asio::buffer(buf), e);
+            if (!e && n > 0) {
+                received += n;
+            } else if (e == asio::error::would_block ||
+                       e == asio::error::try_again) {
+                std::this_thread::sleep_for(std::chrono::milliseconds(2));
+            } else {
+                break;
+            }
+        }
+        const uint64_t pending_dropped =
+            manager.PendingDroppedPackets() - dropped_before;
+        std::printf(
+            "P1b drain: admitted=%zu received=%zu pending_dropped=%llu "
+            "peak_bytes=%llu cap=%zu\n",
+            admitted, received,
+            static_cast<unsigned long long>(pending_dropped),
+            static_cast<unsigned long long>(manager.PeakPendingBytes()),
+            manager.MaxPendingBytes());
+        CHECK(admitted > 0);
+        // 512 KiB of cumulative traffic through a 256 KiB cap: a leaking
+        // counter refuses the second half.
+        CHECK(0 == pending_dropped);
+        CHECK(manager.PeakPendingBytes() <= manager.MaxPendingBytes());
+
+        manager.Stop();
+        vgww::web::RuleStore::Instance().RemovePortMap(0);
+    }
+
     /// C5: WAN->LAN backpressure. A LanSender returning false (peer window
     /// full / queue capped) must PAUSE the WAN receive chain - further WAN
     /// data must not be read (and buffered) until the queue drains. Once the
@@ -879,6 +1096,8 @@ int main() {
     TestOnStackDataBoundary();
     TestRestartAndLoopLifetime();
     TestSingleOutstandingWanWrite();
+    TestPendingQueueIsBounded();
+    TestPendingBytesDecrementOnDrain();
     TestWanReadBackpressure();
     TestB83UdpRuleNeverBindsTcpAcceptor();
     TestAcceptHandlerThrowKeepsTheRuleAlive();

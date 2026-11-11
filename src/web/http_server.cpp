@@ -174,6 +174,17 @@ namespace vgww {
 
         bool HttpServer::Start(const std::string& address, uint16_t port,
                                std::string& error) {
+            // batch208: a second Start() on a LIVE instance used to replace
+            // io_/acceptor_ while the accept thread was still inside
+            // io_->run() on the OLD context - a use-after-free. Refuse
+            // instead of tearing the running server down; the caller's
+            // contract is Stop() then Start().
+            if (running_.load()) {
+                // "busy" is an existing localized token (err.busy); a new
+                // token would render as the raw key in the WebUI toast.
+                error = "busy";
+                return false;
+            }
             std::error_code err;
             const asio::ip::tcp::endpoint endpoint(
                 asio::ip::make_address(address, err), port);
@@ -209,7 +220,11 @@ namespace vgww {
             }
             port_ = port;
             running_.store(true);
-            accept_thread_ = std::thread([this] { AcceptLoop(); });
+            // batch208: the accept thread captures the context it must run,
+            // so it can never observe a REPLACED io_ member (the old code
+            // read `io_` inside the thread, which is the UAF root cause).
+            asio::io_context* const ctx = io_.get();
+            accept_thread_ = std::thread([this, ctx] { AcceptLoop(ctx); });
             // Two connection workers: one stalled client can no longer pin
             // the only handler (the acceptor keeps accepting).
             static constexpr size_t kConnectionWorkers = 2;
@@ -275,7 +290,7 @@ namespace vgww {
             io_.reset();
         }
 
-        void HttpServer::AcceptLoop() {
+        void HttpServer::AcceptLoop(asio::io_context* ctx) {
             StartAccept();
             // The accept handler guards its own body and re-arms itself, so
             // run() returns only when Stop() parks the context. An exception
@@ -283,7 +298,7 @@ namespace vgww {
             // asio's dispatch frame is undefined behaviour, so it is counted
             // separately rather than retried.
             try {
-                io_->run();
+                ctx->run();
             } catch (...) {
                 escaped_errors_.fetch_add(1, std::memory_order_relaxed);
             }

@@ -177,7 +177,16 @@ namespace vgww {
                     return true;
             }
 
-            ParseL4Ports(data, len, out);
+            // ICMPv4 carries no ports; its first four bytes are type/code/
+            // checksum, and the checksum differs per echo so reading it as a
+            // four-tuple scattered ONE conversation across workers (the
+            // SymmetricFlowHash input, dataplane worker selection). The ICMPv6
+            // arm returns early before this read for exactly that reason; v4
+            // must NOT return early because the multicast/broadcast filter
+            // below still applies to it, so skip only the port read.
+            if (FrameClass::kIcmpV4 != out.cls) {
+                ParseL4Ports(data, len, out);
+            }
 
             // DHCP is UDP to ports 67/68 (client->server uses dst 67).
             if ((FrameClass::kUdpV4 == out.cls) &&

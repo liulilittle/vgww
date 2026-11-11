@@ -113,6 +113,52 @@ namespace vgww {
         return options;
     }
 
+    ConfigPathResult ParseConfigPathArg(
+        const std::vector<std::string>& args) {
+        static constexpr char kConfigEq[] = "--config=";
+        static constexpr char kConfig[] = "--config";
+
+        ConfigPathResult result;
+        for (size_t i = 0; i < args.size(); ++i) {
+            const std::string& arg = args[i];
+            if (arg.rfind(kConfigEq, 0) == 0) {
+                // Everything after "=" is the path; an empty tail is the
+                // operator writing "--config=" with no file, not "absent".
+                result.path = arg.substr(sizeof(kConfigEq) - 1);
+                if (result.path.empty()) {
+                    result.status = ConfigPathStatus::kInvalid;
+                    result.error =
+                        "--config= needs a file path (got an empty value)";
+                } else {
+                    result.status = ConfigPathStatus::kOk;
+                    result.error.clear();
+                }
+            } else if (kConfig == arg) {
+                // "--config <path>": the value must be a real path. A
+                // following flag or the end of argv is a truncated command
+                // line, and silently treating it as "no --config" is what
+                // sent the process to a different config file.
+                const std::string* value = nullptr;
+                if (i + 1 < args.size() && !args[i + 1].empty() &&
+                    args[i + 1].rfind("--", 0) != 0) {
+                    value = &args[i + 1];
+                    ++i;
+                }
+                if (value == nullptr) {
+                    result.status = ConfigPathStatus::kInvalid;
+                    result.path.clear();
+                    result.error =
+                        "--config needs a file path (missing value)";
+                } else {
+                    result.path = *value;
+                    result.status = ConfigPathStatus::kOk;
+                    result.error.clear();
+                }
+            }
+        }
+        return result;
+    }
+
     bool BypassesSingleInstanceGate(
         const std::vector<std::string>& args) noexcept {
         // P87: the gate has one bypass rule - a headless run owns no window.

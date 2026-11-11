@@ -131,6 +131,12 @@ namespace {
         auto icmp = BuildV4Frame(kClientIp, kServerIp, 0, 0, 1, 16);
         CHECK(ClassifyFrame(icmp.data(), icmp.size(), view));
         CHECK(FrameClass::kIcmpV4 == view.cls);
+        // Symmetric with the v6 case in TestV6L4Classes: ICMP has no ports, so
+        // its type/code/checksum bytes are never a four-tuple. Reading them
+        // made src_port/dst_port carry the checksum, which differs per ping,
+        // so SymmetricFlowHash scattered ONE conversation across workers.
+        CHECK(0 == view.src_port);
+        CHECK(0 == view.dst_port);
     }
 
     void TestMulticastAndBroadcast() {

@@ -2169,6 +2169,244 @@ static void TestB1ConsoleEndpointFiltersTokens() {
     std::remove(rules.c_str());
 }
 
+// batch208: an EMPTY console ring must report count 0. The line splitter used
+// `while (start <= all.size())`, so an empty snapshot still entered the loop
+// once, produced one empty line, and pushed it into `kept` (the empty string
+// contains no "token"), making the endpoint claim one line of text that does
+// not exist. The same off-by-one also appended a phantom empty line to every
+// snapshot that ended with a newline.
+static void TestB208EmptyConsoleCountsZero() {
+    using namespace vgww::core;
+    const char* path = "b208-console-empty.json";
+    const std::string rules = std::string(path) + ".rules.json";
+    std::remove(path);
+    std::remove(rules.c_str());
+    Config cfg;
+    cfg.web.port = 18145;
+    bool ok = false;
+    cfg.gateway.ipv4 = ParseIpv4("192.168.0.40", ok);
+    cfg.gateway.mask = ParseIpv4("255.255.255.0", ok);
+    MacAddress mac{};
+    ParseMac("30:fc:68:88:b4:a9", mac);
+    cfg.gateway.mac = mac;
+    std::string err;
+    CHECK(cfg.SaveToFile(path, err));
+
+    vgww::runtime::Dataplane dp(cfg);
+    HttpServer api;
+    vgww::web::RegisterApi(api, dp, cfg, path, {}, [] { return std::string(); });
+    constexpr uint16_t kPort = 18145;
+    std::string start_err;
+    CHECK(api.Start("127.0.0.1", kPort, start_err));
+
+    std::string body;
+    CHECK(HttpGet("/api/console", kPort, body) == 200);
+    const auto json = nlohmann::json::parse(body, nullptr, false);
+    CHECK(!json.is_discarded());
+    if (!json.is_discarded()) {
+        CHECK(json["count"].get<uint64_t>() == 0);
+        CHECK(json["text"].get<std::string>().empty());
+        CHECK(json["available"].get<bool>());
+    }
+    api.Stop();
+
+    // A snapshot that ENDS with a newline must not gain a phantom empty line
+    // either: two real lines, count 2 (not 3).
+    vgww::runtime::Dataplane dp2(cfg);
+    HttpServer api2;
+    vgww::web::RegisterApi(api2, dp2, cfg, path, {},
+                           [] { return std::string("alpha\nbeta\n"); });
+    std::string start_err2;
+    CHECK(api2.Start("127.0.0.1", kPort, start_err2));
+    std::string body2;
+    CHECK(HttpGet("/api/console", kPort, body2) == 200);
+    const auto json2 = nlohmann::json::parse(body2, nullptr, false);
+    CHECK(!json2.is_discarded());
+    if (!json2.is_discarded()) {
+        CHECK(json2["count"].get<uint64_t>() == 2);
+        CHECK(json2["text"].get<std::string>() == "alpha\nbeta");
+    }
+    api2.Stop();
+    std::remove(path);
+    std::remove(rules.c_str());
+}
+
+// batch208: the console filter must drop CREDENTIAL SHAPES, not the bare words
+// "token"/"x-auth". A rate limiter's "token bucket" line is ordinary
+// diagnostics and used to vanish from the WebUI; a real header or key/value
+// credential must still never be re-served.
+static void TestB208ConsoleKeepsTokenWordsButDropsCredentials() {
+    using namespace vgww::core;
+    const char* path = "b208-console-shapes.json";
+    const std::string rules = std::string(path) + ".rules.json";
+    std::remove(path);
+    std::remove(rules.c_str());
+    Config cfg;
+    cfg.web.port = 18146;
+    bool ok = false;
+    cfg.gateway.ipv4 = ParseIpv4("192.168.0.40", ok);
+    cfg.gateway.mask = ParseIpv4("255.255.255.0", ok);
+    MacAddress mac{};
+    ParseMac("30:fc:68:88:b4:a9", mac);
+    cfg.gateway.mac = mac;
+    std::string err;
+    CHECK(cfg.SaveToFile(path, err));
+
+    vgww::runtime::Dataplane dp(cfg);
+    HttpServer api;
+    vgww::web::RegisterApi(api, dp, cfg, path, {}, [] {
+        return std::string(
+            "ratelimit token bucket refilled\n"
+            "x-auth-token: secret123\n"
+            "Authorization: Bearer abc\n"
+            "token=abc123\n"
+            "token: abc123\n"
+            "X-Auth-Token: super-secret\n"
+            "keep-me-1\n"
+            "keep-me-2");
+    });
+    constexpr uint16_t kPort = 18146;
+    std::string start_err;
+    CHECK(api.Start("127.0.0.1", kPort, start_err));
+
+    std::string body;
+    CHECK(HttpGet("/api/console", kPort, body) == 200);
+    const auto json = nlohmann::json::parse(body, nullptr, false);
+    CHECK(!json.is_discarded());
+    if (!json.is_discarded()) {
+        const std::string text = json["text"].get<std::string>();
+        // Legitimate diagnostics survive.
+        CHECK(text.find("ratelimit token bucket refilled") != std::string::npos);
+        CHECK(text.find("keep-me-1") != std::string::npos);
+        CHECK(text.find("keep-me-2") != std::string::npos);
+        // Every credential shape is still filtered out.
+        CHECK(text.find("secret123") == std::string::npos);
+        CHECK(text.find("Bearer abc") == std::string::npos);
+        CHECK(text.find("abc123") == std::string::npos);
+        CHECK(text.find("super-secret") == std::string::npos);
+        CHECK(text.find("x-auth-token") == std::string::npos);
+        CHECK(text.find("X-Auth-Token") == std::string::npos);
+        // 3 kept lines: the token-bucket line plus the two keep-me lines.
+        CHECK(json["count"].get<uint64_t>() == 3);
+    }
+    api.Stop();
+    std::remove(path);
+    std::remove(rules.c_str());
+}
+
+// batch208: /api/system must report the driver state from the data plane's
+// service-state cache, not from a per-request SCM round-trip. The cache is
+// primed at construction and refreshed by the 1 s sampler; the injectable
+// probe pins it so a headless test can prove the route reads the CACHE (a
+// value only the seam can produce, never the machine's real state).
+static void TestB208SystemDriverStateComesFromCache() {
+    using namespace vgww::core;
+    const char* path = "b208-system-cache.json";
+    const std::string rules = std::string(path) + ".rules.json";
+    std::remove(path);
+    std::remove(rules.c_str());
+    Config cfg;
+    cfg.web.port = 18147;
+    bool ok = false;
+    cfg.gateway.ipv4 = ParseIpv4("192.168.0.40", ok);
+    cfg.gateway.mask = ParseIpv4("255.255.255.0", ok);
+    MacAddress mac{};
+    ParseMac("30:fc:68:88:b4:a9", mac);
+    cfg.gateway.mac = mac;
+    std::string err;
+    CHECK(cfg.SaveToFile(path, err));
+
+    // (a) The cache can be driven to BOTH verdicts through the seam, and the
+    // route follows it. Neither value comes from the real SCM here.
+    {
+        vgww::runtime::Dataplane dp(cfg);
+        dp.SetDriverServiceProbeForTest([] { return true; });
+        CHECK(dp.GetSystem().ndisrd_service_running);
+        HttpServer api;
+        vgww::web::RegisterApi(api, dp, cfg, path);
+        constexpr uint16_t kPort = 18147;
+        std::string start_err;
+        CHECK(api.Start("127.0.0.1", kPort, start_err));
+        std::string body;
+        CHECK(HttpGet("/api/system", kPort, body) == 200);
+        CHECK(body.find("\"driver\":\"running\"") != std::string::npos);
+        // The key set is a contract: the cache change must not add or drop
+        // keys (check-api-contract verifies the route table, this the body).
+        const auto json = nlohmann::json::parse(body, nullptr, false);
+        CHECK(!json.is_discarded());
+        if (!json.is_discarded()) {
+            CHECK(json.contains("proc"));
+            CHECK(json.contains("throughput"));
+            CHECK(json.contains("version"));
+            CHECK(json.contains("memory"));
+            CHECK(json.contains("config_path"));
+            CHECK(json.contains("uptime_s"));
+            CHECK(json.contains("driver"));
+            CHECK(json["driver"].get<std::string>() == "running");
+        }
+        api.Stop();
+    }
+    {
+        vgww::runtime::Dataplane dp(cfg);
+        dp.SetDriverServiceProbeForTest([] { return false; });
+        CHECK(!dp.GetSystem().ndisrd_service_running);
+        HttpServer api;
+        vgww::web::RegisterApi(api, dp, cfg, path);
+        constexpr uint16_t kPort = 18147;
+        std::string start_err;
+        CHECK(api.Start("127.0.0.1", kPort, start_err));
+        std::string body;
+        CHECK(HttpGet("/api/system", kPort, body) == 200);
+        CHECK(body.find("\"driver\":\"stopped\"") != std::string::npos);
+        api.Stop();
+    }
+    // (b) Without the seam the CONSTRUCTOR primes the cache from the real
+    // SCM, so a never-Started data plane still reports the machine's truth
+    // (the "initial value must be correct" requirement).
+    {
+        vgww::runtime::Dataplane dp(cfg);
+        const bool real = vgww::driver::NdisrdServiceRunning();
+        CHECK(dp.GetSystem().ndisrd_service_running == real);
+    }
+    std::remove(path);
+    std::remove(rules.c_str());
+}
+
+// batch208: HttpServer::Start must refuse a SECOND start on a live instance.
+// The old Start() unconditionally replaced io_/acceptor_ while the accept
+// thread kept running io_->run() on the OLD context (it read the member), so
+// a double Start was a use-after-free. The guard must return false, leave the
+// RUNNING server serving, and not crash.
+static void TestB208StartTwiceIsRefused() {
+    using namespace vgww::web;
+    HttpServer srv;
+    srv.Route("GET", "/api/start-twice", [](const Request&) {
+        return Response::Text("alive", 200);
+    });
+    std::string err;
+    constexpr uint16_t kPort = 18329;
+    CHECK(srv.Start("127.0.0.1", kPort, err));
+
+    // Second Start on the SAME port (the UAF trigger: it used to rebind and
+    // overwrite the members under the running accept thread).
+    std::string err2;
+    const bool second = srv.Start("127.0.0.1", kPort, err2);
+    CHECK(!second);
+    CHECK(!err2.empty());
+
+    // A different port too: the guard is about the INSTANCE being live, not
+    // about the bind colliding with itself.
+    std::string err3;
+    CHECK(!srv.Start("127.0.0.1", static_cast<uint16_t>(kPort + 1), err3));
+
+    // The ORIGINAL server must still work: the guard must not have torn the
+    // live machinery down.
+    std::string body;
+    CHECK(200 == HttpGetWithin("/api/start-twice", kPort, body, 2000));
+    CHECK("alive" == body);
+    srv.Stop();
+}
+
 // batch22 B4: privileged endpoints. Policy matrix (five cases) + autostart read
 // back + audit lines. The native effect is supplied by callbacks, so no UAC or
 // registry write happens here - the test asserts the API contract itself.
@@ -2932,6 +3170,140 @@ static void TestP107WebBindingRefusalIsAudited() {
     std::remove(path);
     std::remove(lease_path);
     // batch164: the v6 lease store is derived from the v4 path (LeaseFile6).
+    std::remove((std::string(lease_path) + ".leases6").c_str());
+}
+
+// P1: a static binding that lives in the CONFIG document (not the runtime
+// table) could never be deleted. GET /api/dhcp/bindings lists config entries
+// (StaticBindings merges them), the UI renders a delete button per row, but
+// DELETE only consulted the runtime table and answered 404 - and because the
+// 404 returned before PersistDhcpBindingV4(remove=true), the config file was
+// never cleaned either. The row was permanently undeletable.
+//
+// Asserted end to end: a config binding is listed, DELETE answers 200, the
+// next GET no longer lists it, and the config document on disk lost the row.
+// The runtime path (POST then DELETE) and the absent-key 404 stay as
+// regression guards.
+static void TestP1WebConfigBindingIsDeletable() {
+    using namespace vgww::core;
+    const char* path = "p1-cfgdel.json";
+    const char* lease_path = "p1_leases.json";
+    std::remove(path);
+    std::remove(lease_path);
+    Config cfg;
+    cfg.adapter = "P1NIC";
+    cfg.mode = Mode::kMain;
+    cfg.dhcp.enabled = true;
+    cfg.web.port = 18150;
+    cfg.web.token = "tok";
+    bool ok = false;
+    cfg.gateway.ipv4 = ParseIpv4("192.168.60.1", ok);
+    cfg.gateway.mask = ParseIpv4("255.255.255.0", ok);
+    cfg.gateway.mac = {0x30, 0xFC, 0x68, 0x88, 0xB4, 0xB1};
+    cfg.dhcp.pool_start = ParseIpv4("192.168.60.100", ok);
+    cfg.dhcp.pool_end = ParseIpv4("192.168.60.200", ok);
+    cfg.dhcp.lease_seconds = 3600;
+    cfg.ipv6.enabled = true;
+    cfg.ipv6.prefix_len = 64;
+    cfg.ipv6.ula_prefix = {0xFD, 0x00, 0x11, 0x33, 0x44, 0x55, 0x66,
+                           0x77, 0, 0, 0, 0, 0, 0, 0, 0};
+    cfg.ipv6.dhcpv6.enabled = true;
+    cfg.ipv6.dhcpv6.pool_start = {0xFD, 0x00, 0x11, 0x33, 0x44, 0x55,
+                                  0x66, 0x77, 0, 0, 0, 0, 0, 0, 0x10, 0x00};
+    cfg.ipv6.dhcpv6.pool_end = {0xFD, 0x00, 0x11, 0x33, 0x44, 0x55,
+                                0x66, 0x77, 0, 0, 0, 0, 0, 0, 0x1F, 0xFF};
+    cfg.perf.workers = 2;
+    cfg.perf.ring_capacity = 64;
+    cfg.perf.max_conns = 64;
+    // One v4 config binding and one v6 config binding, both on disk.
+    StaticBinding v4;
+    v4.mac = {0x02, 0x00, 0x00, 0x00, 0xC1, 0x01};
+    v4.ip = ParseIpv4("192.168.60.150", ok);
+    v4.hostname = "cfg-printer";
+    cfg.dhcp.static_bindings.push_back(v4);
+    Dhcp6StaticBinding v6;
+    v6.duid = {0x00, 0x03, 0x00, 0x01, 0x02, 0x00, 0x00, 0x00, 0xC1, 0x02};
+    v6.ip = {0xFD, 0x00, 0x11, 0x33, 0x44, 0x55, 0x66,
+             0x77, 0, 0, 0, 0, 0, 0, 0x15, 0x00};
+    v6.hostname = "cfg-nas6";
+    cfg.ipv6.dhcpv6.static_bindings.push_back(v6);
+    std::string err;
+    CHECK(cfg.SaveToFile(path, err));
+
+    vgww::runtime::Dataplane dp(cfg, lease_path);
+    dp.SetDriverClient(std::make_unique<WebFakeDriver>());
+    std::string start_error;
+    CHECK(dp.Start(start_error));
+    CHECK(dp.DhcpActive());
+    CHECK(dp.Dhcp6Active());
+
+    HttpServer api;
+    std::vector<std::string> audit_lines;
+    vgww::web::RegisterApi(
+        api, dp, cfg, path, "tok", {}, [] { return true; },
+        [](bool) { return false; },
+        [&audit_lines](const std::string& line) {
+            audit_lines.push_back(line);
+        });
+    constexpr uint16_t kPort = 18150;
+    CHECK(api.Start("127.0.0.1", kPort, err));
+
+    std::string body;
+    // The config binding is listed (this is what the UI renders a delete for).
+    CHECK(HttpGet("/api/dhcp/bindings", kPort, body) == 200);
+    CHECK(body.find("02:00:00:00:C1:01") != std::string::npos);
+    CHECK(HttpGet("/api/dhcp6/bindings", kPort, body) == 200);
+    CHECK(body.find("00:03:00:01:02:00:00:00:c1:02") != std::string::npos);
+
+    // DELETE of the config-managed v4 binding: 200, not 404.
+    CHECK(HttpDeleteWithToken("/api/dhcp/bindings?mac=02:00:00:00:C1:01",
+                              kPort, "tok", body) == 200);
+    // The list no longer shows it (the in-memory view was synced).
+    CHECK(HttpGet("/api/dhcp/bindings", kPort, body) == 200);
+    CHECK(body.find("02:00:00:00:C1:01") == std::string::npos);
+    // The config document on disk lost the row too.
+    {
+        std::string load_err;
+        const auto disk = Config::LoadFromFile(path, load_err);
+        CHECK(disk.has_value());
+        if (disk) {
+            CHECK(disk->dhcp.static_bindings.empty());
+        }
+    }
+
+    // Same for the v6 config binding.
+    CHECK(HttpDeleteWithToken(
+              "/api/dhcp6/bindings?duid=00:03:00:01:02:00:00:00:c1:02",
+              kPort, "tok", body) == 200);
+    CHECK(HttpGet("/api/dhcp6/bindings", kPort, body) == 200);
+    CHECK(body.find("00:03:00:01:02:00:00:00:c1:02") == std::string::npos);
+    {
+        std::string load_err;
+        const auto disk = Config::LoadFromFile(path, load_err);
+        CHECK(disk.has_value());
+        if (disk) {
+            CHECK(disk->ipv6.dhcpv6.static_bindings.empty());
+        }
+    }
+
+    // Regression: a runtime binding (POST) is still deletable.
+    CHECK(HttpPost(kPort, "/api/dhcp/bindings", "tok",
+                   R"({"mac":"02:00:00:00:C1:03","ip":"192.168.60.151"})",
+                   body) == 200);
+    CHECK(HttpDeleteWithToken("/api/dhcp/bindings?mac=02:00:00:00:C1:03",
+                              kPort, "tok", body) == 200);
+    // Regression: an absent key is still a 404.
+    CHECK(HttpDeleteWithToken("/api/dhcp/bindings?mac=02:00:00:00:C1:99",
+                              kPort, "tok", body) == 404);
+    CHECK(HttpDeleteWithToken(
+              "/api/dhcp6/bindings?duid=00:03:00:01:02:00:00:00:c1:99",
+              kPort, "tok", body) == 404);
+
+    api.Stop();
+    std::string stop_error;
+    CHECK(dp.Stop(stop_error));
+    std::remove(path);
+    std::remove(lease_path);
     std::remove((std::string(lease_path) + ".leases6").c_str());
 }
 
@@ -5196,6 +5568,154 @@ static void TestB34rQueryTokenIsNotAccepted() {
     std::printf("b34r header-token: status=%d\n", via_header);
     CHECK(200 == via_header);
     srv.Stop();
+}
+
+// batch207: the WebUI settings page has to answer "is this token right?"
+// BEFORE it stores the token and announces success. The only thing that
+// decides whether a token is accepted is the global write guard, and it runs
+// only for non-GET/HEAD requests - so the page used to probe with
+// GET /api/config, which is deliberately unauthenticated (the page itself
+// must load before any token is known). Every typo therefore passed the probe
+// and was stored, and the operator only found out later from a page full of
+// 401s. POST /api/auth/verify exists for exactly this question: the guard
+// answers before the handler runs, so a wrong token is 401 with no state
+// change, and the endpoint itself has no side effects.
+static void TestB207AuthVerifyProbeIsGuarded() {
+    using namespace vgww::core;
+    const char* path = "b207-auth-verify.json";
+    const std::string rules = std::string(path) + ".rules.json";
+    std::remove(path);
+    std::remove(rules.c_str());
+    Config cfg;
+    cfg.web.port = 18327;
+    bool ok = false;
+    cfg.gateway.ipv4 = ParseIpv4("192.168.0.40", ok);
+    cfg.gateway.mask = ParseIpv4("255.255.255.0", ok);
+    MacAddress mac{};
+    ParseMac("30:fc:68:88:b4:a9", mac);
+    cfg.gateway.mac = mac;
+    cfg.web.token = "secret";
+    std::string err;
+    CHECK(cfg.SaveToFile(path, err));
+
+    const auto read_file = [](const char* p) {
+        std::ifstream in(p, std::ios::binary);
+        std::ostringstream out;
+        out << in.rdbuf();
+        return out.str();
+    };
+
+    // One raw POST carrying an arbitrary header block, so the X-Auth-Token and
+    // the Bearer form are both expressed the way a client would send them.
+    const auto post_with = [](uint16_t port, const std::string& extra_headers,
+                              std::string& body) {
+        std::string text;
+        const int status = HttpRawFull(
+            port,
+            "POST /api/auth/verify HTTP/1.1\r\nHost: t\r\n"
+            "Content-Length: 0\r\n" +
+                extra_headers + "Connection: close\r\n\r\n",
+            text);
+        const size_t at = text.find("\r\n\r\n");
+        body = (std::string::npos == at) ? std::string() : text.substr(at + 4);
+        return status;
+    };
+
+    // --- a credential IS configured: the guard decides. ---
+    {
+        const std::string before = read_file(path);
+        vgww::runtime::Dataplane dp(cfg);
+        HttpServer api;
+        std::string audit;
+        vgww::web::RegisterApi(api, dp, cfg, path, /*auth_token=*/"secret", {},
+                               {}, {}, [&audit](const std::string& l) {
+                                   audit += l + "\n";
+                               },
+                               [](const Config&, uint64_t) { return true; });
+        std::string se;
+        CHECK(api.Start("127.0.0.1", 18327, se));
+        std::string body;
+
+        // The defect itself: a GET is NOT authenticated, which is why probing
+        // with GET /api/config could never prove anything.
+        CHECK(HttpGet("/api/config", 18327, body) == 200);
+
+        // Correct token -> 200 and the documented JSON answer.
+        const int good = post_with(18327, "X-Auth-Token: secret\r\n", body);
+        std::printf("b207 verify(good x-auth-token): status=%d body=[%s]\n",
+                    good, body.c_str());
+        CHECK(good == 200);
+        CHECK(body.find("\"ok\":true") != std::string::npos);
+
+        // Bearer form is accepted exactly like X-Auth-Token.
+        CHECK(post_with(18327, "Authorization: Bearer secret\r\n", body) ==
+              200);
+        CHECK(body.find("\"ok\":true") != std::string::npos);
+
+        // The exact wire shape api() produces: fetch(path, {method:"POST"}) has
+        // no body, so no Content-Length field at all. The server must frame it
+        // as an empty body and still run the guard.
+        {
+            std::string text;
+            const int bare = HttpRawFull(
+                18327,
+                "POST /api/auth/verify HTTP/1.1\r\nHost: t\r\n"
+                "X-Auth-Token: secret\r\nConnection: close\r\n\r\n",
+                text);
+            const size_t at = text.find("\r\n\r\n");
+            const std::string b =
+                (std::string::npos == at) ? std::string() : text.substr(at + 4);
+            std::printf("b207 verify(no content-length): status=%d body=[%s]\n",
+                        bare, b.c_str());
+            CHECK(bare == 200);
+            CHECK(b.find("\"ok\":true") != std::string::npos);
+        }
+
+        // Wrong token -> 401 from the guard, and the refusal is audited the
+        // same way every other guard refusal is.
+        CHECK(post_with(18327, "X-Auth-Token: wrong\r\n", body) == 401);
+        CHECK(body.find("unauthorized") != std::string::npos);
+        CHECK(audit.find("request refused (unauthorized: invalid token)") !=
+              std::string::npos);
+
+        // No credential presented at all -> 401, not 200.
+        CHECK(post_with(18327, "", body) == 401);
+
+        // The probe must not be a disguised write: the persisted configuration
+        // is byte-identical after every call above.
+        CHECK(read_file(path) == before);
+
+        api.Stop();
+    }
+
+    // --- no credential configured: the guard passes everything through, which
+    //     is the same semantics every other write route already has
+    //     (web_api.cpp 2275-2277). ---
+    {
+        const char* path2 = "b207-auth-verify-empty.json";
+        const std::string rules2 = std::string(path2) + ".rules.json";
+        std::remove(path2);
+        std::remove(rules2.c_str());
+        Config cfg2 = cfg;
+        cfg2.web.port = 18328;
+        cfg2.web.token.clear();
+        CHECK(cfg2.SaveToFile(path2, err));
+        vgww::runtime::Dataplane dp(cfg2);
+        HttpServer api2;
+        vgww::web::RegisterApi(api2, dp, cfg2, path2, /*auth_token=*/{}, {},
+                               {}, {}, {});
+        std::string se;
+        CHECK(api2.Start("127.0.0.1", 18328, se));
+        std::string body;
+        CHECK(post_with(18328, "", body) == 200);
+        CHECK(body.find("\"ok\":true") != std::string::npos);
+        api2.Stop();
+        std::remove(path2);
+        std::remove(rules2.c_str());
+    }
+
+    std::remove(path);
+    std::remove(rules.c_str());
 }
 
 // Two independent input boundaries, asserted together because both are
@@ -10012,6 +10532,7 @@ int main(int argc, char** argv) {
     TestP123WebConfigMergeMatchesDuidByValue();
     TestP124WebConfigV6BindingCapRefusalIsAudited();
     TestP107WebBindingRefusalIsAudited();
+    TestP1WebConfigBindingIsDeletable();
     TestP113WebRuleAddRefusalIsAudited();
     TestB126WebConsoleReportsDropped();
     TestB127StatusContractKeys();
@@ -10021,6 +10542,10 @@ int main(int argc, char** argv) {
     TestB2LeaseEndpointsShape();
     TestB5SystemIdentityFields();
     TestB1ConsoleEndpointFiltersTokens();
+    TestB208EmptyConsoleCountsZero();
+    TestB208ConsoleKeepsTokenWordsButDropsCredentials();
+    TestB208SystemDriverStateComesFromCache();
+    TestB208StartTwiceIsRefused();
     TestB4PrivilegedEndpoints();
     TestB34oCorruptRuleFileIsNotSilentEmpty();
     TestB83CorruptRulesFilePreserved();
@@ -10047,6 +10572,7 @@ int main(int argc, char** argv) {
     TestB34rTokenCompareIsConstantTime();
     TestB34rEmptyTokenNeverDisablesAuth();
     TestB34rQueryTokenIsNotAccepted();
+    TestB207AuthVerifyProbeIsGuarded();
     TestB34rBodyCapAndTraversal();
     TestB138DeleteIsByIdentityNotPosition();
     TestB141LoadedBanIpIsCanonical();

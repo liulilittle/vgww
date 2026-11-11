@@ -8,6 +8,7 @@
 
 #include "dsp/classifier.h"
 #include "dsp/spsc_ring.h"
+#include "driver/installer.h"
 #include "driver/ndisrd_client.h"
 #include "core/handler_guard.h"
 #include "net/eth.h"
@@ -162,6 +163,25 @@ namespace vgww {
                 : config(cfg), lease_file(lease_path) {
                 backend.owner = this;
                 stats = &owned_stats;
+                // batch208: prime the cache once so /api/system reports the
+                // TRUE service state even when the sampling thread never runs
+                // (the data plane may not be Started, or Start may fail).
+                SampleDriverService();
+            }
+
+            /// batch208: refresh the cached ndisrd service state. Runs on the
+            /// control thread's 1 s cadence and once at construction; the
+            /// test seam, when installed, replaces the SCM query.
+            void SampleDriverService() noexcept {
+                bool is_running = false;
+                try {
+                    is_running = driver_service_probe_
+                                     ? driver_service_probe_()
+                                     : driver::NdisrdServiceRunning();
+                } catch (...) {
+                    is_running = false;
+                }
+                ndisrd_service_running_.store(is_running);
             }
 
             const core::Config& config;
@@ -216,6 +236,13 @@ namespace vgww {
             std::atomic<uint32_t> sys_cpu_cores_{0};
             std::atomic<uint64_t> sys_proc_ws_bytes_{0};
             std::atomic<uint64_t> sys_proc_virt_bytes_{0};
+            /// batch208: ndisrd service state, sampled by the control thread
+            /// once per second (and once in the constructor) so the WebUI's
+            /// /api/system never performs an SCM round-trip per request.
+            std::atomic<bool> ndisrd_service_running_{false};
+            /// batch208 test seam: overrides the SCM query above. Empty in
+            /// production (the real NdisrdServiceRunning is used).
+            std::function<bool()> driver_service_probe_;
 
             Backend backend;
 
@@ -3541,6 +3568,9 @@ namespace vgww {
                 SYSTEM_INFO si{};
                 GetSystemInfo(&si);
                 sys_cpu_cores_.store(si.dwNumberOfProcessors);
+                // batch208: the WebUI's /api/system reads this cache instead
+                // of opening the SCM on every poll.
+                SampleDriverService();
             }
 
             void ControlLoop() {
@@ -4001,54 +4031,21 @@ namespace vgww {
             const double window_s = snapshot->window_s;
             auto neigh = impl_->neighbors.Snapshot();
             const auto now = std::chrono::steady_clock::now();
-            const uint32_t gw = impl_->config.gateway.ipv4;
-            const uint32_t mask = impl_->config.gateway.mask;
             out.reserve(neigh->Entries().size());
             for (const auto& [ip, entry] : neigh->Entries()) {
                 // Only clients on the gateway's own LAN are real devices
                 // behind it. The neighbor table also records WAN-side sources
                 // (host passthrough / Hyper-V vEthernet traffic), which are
                 // internal to this machine and never shown on the device list.
-                if (ip.IsV4()) {
-                    uint8_t wire[4];
-                    ip.ToV4Wire(wire);
-                    const uint32_t host_ip =
-                        static_cast<uint32_t>(wire[0]) |
-                        (static_cast<uint32_t>(wire[1]) << 8) |
-                        (static_cast<uint32_t>(wire[2]) << 16) |
-                        (static_cast<uint32_t>(wire[3]) << 24);
-                    if ((host_ip & mask) != (gw & mask)) {
-                        continue;  // not on the gateway's LAN segment
-                    }
-                } else {
-                    // v6 clients are kept only when they sit inside the ULA
-                    // prefix RA advertises (SLAAC clients).
-                    if (!impl_->config.ipv6.enabled ||
-                        impl_->config.ipv6.prefix_len > 64) {
-                        continue;
-                    }
-                    const auto& pfx = impl_->config.ipv6.ula_prefix;
-                    const uint32_t len = impl_->config.ipv6.prefix_len;
-                    bool in_prefix = true;
-                    for (uint32_t i = 0; i < len / 8 && in_prefix; ++i) {
-                        if (pfx[i] != ip.bytes[i]) in_prefix = false;
-                    }
-                    if (in_prefix && (len % 8) != 0) {
-                        const uint32_t rem = len % 8;
-                        const uint8_t keep = static_cast<uint8_t>(
-                            0xFFu << (8 - rem));
-                        if ((pfx[len / 8] & keep) !=
-                            (ip.bytes[len / 8] & keep)) {
-                            in_prefix = false;
-                        }
-                    }
-                    if (!in_prefix) {
-                        continue;
-                    }
+                // The SAME predicate reports the per-client `lan` flag below,
+                // so the filter and the flag can never disagree (C6).
+                if (!IsLanClientAddress(impl_->config, ip)) {
+                    continue;
                 }
                 ClientRate rate;
                 rate.ip = ip;
                 rate.mac = entry.mac;
+                rate.lan = true;  // IsLanClientAddress() just proved it
                 rate.last_seen_s = static_cast<uint64_t>(
                     std::chrono::duration_cast<std::chrono::seconds>(
                         now - entry.last_seen)
@@ -4098,7 +4095,18 @@ namespace vgww {
             s.cpu_cores = impl_->sys_cpu_cores_.load();
             s.proc_ws_bytes = impl_->sys_proc_ws_bytes_.load();
             s.proc_virt_bytes = impl_->sys_proc_virt_bytes_.load();
+            s.ndisrd_service_running = impl_->ndisrd_service_running_.load();
             return s;
+        }
+
+        void Dataplane::SetDriverServiceProbeForTest(std::function<bool()> probe) {
+            if (!impl_) {
+                return;
+            }
+            impl_->driver_service_probe_ = std::move(probe);
+            // Re-sample so the cache reflects the injected value right away
+            // (a headless test may never Start() the data plane).
+            impl_->SampleDriverService();
         }
 
         // ------------------------------------------------------------------
@@ -4318,6 +4326,46 @@ namespace vgww {
         // safe when no v6 server was assembled (bypass / ipv6 off / dhcpv6
         // off) and degrades to an empty or false result.
         // ------------------------------------------------------------------
+        // P2: the ONE definition of "is this address on the gateway's own LAN".
+        // The device list filters on it and ClientRate.lan reports it, so the
+        // two can never disagree (C6). v4: inside gateway.ipv4/mask. v6: inside
+        // the advertised ULA prefix (and only when IPv6 is on).
+        bool IsLanClientAddress(const core::Config& config,
+                                const net::IpAddress& ip) noexcept {
+            if (ip.IsV4()) {
+                uint8_t wire[4];
+                ip.ToV4Wire(wire);
+                const uint32_t host_ip =
+                    static_cast<uint32_t>(wire[0]) |
+                    (static_cast<uint32_t>(wire[1]) << 8) |
+                    (static_cast<uint32_t>(wire[2]) << 16) |
+                    (static_cast<uint32_t>(wire[3]) << 24);
+                return (host_ip & config.gateway.mask) ==
+                       (config.gateway.ipv4 & config.gateway.mask);
+            }
+            // v6 clients are LAN clients only when they sit inside the ULA
+            // prefix RA advertises (SLAAC clients).
+            if (!config.ipv6.enabled || config.ipv6.prefix_len > 64) {
+                return false;
+            }
+            const auto& pfx = config.ipv6.ula_prefix;
+            const uint32_t len = config.ipv6.prefix_len;
+            for (uint32_t i = 0; i < len / 8; ++i) {
+                if (pfx[i] != ip.bytes[i]) {
+                    return false;
+                }
+            }
+            if ((len % 8) != 0) {
+                const uint32_t rem = len % 8;
+                const uint8_t keep =
+                    static_cast<uint8_t>(0xFFu << (8 - rem));
+                if ((pfx[len / 8] & keep) != (ip.bytes[len / 8] & keep)) {
+                    return false;
+                }
+            }
+            return true;
+        }
+
         // batch142: these two are declared in dataplane.h so the REST layer can
         // compare DUIDs by value instead of by spelling.
         /// DUID <-> colon-separated hex (WebUI surface).

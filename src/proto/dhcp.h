@@ -255,7 +255,11 @@ namespace vgww {
             std::vector<StaticView> StaticBindings() const;
 
         private:
-            const core::Config& config_;
+            /// A COPY of the config, not a reference: RemoveBinding must be
+            /// able to drop a config-managed static binding from the live
+            /// view, and the caller's config object is const. Mirrors the
+            /// DHCPv6 server, which has always held a copy.
+            core::Config config_;
             std::mutex mutex_;
             std::unordered_map<net::WireMac, Lease, net::WireMacHash> leases_;
             uint32_t next_dynamic_ = 0;  ///< pool cursor (host order)

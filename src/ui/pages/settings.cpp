@@ -1608,15 +1608,25 @@ void SettingsPage::RefreshDirty() {
                 // (controls != what we wrote) still blocks the overwrite.
                 // RefreshDirty() already uses exactly this baseline.
                 const bool user_edited = initialized_ && !ReadDraft().Equals(applied_);
+                // batch330: captured before initialized_ is set below, because
+                // the UI-scale refresh must obey the exact same gate: it rewrites
+                // the select (and the auto-display flags) from the snapshot, so
+                // running it during an unsaved edit silently reverted an
+                // explicit pick on the next tick. ReadDraft() then matched
+                // applied_ again, the "unsaved" badge disappeared and Save
+                // persisted the stale value.
+                const bool mirror_snapshot = !initialized_ || !user_edited;
                 applied_ = from_snapshot;
-                if (!initialized_ || !user_edited) {
+                if (mirror_snapshot) {
                     // No unsaved edits: mirror the newest snapshot.
                     FillControls(applied_);
                     initialized_ = true;
                 }
                 // batch20: "auto" shows the nearest percent of the EFFECTIVE
-                // scale (the desktop scale while auto is in force).
-                if (ui_scale_ != nullptr) {
+                // scale (the desktop scale while auto is in force). batch330:
+                // only while the form mirrors the snapshot - a user pick is
+                // authoritative and must survive every following tick.
+                if (ui_scale_ != nullptr && mirror_snapshot) {
                     std::wstring token = applied_.ui_scale;
                     ui_scale_auto_display_ = (token == L"auto");
                     if (ui_scale_auto_display_) {

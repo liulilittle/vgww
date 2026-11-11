@@ -2315,6 +2315,115 @@ namespace {
         CHECK(dataplane.Stop(stop_error));
     }
 
+    /// P2: `/api/clients` reported `lan:true` for EVERY client because the
+    /// field was never assigned (dataplane.h defaulted it to true and no
+    /// production code wrote it). The WebUI's WAN filter (`!isLan`) therefore
+    /// always produced an empty table.
+    ///
+    /// The device list itself only ever contains LAN-side neighbours (the
+    /// ClientRates() loop drops everything else), so the `false` branch is
+    /// unreachable THROUGH ClientRates(). The rule is therefore exposed as
+    /// IsLanClientAddress() - the single source of truth the filter and the
+    /// flag both use - and asserted directly for BOTH verdicts, plus end to
+    /// end through ClientRates() for the reachable (LAN) case.
+    void RunClientLanFlagScenario() {
+        vgww::core::Config config;
+        config.adapter = "TestNIC";
+        bool ok = false;
+        config.gateway.ipv4 = vgww::core::ParseIpv4("192.168.0.40", ok);
+        CHECK(ok);
+        config.gateway.mask = vgww::core::ParseIpv4("255.255.255.0", ok);
+        CHECK(ok);
+        config.gateway.mac = kGatewayMac;
+        config.ipv6.enabled = true;
+        config.ipv6.prefix_len = 64;
+        config.ipv6.ula_prefix = {0xFD, 0x00, 0x11, 0x22, 0x33, 0x44, 0x55,
+                                  0x66, 0, 0, 0, 0, 0, 0, 0, 0};
+        config.perf.workers = 1;
+        config.perf.max_conns = 64;
+
+        const auto v4 = [&ok](const char* text) {
+            return vgww::net::IpAddress::FromV4NetOrder(
+                vgww::core::ParseIpv4(text, ok));
+        };
+
+        // --- the predicate, both verdicts (the false branch is unreachable
+        // through ClientRates(), so it is asserted here directly) ---
+        // v4 inside the /24.
+        CHECK(vgww::runtime::IsLanClientAddress(config, v4("192.168.0.101")));
+        // v4 outside the /24 (a WAN-side source).
+        CHECK(!vgww::runtime::IsLanClientAddress(config, v4("93.184.216.34")));
+        // v6 inside the ULA prefix.
+        {
+            std::array<uint8_t, 16> in = config.ipv6.ula_prefix;
+            in[15] = 0x42;
+            CHECK(vgww::runtime::IsLanClientAddress(
+                config, vgww::net::IpAddress::FromV6(in.data())));
+        }
+        // v6 outside the ULA prefix (a global address).
+        {
+            std::array<uint8_t, 16> out{};
+            out[0] = 0x20;
+            out[1] = 0x01;  // 2001::/16, not the ULA
+            out[15] = 0x42;
+            CHECK(!vgww::runtime::IsLanClientAddress(
+                config, vgww::net::IpAddress::FromV6(out.data())));
+        }
+        // v6 with IPv6 disabled: never a LAN client.
+        {
+            vgww::core::Config off = config;
+            off.ipv6.enabled = false;
+            std::array<uint8_t, 16> in = config.ipv6.ula_prefix;
+            in[15] = 0x42;
+            CHECK(!vgww::runtime::IsLanClientAddress(
+                off, vgww::net::IpAddress::FromV6(in.data())));
+        }
+
+        // --- end to end: a LAN client's ClientRate.lan is true ---
+        // The struct default is FALSE (a client is not LAN until proven), so
+        // the assertion below can only pass if ClientRates() actually ASSIGNS
+        // the flag - an unassigned field would read false and fail. This is
+        // what makes the test discriminate "assigned" from "defaulted".
+        {
+            vgww::runtime::Dataplane::ClientRate fresh;
+            CHECK(!fresh.lan);
+        }
+        auto fake = std::make_unique<TestDriverClient>();
+        TestDriverClient* raw = fake.get();
+        vgww::runtime::Dataplane dataplane(config);
+        dataplane.SetDriverClient(std::move(fake));
+        std::string start_error;
+        CHECK(dataplane.Start(start_error));
+
+        // An ARP from the LAN client teaches the neighbour table; the control
+        // thread publishes it on its next tick.
+        raw->ScriptInbound(BuildArpRequest(), 0);
+        CHECK(WaitFor(
+            [&] {
+                const auto rates = dataplane.ClientRates();
+                for (const auto& r : rates) {
+                    if (r.mac == kClientMac) {
+                        return true;
+                    }
+                }
+                return false;
+            },
+            5000));
+
+        bool saw_client = false;
+        for (const auto& r : dataplane.ClientRates()) {
+            if (r.mac == kClientMac) {
+                saw_client = true;
+                // The reachable branch: a LAN client is reported as LAN.
+                CHECK(r.lan);
+            }
+        }
+        CHECK(saw_client);
+
+        std::string stop_error;
+        CHECK(dataplane.Stop(stop_error));
+    }
+
     /// batch34p: when the RX ring is full, the frame is DROPPED - and that
     /// drop must be COUNTED. The TX path already does this
     /// (dataplane.cpp:1900-1904: Push() false -> ++stats->rx_dropped), but the
@@ -2424,6 +2533,7 @@ int main() {
     RunHostOriginatedScenario();
     RunRxRingOverflowCountedScenario();
     RunRateTableBoundedUnderForgedMacFloodScenario();
+    RunClientLanFlagScenario();
     vgww::core::Config config;
     config.adapter = "TestNIC";
     config.gateway.ipv4 = kGatewayIp;

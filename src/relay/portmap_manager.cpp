@@ -197,8 +197,32 @@ namespace vgww {
                                 !it->second.established) {
                                 continue;
                             }
-                            it->second.pending.emplace_back(std::move(payload));
-                            PumpOne(conn_id, it->second);
+                            // P1: the 64-packet `data_queue_` bound is
+                            // transient (this loop empties it every pass), so
+                            // it never applied to the per-relay queue that
+                            // actually backs up behind a stalled WAN write.
+                            // Enforce the byte bound HERE, at the hand-off:
+                            // over it the packet is dropped and counted, so a
+                            // remote peer that simply stops reading can no
+                            // longer drive an unbounded allocation.
+                            Relay& relay = it->second;
+                            if (relay.pending_bytes + payload.size() >
+                                kMaxPendingBytes) {
+                                pending_dropped_.fetch_add(
+                                    1, std::memory_order_relaxed);
+                                continue;
+                            }
+                            relay.pending_bytes += payload.size();
+                            const size_t depth = relay.pending_bytes;
+                            relay.pending.emplace_back(std::move(payload));
+                            uint64_t peak = peak_pending_bytes_.load(
+                                std::memory_order_relaxed);
+                            while (peak < depth &&
+                                   !peak_pending_bytes_.compare_exchange_weak(
+                                       peak, depth,
+                                       std::memory_order_relaxed)) {
+                            }
+                            PumpOne(conn_id, relay);
                         }
                     }
 
@@ -459,8 +483,14 @@ namespace vgww {
                 return;
             }
             auto& chunk = relay.pending.front();
+            // P1: read the size BEFORE the move - a moved-from vector's size()
+            // is unspecified, and the byte accounting must mirror the enqueue
+            // exactly or `pending_bytes` only ever grows and the cap above
+            // permanently refuses every later packet on this relay.
+            const size_t chunk_bytes = chunk.size();
             auto buffer = std::make_shared<core::PoolVector<uint8_t>>(std::move(chunk));
             relay.pending.pop_front();
+            relay.pending_bytes -= chunk_bytes;
             // C1: one composed async_write at a time per socket (asio forbids
             // concurrent composed ops on the same socket). While a write is
             // in flight the rest of the queue waits in `pending`; the write
