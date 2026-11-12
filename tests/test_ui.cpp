@@ -7899,6 +7899,144 @@ static void TestW11SavePostRefusalKeepsDraft() {
     controller.Stop();
 }
 
+// batchW11: a refused SetAutostartCmd (worker blocked + 64-slot backpressure)
+// must not leave the About checkbox showing a state the system never accepted.
+// The old on_changed set autostart_awaiting_=true and discarded the
+// SubmitCommand result; a refused Post produces no CommandResult, so
+// OnCommandFailed never runs and there is no other refresh source. The fix
+// rolls the checkbox back to the registry truth in place on !posted.
+static void TestW11AutostartPostRefusalKeepsRegistryTruth() {
+    using namespace vgww::ui;
+    FixTextMetrics();
+    I18n::Instance().SetLang(Lang::ZhCN);
+
+    // Gate blocks only the first command; SetAutostartCmd is recorded but
+    // never reaches tray::SetAutostart, so IsAutostartEnabled() stays fixed.
+    class GatedAutostartExecutor final : public vgww::ui::CommandExecutor {
+    public:
+        vgww::ui::CommandResult Execute(const vgww::ui::Command& cmd) override {
+            if (const auto* c =
+                    std::get_if<vgww::ui::SetAutostartCmd>(&cmd)) {
+                last_enabled.store(c->enabled, std::memory_order_release);
+                autostart_count.fetch_add(1, std::memory_order_release);
+            }
+            executed.fetch_add(1, std::memory_order_release);
+            if (!claimed.exchange(true, std::memory_order_acq_rel)) {
+                entered.store(true, std::memory_order_release);
+                while (!release.load(std::memory_order_acquire)) {
+                    std::this_thread::sleep_for(std::chrono::milliseconds(1));
+                }
+            }
+            return vgww::ui::CommandResult{true, L"ok"};
+        }
+        std::atomic<bool> claimed{false};
+        std::atomic<bool> entered{false};
+        std::atomic<bool> release{false};
+        std::atomic<int> executed{0};
+        std::atomic<int> autostart_count{0};
+        std::atomic<bool> last_enabled{false};
+    };
+
+    ShellFakeSource source;
+    GatedAutostartExecutor executor;
+    UiController controller(source, executor);
+    std::string error;
+    CHECK(controller.Start(error));
+
+    UiSnapshot snapshot = MakeRulesSnapshot(1, 1);
+    snapshot.driver_running = true;
+    UiApp app;
+    app.Compose(controller, snapshot);
+    app.root().Arrange({0.0f, 0.0f, 1280.0f, 1000.0f});
+    app.router().Navigate("about");
+    app.Update(snapshot);
+    app.root().Arrange({0.0f, 0.0f, 1280.0f, 1000.0f});
+
+    const bool real = tray::IsAutostartEnabled();
+    auto* autostart = dynamic_cast<Checkbox*>(
+        FindById(app.root(), "about.autostart"));
+    CHECK(autostart != nullptr);
+    if (autostart == nullptr) {
+        executor.release.store(true, std::memory_order_release);
+        controller.Stop();
+        return;
+    }
+    CHECK(autostart->checked == real);
+
+    // Fill the 64-slot queue: one command executes (and blocks), 64 pending.
+    CHECK(controller.Post(Command{AddBanCmd{"mac", "gate"}}));
+    const auto deadline = std::chrono::steady_clock::now() +
+                          std::chrono::seconds(3);
+    while (!executor.entered.load(std::memory_order_acquire) &&
+           std::chrono::steady_clock::now() < deadline) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(2));
+    }
+    CHECK(executor.entered.load(std::memory_order_acquire));
+    for (int i = 0; i < 64; ++i) {
+        CHECK(controller.Post(
+            Command{AddBanCmd{"mac", "q" + std::to_string(i)}}));
+    }
+    CHECK(!controller.Post(Command{AddBanCmd{"mac", "fill-check"}}));
+    CHECK(executor.autostart_count.load(std::memory_order_acquire) == 0);
+    app.toasts().Clear();
+
+    // ---- Click against a full queue: the post is refused. ----
+    const bool requested = !real;
+    const std::size_t toast_base = app.toasts().active_count();
+    ClickElement(*autostart);
+    app.root().Arrange({0.0f, 0.0f, 1280.0f, 1000.0f});
+
+    // (1) No SetAutostartCmd reached the worker: the post was refused.
+    CHECK(executor.autostart_count.load(std::memory_order_acquire) == 0);
+    // (2) The checkbox must roll back to the registry truth in place, not
+    //     stay at the user's optimistic toggle. Red: discarded Post result.
+    CHECK(autostart->checked == real);
+    CHECK(autostart->checked != requested);
+    // (3) SubmitCommand still surfaces the busy toast on refusal.
+    CHECK(app.toasts().active_count() > toast_base);
+
+    // (5) A refused Post must not arm autostart_awaiting_. The flag's
+    //     only observable effect: with no armed flag, OnCommandFailed() is a
+    //     no-op and a manually set display value survives. Red: the old code
+    //     armed the flag before a refused Post, so OnCommandFailed() clobbers
+    //     the display value back to real.
+    Page* about_page = app.router().current();
+    CHECK(about_page != nullptr);
+    if (about_page != nullptr) {
+        autostart->checked = !real;
+        about_page->OnCommandFailed();
+        CHECK(autostart->checked == !real);
+        autostart->checked = real;
+    }
+
+    // ---- Release the queue; a fresh click must post with the expected value. ----
+    executor.release.store(true, std::memory_order_release);
+    const auto drain_deadline = std::chrono::steady_clock::now() +
+                                std::chrono::seconds(3);
+    while (executor.executed.load(std::memory_order_acquire) < 65 &&
+           std::chrono::steady_clock::now() < drain_deadline) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(2));
+    }
+    CHECK(executor.executed.load(std::memory_order_acquire) >= 65);
+    CHECK(executor.autostart_count.load(std::memory_order_acquire) == 0);
+
+    // The checkbox is back at real; a real click requests !real.
+    CHECK(autostart->checked == real);
+    ClickElement(*autostart);
+    const auto retry_deadline = std::chrono::steady_clock::now() +
+                                std::chrono::seconds(3);
+    while (executor.autostart_count.load(std::memory_order_acquire) < 1 &&
+           std::chrono::steady_clock::now() < retry_deadline) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(2));
+    }
+    // (4) The retry posts exactly one SetAutostartCmd carrying !real.
+    CHECK(executor.autostart_count.load(std::memory_order_acquire) == 1);
+    CHECK(executor.last_enabled.load(std::memory_order_acquire) == !real);
+
+    controller.Stop();
+    I18n::Instance().SetLang(Lang::ZhCN);
+}
+
 static void TestPageUtilNarrow() {
     using namespace vgww::ui;
     // S6 migration guard: Narrow is defined out-of-line in page_util.cpp but
@@ -36922,6 +37060,7 @@ int main() {
     TestBusyToastOnFullQueue();
     TestP108QueueRefusalIsAudited();
     TestW11SavePostRefusalKeepsDraft();
+    TestW11AutostartPostRefusalKeepsRegistryTruth();
     TestPageUtilNarrow();
     TestTextInputMouseCaret();
     TestM7CaretPrefixWidthCache();

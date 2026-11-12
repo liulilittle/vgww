@@ -197,8 +197,14 @@ namespace vgww {
                 autostart_ = static_cast<Checkbox*>(row->Add(std::move(box)));
                 autostart_->on_changed = [this](bool enabled) {
                     if (ctx_ != nullptr && ctx_->controller != nullptr) {
-                        autostart_awaiting_ = true;
-                        SubmitCommand(*ctx_, Command{SetAutostartCmd{enabled}});
+                        const bool posted = SubmitCommand(
+                            *ctx_, Command{SetAutostartCmd{enabled}});
+                        if (posted) {
+                            autostart_awaiting_ = true;
+                        } else {
+                            autostart_->SetChecked(
+                                vgww::ui::tray::IsAutostartEnabled());
+                        }
                     }
                 };
                 host.Add(std::move(row));
