@@ -241,16 +241,53 @@ namespace vgww {
             /// Retire stale SCM registrations (default: the real
             /// CleanupLegacyServiceRegistration; additive V2 seam so the
             /// full headless success test can keep zero real-SCM contact).
-            std::function<void()> cleanup_legacy_service;
+            /// Returns false + a reason when the registration could not be
+            /// removed: a dead SERVICE_KERNEL_DRIVER cannot coexist with the
+            /// NDIS-bound LWF, so the install must report that instead of
+            /// letting pnputil/INetCfg fail later with an unrelated error.
+            std::function<bool(std::wstring&)> cleanup_legacy_service;
         };
+
+        /// `<windows_dir>\System32\drivers`. An EMPTY input yields an EMPTY
+        /// path: the caller must skip the filesystem work instead of letting
+        /// `path(L"")/"System32"/"drivers"` degrade into a RELATIVE path that
+        /// resolves against the current working directory (a failed
+        /// GetWindowsDirectoryW used to do exactly that, so the System32
+        /// cleanup could delete an unrelated same-named file under the CWD).
+        std::filesystem::path MakeSystemDriversDir(
+            const std::wstring& windows_dir);
+
+        /// Real implementation of UninstallHooks::remove_system32_copy.
+        /// `windows_dir` overrides the GetWindowsDirectoryW result so the
+        /// headless suite can drive the resolution-failure branch (empty
+        /// string = the query failed); nullptr queries the real OS. An
+        /// unresolved directory is REPORTED and skipped, never probed
+        /// relatively.
+        bool RemoveSystem32CopyReal(std::wstring& error,
+                                    const std::wstring* windows_dir = nullptr);
+
+        /// True only when a GetEnvironmentVariableW call captured the value
+        /// into a MAX_PATH buffer: 0 means "not defined" and a value
+        /// >= MAX_PATH means the buffer was too small (the API then returns
+        /// the REQUIRED length and leaves the buffer contents undefined).
+        /// Both cases must be treated as failure - the old code only checked
+        /// for 0 and could build a path from uninitialized/partial text.
+        bool EnvValueFitsBuffer(DWORD returned_length);
+
+        /// `<program_data>\VGWW`, or an EMPTY path when `program_data` is
+        /// empty (the environment query failed), so no relative path is ever
+        /// used to locate or delete a file.
+        std::filesystem::path MakeProgramDataPath(
+            const std::wstring& program_data);
 
         /// Injection seams for the uninstall path (batch16 F4/F7). Empty
         /// members run the real implementation. The remover hooks return
         /// false + a reason; failures are reported as residuals.
         struct UninstallHooks {
             /// SCM legacy-service cleanup (default: real DeleteService
-            /// path).
-            std::function<void()> cleanup_legacy_service;
+            /// path). Returns false + a reason when the stale registration
+            /// could not be retired; the uninstall reports it as a residual.
+            std::function<bool(std::wstring&)> cleanup_legacy_service;
             /// Remove the VGWW-GrantAccess boot task (default: real
             /// schtasks /query + /delete).
             std::function<bool(std::wstring&)> remove_boot_task;

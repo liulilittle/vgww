@@ -186,25 +186,54 @@ namespace vgww {
         /// channel (defect #1: LWF drivers never start that way, leaving a
         /// dead SERVICE_KERNEL_DRIVER registration behind). A RUNNING service
         /// is left alone (already loaded); anything else is deleted.
-        void CleanupLegacyServiceRegistration() {
+        ///
+        /// Returns false + a reason when the registration could NOT be
+        /// retired. The failure must reach the caller: a dead
+        /// SERVICE_KERNEL_DRIVER cannot coexist with the NDIS-bound LWF, so
+        /// pnputil / INetCfg would fail afterwards with an unrelated error
+        /// and the real root cause (this delete) would be lost.
+        bool CleanupLegacyServiceRegistration(std::wstring& error) {
+            error.clear();
             SC_HANDLE scm =
                 ::OpenSCManagerW(nullptr, nullptr, SC_MANAGER_CONNECT);
             if (nullptr == scm) {
-                return;
+                error = L"cannot open the service control manager (error " +
+                        std::to_wstring(::GetLastError()) + L")";
+                return false;
             }
             SC_HANDLE svc = ::OpenServiceW(
                 scm, L"ndisrd", SERVICE_QUERY_STATUS | DELETE);
-            if (nullptr != svc) {
-                SERVICE_STATUS status{};
-                const bool running =
-                    ::QueryServiceStatus(svc, &status) &&
-                    SERVICE_RUNNING == status.dwCurrentState;
-                if (!running) {
-                    ::DeleteService(svc);
+            if (nullptr == svc) {
+                const DWORD open_error = ::GetLastError();
+                ::CloseServiceHandle(scm);
+                if (ERROR_SERVICE_DOES_NOT_EXIST == open_error) {
+                    return true;  // nothing to retire
                 }
-                ::CloseServiceHandle(svc);
+                error = L"cannot open the legacy ndisrd service (error " +
+                        std::to_wstring(open_error) + L")";
+                return false;
             }
+            SERVICE_STATUS status{};
+            const bool running =
+                ::QueryServiceStatus(svc, &status) &&
+                SERVICE_RUNNING == status.dwCurrentState;
+            if (running) {
+                ::CloseServiceHandle(svc);
+                ::CloseServiceHandle(scm);
+                return true;  // already loaded: leave it alone
+            }
+            const BOOL deleted = ::DeleteService(svc);
+            const DWORD delete_error = deleted ? 0 : ::GetLastError();
+            ::CloseServiceHandle(svc);
             ::CloseServiceHandle(scm);
+            // A service already marked for deletion disappears at the next
+            // boot: that is the desired end state, not a failure.
+            if (!deleted && ERROR_SERVICE_MARKED_FOR_DELETE != delete_error) {
+                error = L"DeleteService(ndisrd) failed (error " +
+                        std::to_wstring(delete_error) + L")";
+                return false;
+            }
+            return true;
         }
 
         std::wstring PnputilExe() {
@@ -226,11 +255,16 @@ namespace vgww {
             return RunProcessCapture(PnputilExe(), args, output, exit_code);
         }
 
-        /// Fully qualified path of %SystemRoot%\System32\drivers.
-        std::filesystem::path SystemDriversDir() {
+        /// Resolves the Windows directory, keeping the API's failure signal
+        /// (an empty string) visible to the caller instead of treating the
+        /// untouched buffer as a directory name.
+        std::wstring WindowsDirectory() {
             wchar_t windir[MAX_PATH] = {0};
-            ::GetWindowsDirectoryW(windir, MAX_PATH);
-            return std::filesystem::path(windir) / "System32" / "drivers";
+            const UINT got = ::GetWindowsDirectoryW(windir, MAX_PATH);
+            if (0 == got || got >= MAX_PATH) {
+                return {};
+            }
+            return std::wstring(windir, got);
         }
 
         std::wstring SchtasksExe() {
@@ -258,11 +292,17 @@ namespace vgww {
         /// one file; the (possibly shared) directory stays.
         bool RemoveMirrorCopy(std::wstring& error) {
             wchar_t pd[MAX_PATH] = {0};
-            if (0 == ::GetEnvironmentVariableW(L"ProgramData", pd, MAX_PATH)) {
+            const DWORD got =
+                ::GetEnvironmentVariableW(L"ProgramData", pd, MAX_PATH);
+            if (!EnvValueFitsBuffer(got)) {
                 return true;  // cannot name the file: no residual to claim
             }
-            const std::filesystem::path copy =
-                std::filesystem::path(pd) / L"VGWW" / L"vgww.exe";
+            const std::filesystem::path vgww_dir =
+                MakeProgramDataPath(std::wstring(pd, got));
+            if (vgww_dir.empty()) {
+                return true;  // cannot name the file: no residual to claim
+            }
+            const std::filesystem::path copy = vgww_dir / L"vgww.exe";
             std::error_code ec;
             if (!std::filesystem::exists(copy, ec)) {
                 return true;
@@ -270,25 +310,6 @@ namespace vgww {
             std::filesystem::remove(copy, ec);
             if (ec) {
                 error = copy.wstring() + L": delete failed (file in use?)";
-                return false;
-            }
-            return true;
-        }
-
-        /// Removes the manual System32\drivers\ndisrd.sys copy (real
-        /// implementation for UninstallHooks::remove_system32_copy). A
-        /// failure must be reported, never swallowed (batch16 F7/B-3).
-        bool RemoveSystem32Copy(std::wstring& error) {
-            std::error_code ec;
-            const std::filesystem::path sys32_copy =
-                SystemDriversDir() / "ndisrd.sys";
-            if (!std::filesystem::exists(sys32_copy, ec)) {
-                return true;
-            }
-            std::filesystem::remove(sys32_copy, ec);
-            if (ec) {
-                error = sys32_copy.wstring() +
-                        L": delete failed (driver in use or access denied)";
                 return false;
             }
             return true;
@@ -313,6 +334,67 @@ namespace vgww {
         }
 
         }  // namespace
+
+        /// See installer.h. An empty Windows directory yields an EMPTY path:
+        /// joining it anyway would produce the relative "System32/drivers",
+        /// which resolves against the current working directory.
+        std::filesystem::path MakeSystemDriversDir(
+            const std::wstring& windows_dir) {
+            if (windows_dir.empty()) {
+                return {};
+            }
+            return std::filesystem::path(windows_dir) / "System32" / "drivers";
+        }
+
+        /// See installer.h. GetEnvironmentVariableW returns the REQUIRED
+        /// length when the buffer is too small, so only 1 .. MAX_PATH-1 is a
+        /// value that actually landed in the buffer (the terminator needs a
+        /// slot too).
+        bool EnvValueFitsBuffer(DWORD returned_length) {
+            return 0 != returned_length && returned_length < MAX_PATH;
+        }
+
+        /// See installer.h.
+        std::filesystem::path MakeProgramDataPath(
+            const std::wstring& program_data) {
+            if (program_data.empty()) {
+                return {};
+            }
+            return std::filesystem::path(program_data) / L"VGWW";
+        }
+
+        /// See installer.h.
+        bool RemoveSystem32CopyReal(std::wstring& error,
+                                   const std::wstring* windows_dir) {
+            error.clear();
+            const std::wstring windir =
+                windows_dir ? *windows_dir : WindowsDirectory();
+            const std::filesystem::path drivers = MakeSystemDriversDir(windir);
+            if (drivers.empty()) {
+                error = L"cannot resolve %SystemRoot%\\System32\\drivers "
+                        L"(GetWindowsDirectoryW failed); the ndisrd.sys copy "
+                        L"was NOT removed";
+                return false;
+            }
+            std::error_code ec;
+            const std::filesystem::path sys32_copy = drivers / L"ndisrd.sys";
+            if (!std::filesystem::exists(sys32_copy, ec)) {
+                return true;
+            }
+            std::filesystem::remove(sys32_copy, ec);
+            if (ec) {
+                error = sys32_copy.wstring() +
+                        L": delete failed (driver in use or access denied)";
+                return false;
+            }
+            return true;
+        }
+
+        /// Default body for UninstallHooks::remove_system32_copy.
+        bool RemoveSystem32Copy(std::wstring& error) {
+            return RemoveSystem32CopyReal(error, nullptr);
+        }
+
         /// Removes the VGWW-GrantAccess boot task (real implementation for
         /// UninstallHooks::remove_boot_task). Queries first: deleting a
         /// missing task exits non-zero, and "task absent" is exactly the
@@ -531,6 +613,36 @@ namespace vgww {
             return exited;
         }
 
+        /// True when `val_lower` (already lowercased, trimmed) is THIS
+        /// product's INF FILE NAME rather than some unrelated field that
+        /// merely mentions the word. The uninstall deletes whole driver-store
+        /// packages, so the match has to be the package identity:
+        ///   * the value must be a BARE file name - no path separator and no
+        ///     whitespace - ending in ".inf", and
+        ///   * its stem must contain "ndisrd" (ndisrd_lwf.inf today, plus an
+        ///     older or renamed WinpkFilter INF, which must never be missed).
+        /// A sentence such as "interoperates with ndisrd_lwf.inf" or a
+        /// provider/signer/comment string is rejected by the shape test.
+        bool IsNdisrdInfValue(const std::string& val_lower) {
+            constexpr const char kSuffix[] = ".inf";
+            constexpr size_t kSuffixLen = sizeof(kSuffix) - 1;
+            if (val_lower.size() <= kSuffixLen) {
+                return false;
+            }
+            if (val_lower.compare(val_lower.size() - kSuffixLen, kSuffixLen,
+                                  kSuffix) != 0) {
+                return false;
+            }
+            // Reject anything that is not a single file-name token.
+            for (const char c : val_lower) {
+                if (' ' == c || '\t' == c || '/' == c || '\\' == c ||
+                    ':' == c || '"' == c) {
+                    return false;
+                }
+            }
+            return std::string::npos != val_lower.find("ndisrd");
+        }
+
         std::vector<std::string> ParsePnputilNdisrdOems(
             const std::string& transcript) {
             std::vector<std::string> found;
@@ -590,11 +702,19 @@ namespace vgww {
                         }
                         return o;
                     }(val);
-                    if (!current_oem.empty() &&
-                        std::string::npos != val_lower.find("ndisrd")) {
-                        // Every ndisrd hit resolves to the entry the oem
-                        // tracker currently points at; dedupe repeated hits
-                        // within one entry (e.g. Original Name + comments).
+                    // STRONG feature only. The old check accepted ANY labeled
+                    // field containing "ndisrd" (provider, description,
+                    // signer, comment), so a third-party package mentioning
+                    // the substring was deleted with /delete-driver
+                    // /uninstall. What identifies our package is its own INF
+                    // FILE NAME, which is locale independent: accept the known
+                    // product names, plus any other value that is itself an
+                    // ".inf" file name containing "ndisrd" (a renamed/older
+                    // WinpkFilter INF must never be missed).
+                    if (!current_oem.empty() && IsNdisrdInfValue(val_lower)) {
+                        // Every hit resolves to the entry the oem tracker
+                        // currently points at; dedupe repeated hits within one
+                        // entry.
                         if (std::find(found.begin(), found.end(),
                                       current_oem) == found.end()) {
                             found.push_back(current_oem);
@@ -765,11 +885,20 @@ namespace vgww {
 
             // Retire any stale SCM registration the old channel may have left
             // behind (a dead SERVICE_KERNEL_DRIVER cannot coexist with the
-            // NDIS-bound LWF under the same name).
-            if (hooks.cleanup_legacy_service) {
-                hooks.cleanup_legacy_service();
-            } else {
-                CleanupLegacyServiceRegistration();
+            // NDIS-bound LWF under the same name). A failure here MUST stop
+            // the install: pnputil/INetCfg would otherwise fail later with an
+            // unrelated error and the real root cause would be lost.
+            std::wstring scm_note;
+            const bool scm_ok = hooks.cleanup_legacy_service
+                ? hooks.cleanup_legacy_service(scm_note)
+                : CleanupLegacyServiceRegistration(scm_note);
+            if (!scm_ok) {
+                return "cannot retire the legacy ndisrd service registration "
+                       "(legacy service cleanup failed): " +
+                       WideToUtf8(
+                           scm_note.empty()
+                               ? L"the stale SCM registration is still present"
+                               : scm_note);
             }
 
             // Baseline (batch16 F6/B-9): record the ndisrd entries in the
@@ -994,14 +1123,19 @@ namespace vgww {
             // 3) Cleanup phase. The driver is gone; dismantle the self-heal
             // artifacts (task + mirror) and the residues of the retired
             // channels, reporting every failure as a residual (batch16
-            // F5/F7).
-            if (hooks.cleanup_legacy_service) {
-                hooks.cleanup_legacy_service();
-            } else {
-                CleanupLegacyServiceRegistration();
-            }
+            // F5/F7). The SCM cleanup is a residual too: a DeleteService that
+            // silently failed used to leave a dead registration behind with
+            // no diagnostic at all.
             std::vector<std::wstring> residual;
             std::wstring note;
+            const bool scm_ok = hooks.cleanup_legacy_service
+                ? hooks.cleanup_legacy_service(note)
+                : CleanupLegacyServiceRegistration(note);
+            if (!scm_ok) {
+                residual.push_back(
+                    note.empty() ? L"ndisrd SCM service delete failed" : note);
+            }
+            note.clear();
             const bool task_ok = hooks.remove_boot_task
                 ? hooks.remove_boot_task(note)
                 : RemoveBootTask(note);
@@ -1614,11 +1748,17 @@ namespace vgww {
 
         std::filesystem::path DefaultInstallReportPath() {
             wchar_t pd[MAX_PATH] = {0};
-            if (0 == ::GetEnvironmentVariableW(L"ProgramData", pd, MAX_PATH)) {
+            const DWORD got =
+                ::GetEnvironmentVariableW(L"ProgramData", pd, MAX_PATH);
+            if (!EnvValueFitsBuffer(got)) {
                 return {};
             }
-            return std::filesystem::path(pd) / L"VGWW" /
-                   L"install-report.txt";
+            const std::filesystem::path vgww_dir =
+                MakeProgramDataPath(std::wstring(pd, got));
+            if (vgww_dir.empty()) {
+                return {};
+            }
+            return vgww_dir / L"install-report.txt";
         }
 
         bool WriteInstallReport(const std::filesystem::path& path,

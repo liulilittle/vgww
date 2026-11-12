@@ -263,7 +263,7 @@ namespace {
         int sys32 = 0;
         vgww::driver::UninstallHooks hooks() {
             vgww::driver::UninstallHooks h;
-            h.cleanup_legacy_service = [this] { ++scm; };
+            h.cleanup_legacy_service = [this](std::wstring&) { ++scm; return true; };
             h.remove_boot_task = [this](std::wstring&) {
                 ++task;
                 return true;
@@ -298,7 +298,7 @@ namespace {
         vgww::driver::InstallHooks h;
         h.ensure_device_access = [] { return true; };
         h.remove_boot_task = [](std::wstring&) { return true; };
-        h.cleanup_legacy_service = [] {};
+        h.cleanup_legacy_service = [](std::wstring&) { return true; };
         return h;
     }
 
@@ -1355,7 +1355,7 @@ namespace {
             rs.fallback = {no_ndisrd, 0, true};
             int scm = 0, task = 0, mirror = 0, sys32 = 0;
             vgww::driver::UninstallHooks hooks;
-            hooks.cleanup_legacy_service = [&] { ++scm; };
+            hooks.cleanup_legacy_service = [&](std::wstring&) { ++scm; return true; };
             hooks.remove_boot_task = [&](std::wstring&) {
                 ++task;
                 return true;
@@ -1416,7 +1416,7 @@ namespace {
         rs.script.push_back({"", 0, true});  // add-driver ok
         int grant = 0, task = 0, scm = 0;
         vgww::driver::InstallHooks hooks;
-        hooks.cleanup_legacy_service = [&] { ++scm; };
+        hooks.cleanup_legacy_service = [&](std::wstring&) { ++scm; return true; };
         hooks.ensure_device_access = [&] {
             ++grant;
             return true;
@@ -1460,7 +1460,7 @@ namespace {
             rs.script.push_back({"", 0, true});
             int scm = 0, task = 0, mirror = 0, sys32 = 0;
             vgww::driver::UninstallHooks hooks;
-            hooks.cleanup_legacy_service = [&] { ++scm; };
+            hooks.cleanup_legacy_service = [&](std::wstring&) { ++scm; return true; };
             hooks.remove_boot_task = [&](std::wstring&) {
                 ++task;
                 return true;
@@ -1490,7 +1490,7 @@ namespace {
             rs.script.push_back({kOemTranscript, 0, true});
             rs.script.push_back({"", 0, true});
             vgww::driver::UninstallHooks hooks;
-            hooks.cleanup_legacy_service = [] {};
+            hooks.cleanup_legacy_service = [](std::wstring&) { return true; };
             hooks.remove_boot_task = [](std::wstring&) { return true; };
             hooks.remove_mirror_copy = [](std::wstring&) { return true; };
             hooks.remove_system32_copy = [](std::wstring& e) {
@@ -1510,7 +1510,7 @@ namespace {
             rs.script.push_back({kOemTranscript, 0, true});
             rs.script.push_back({"", 0, true});
             vgww::driver::UninstallHooks hooks;
-            hooks.cleanup_legacy_service = [] {};
+            hooks.cleanup_legacy_service = [](std::wstring&) { return true; };
             hooks.remove_boot_task = [](std::wstring& e) {
                 e = L"schtasks /delete failed";
                 return false;
@@ -1532,7 +1532,7 @@ namespace {
             rs.script.push_back({"", 0, true});
             rs.script.push_back({"", 0, true});
             vgww::driver::UninstallHooks hooks;
-            hooks.cleanup_legacy_service = [] {};
+            hooks.cleanup_legacy_service = [](std::wstring&) { return true; };
             hooks.remove_boot_task = [](std::wstring&) { return true; };
             hooks.remove_mirror_copy = [](std::wstring&) { return true; };
             hooks.remove_system32_copy = [](std::wstring&) { return true; };
@@ -1984,6 +1984,241 @@ namespace {
         }
     }
 
+    // ------------------------------------------------------------------
+    // Defect A (P3): a failed GetWindowsDirectoryW used to leave the buffer
+    // empty and the join degraded into the RELATIVE path
+    // "System32/drivers", so the System32 cleanup probed/removed a
+    // same-named file under the current working directory. The fix makes the
+    // path builder return an EMPTY path for an empty Windows directory and
+    // makes the remover REPORT the unresolved directory instead of touching
+    // the filesystem.
+    // ------------------------------------------------------------------
+    void TestSystemDriversDirResolution() {
+        using vgww::driver::MakeSystemDriversDir;
+        using vgww::driver::RemoveSystem32CopyReal;
+
+        // Empty Windows directory -> empty path (never a relative path).
+        const std::filesystem::path unresolved = MakeSystemDriversDir(L"");
+        CHECK(unresolved.empty());
+        CHECK(!unresolved.is_absolute());
+
+        // A resolved directory keeps the exact Windows\System32\drivers shape.
+        const std::filesystem::path win = MakeSystemDriversDir(L"C:\\Windows");
+        CHECK(win == std::filesystem::path(L"C:\\Windows\\System32\\drivers"));
+        CHECK(win.is_absolute());
+
+        // The remover must NOT probe the filesystem for an unresolved
+        // directory: it reports the failure and claims nothing was removed.
+        {
+            const std::wstring empty_windir = L"";
+            std::wstring err;
+            const bool ok = RemoveSystem32CopyReal(err, &empty_windir);
+            CHECK(!ok);
+            CHECK(err.find(L"NOT removed") != std::wstring::npos);
+            // The diagnosis must name the real cause (the Windows-directory
+            // query), not a silent success.
+            CHECK(err.find(L"GetWindowsDirectoryW") != std::wstring::npos);
+        }
+
+        // A correctly resolved directory still removes the manual copy.
+        {
+            TempDir t;
+            std::error_code ec;
+            const std::filesystem::path drivers = t.path() / L"System32" /
+                                                  L"drivers";
+            std::filesystem::create_directories(drivers, ec);
+            WriteSizedFile(drivers / L"ndisrd.sys", 64);
+            const std::wstring windir = t.path().wstring();
+            std::wstring err;
+            const bool ok = RemoveSystem32CopyReal(err, &windir);
+            CHECK(ok);
+            CHECK(err.empty());
+            CHECK(!std::filesystem::exists(drivers / L"ndisrd.sys", ec));
+        }
+
+        // Nothing to remove is the clean state.
+        {
+            TempDir t;
+            std::error_code ec;
+            std::filesystem::create_directories(t.path() / L"System32" /
+                                                    L"drivers",
+                                                ec);
+            const std::wstring windir = t.path().wstring();
+            std::wstring err;
+            CHECK(RemoveSystem32CopyReal(err, &windir));
+            CHECK(err.empty());
+        }
+
+        // The empty-CWD trap: with an unresolved directory the remover must
+        // not delete a same-named file that happens to sit in a relative
+        // "System32\drivers" under the current working directory.
+        {
+            TempDir t;
+            std::error_code ec;
+            const std::filesystem::path rel = t.path() / L"System32" /
+                                             L"drivers";
+            std::filesystem::create_directories(rel, ec);
+            WriteSizedFile(rel / L"ndisrd.sys", 32);
+            const std::filesystem::path saved =
+                std::filesystem::current_path(ec);
+            CHECK(!ec);
+            std::filesystem::current_path(t.path(), ec);
+            CHECK(!ec);
+            const std::wstring empty_windir = L"";
+            std::wstring err;
+            const bool ok = RemoveSystem32CopyReal(err, &empty_windir);
+            const bool survivor = std::filesystem::exists(rel / L"ndisrd.sys", ec);
+            std::filesystem::current_path(saved, ec);
+            CHECK(!ok);
+            CHECK(survivor);  // the CWD-relative file was NOT deleted
+        }
+    }
+
+    // ------------------------------------------------------------------
+    // Defect C (P3): GetEnvironmentVariableW returns the REQUIRED length when
+    // the buffer is too small and leaves the buffer contents undefined. Both
+    // 0 (not defined) and >= MAX_PATH must count as failure; the old code
+    // only checked 0 and could build a path from partial text.
+    // ------------------------------------------------------------------
+    void TestEnvValueFitsBuffer() {
+        using vgww::driver::EnvValueFitsBuffer;
+        using vgww::driver::MakeProgramDataPath;
+
+        CHECK(!EnvValueFitsBuffer(0));          // not defined
+        CHECK(!EnvValueFitsBuffer(MAX_PATH));   // buffer too small (needs NUL)
+        CHECK(!EnvValueFitsBuffer(MAX_PATH + 1));
+        CHECK(EnvValueFitsBuffer(1));
+        CHECK(EnvValueFitsBuffer(MAX_PATH - 1));
+
+        // An unresolved ProgramData yields an EMPTY path, so no relative
+        // "%ProgramData%\VGWW" mirror path can ever be built.
+        CHECK(MakeProgramDataPath(L"").empty());
+        CHECK(MakeProgramDataPath(L"C:\\ProgramData") ==
+              std::filesystem::path(L"C:\\ProgramData\\VGWW"));
+    }
+
+    // ------------------------------------------------------------------
+    // Defect B (P3): a failing DeleteService was swallowed. The install path
+    // must stop with a diagnosis naming the legacy service (a dead
+    // SERVICE_KERNEL_DRIVER cannot coexist with the NDIS-bound LWF), and the
+    // uninstall path must report it as a residual.
+    // ------------------------------------------------------------------
+    void TestLegacyServiceFailureReported() {
+        // Install: the failing cleanup hook aborts the install with a clear
+        // diagnosis instead of letting pnputil/INetCfg fail later.
+        if (PayloadTripleNextToExe()) {
+            WiringHarness h;
+            RunnerScript rs;
+            vgww::driver::InstallHooks hooks;
+            hooks.cleanup_legacy_service = [](std::wstring& e) {
+                e = L"DeleteService(ndisrd) failed (error 5)";
+                return false;
+            };
+            hooks.ensure_device_access = [] { return true; };
+            hooks.remove_boot_task = [](std::wstring&) { return true; };
+            const std::string err = vgww::driver::InstallNdisrdDriver(
+                rs.runner(), h.factory(), hooks);
+            CHECK(!err.empty());
+            CHECK(err.find("legacy service") != std::string::npos);
+            CHECK(err.find("error 5") != std::string::npos);
+            // Nothing was published and no session was opened.
+            CHECK(rs.calls == 0);
+            CHECK(!*h.shared_close);
+        } else {
+            std::puts("  (payload not shipped next to the test binary; the "
+                      "install-side paragraph is skipped in this build)");
+        }
+
+        // Uninstall: the same failure becomes a reported residual, not a
+        // silent success.
+        {
+            WiringHarness h;
+            RunnerScript rs;
+            rs.script.push_back({kOemTranscript, 0, true});  // enum
+            rs.script.push_back({"", 0, true});              // delete ok
+            vgww::driver::UninstallHooks hooks;
+            hooks.cleanup_legacy_service = [](std::wstring& e) {
+                e = L"DeleteService(ndisrd) failed (error 5)";
+                return false;
+            };
+            hooks.remove_boot_task = [](std::wstring&) { return true; };
+            hooks.remove_mirror_copy = [](std::wstring&) { return true; };
+            hooks.remove_system32_copy = [](std::wstring&) { return true; };
+            const std::string err = vgww::driver::UninstallNdisrdDriver(
+                rs.runner(), h.factory(), hooks);
+            CHECK(err.find("leftovers") != std::string::npos);
+            CHECK(err.find("DeleteService(ndisrd) failed") !=
+                  std::string::npos);
+        }
+    }
+
+    // ------------------------------------------------------------------
+    // Defect D (P3): the uninstall used to delete every oem entry in which
+    // ANY labeled field mentioned "ndisrd", so a third-party INF with that
+    // substring in an unrelated field was deleted with
+    // /delete-driver /uninstall. The parser now only accepts the STRONG
+    // feature: the package's own INF name (Original Name / the localized
+    // equivalent) is ndisrd_lwf.inf.
+    // ------------------------------------------------------------------
+    void TestParseOnlyStrongFeature() {
+        using vgww::driver::ParsePnputilNdisrdOem;
+        using vgww::driver::ParsePnputilNdisrdOems;
+        using Vec = std::vector<std::string>;
+
+        // A third-party package mentioning "ndisrd" in an unrelated field is
+        // NOT our driver: Original Name says otherwise.
+        const std::string third_party =
+            "Published Name : oem7.inf\n"
+            "Original Name   : acme_tap.inf\n"
+            "Provider Name   : ACME Networks\n"
+            "Signer Name     : ndisrd compliance lab\n";
+        CHECK(ParsePnputilNdisrdOems(third_party) == Vec{});
+        CHECK(ParsePnputilNdisrdOem(third_party) == "");
+
+        // The comment/description field of a foreign package.
+        const std::string third_party_desc =
+            "Published Name : oem8.inf\n"
+            "Original Name   : vendor_filter.inf\n"
+            "Class Name      : Net\n"
+            "Description     : interoperates with ndisrd-compatible stacks\n";
+        CHECK(ParsePnputilNdisrdOems(third_party_desc) == Vec{});
+
+        // A description that literally names our INF file must still be
+        // rejected: the value is a sentence that merely ENDS in our INF name,
+        // not a bare file name. (A pure suffix+substring check accepts this.)
+        const std::string third_party_sentence =
+            "Published Name : oem9.inf\n"
+            "Original Name   : vendor_filter.inf\n"
+            "Description     : compat layer ndisrd_lwf.inf\n";
+        CHECK(ParsePnputilNdisrdOems(third_party_sentence) == Vec{});
+
+        // A path-shaped value must be rejected too, even though it ends in
+        // ".inf" and contains the stem.
+        CHECK(ParsePnputilNdisrdOems(
+                  "Published Name : oem10.inf\n"
+                  "Original Name   : vendor.inf\n"
+                  "Description     : C:\\drivers\\ndisrd_lwf.inf\n") == Vec{});
+
+        // Mixed transcript: only the real package is returned, in order.
+        const std::string mixed =
+            "Published Name : oem7.inf\n"
+            "Original Name   : acme_tap.inf\n"
+            "Provider Name   : ACME ndisrd partner\n"
+            "\n"
+            "Published Name : oem25.inf\n"
+            "Original Name   : ndisrd_lwf.inf\n"
+            "Provider Name   : Ntkr\n";
+        CHECK(ParsePnputilNdisrdOems(mixed) == Vec{"oem25.inf"});
+
+        // A localized label still matches: the VALUE is locale independent.
+        CHECK(ParsePnputilNdisrdOems(
+                  "Published Name : oem3.inf\n"
+                  "Original Name   : NDISRD_LWF.INF\n") == Vec{"oem3.inf"});
+
+        // A bare hit with no tracked oem stays empty.
+        CHECK(ParsePnputilNdisrdOems("Signer Name : ndisrd\n") == Vec{});
+    }
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -2064,6 +2299,10 @@ int main(int argc, char** argv) {
     RUN(TestB119SourcesAreEnglishOnly);
     RUN(TestRunProcessCaptureArgvRoundTrip);
     RUN(TestRunProcessCaptureContract);
+    RUN(TestSystemDriversDirResolution);
+    RUN(TestEnvValueFitsBuffer);
+    RUN(TestLegacyServiceFailureReported);
+    RUN(TestParseOnlyStrongFeature);
 
     if (0 == g_failures) {
         std::puts("test_driver_installer: ALL PASS");
