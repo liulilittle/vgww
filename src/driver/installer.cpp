@@ -26,13 +26,38 @@ namespace vgww {
 
         namespace {
 
+            /// Full path of the running executable, resolved through a growing
+            /// buffer so a vgww.exe in a directory longer than MAX_PATH still
+            /// resolves (batch331 P2: the elevated install/grant spawns used a
+            /// MAX_PATH stack buffer and reported "cannot locate the vgww.exe
+            /// path" for long installs). Empty when GetModuleFileNameW fails or
+            /// overflows the 32767-character NT limit.
+            std::wstring ExecutablePath() {
+                std::wstring path;
+                DWORD cap = MAX_PATH;
+                while (true) {
+                    path.resize(cap);
+                    const DWORD got =
+                        ::GetModuleFileNameW(nullptr, path.data(), cap);
+                    if (0 == got) {
+                        return {};
+                    }
+                    if (got < cap) {
+                        path.resize(got);
+                        return path;
+                    }
+                    if (cap >= 32767) {
+                        return {};
+                    }
+                    cap *= 2;
+                }
+            }
+
             /// Directory of the running executable; empty when the module
             /// path cannot be resolved.
             std::filesystem::path ExeDir() {
-                wchar_t exe[32768] = {0};
-                const DWORD got = ::GetModuleFileNameW(
-                    nullptr, exe, static_cast<DWORD>(std::size(exe)));
-                if (0 == got) {
+                const std::wstring exe = ExecutablePath();
+                if (exe.empty()) {
                     return {};
                 }
                 return std::filesystem::path(exe).parent_path();
@@ -216,36 +241,16 @@ namespace vgww {
             return L"schtasks.exe";
         }
 
-        /// Removes the VGWW-GrantAccess boot task (real implementation for
-        /// UninstallHooks::remove_boot_task). Queries first: deleting a
-        /// missing task exits non-zero, and "task absent" is exactly the
-        /// already-clean state (batch16 F5). Returns false + reason when a
-        /// present task cannot be removed.
-        bool RemoveBootTask(std::wstring& error) {
-            std::string out;
-            DWORD code = 1;
-            if (!RunProcessCapture(SchtasksExe(),
-                                   {L"/query", L"/tn", L"VGWW-GrantAccess"},
-                                   out, code)) {
-                error = L"failed to start schtasks.exe (query boot task)";
-                return false;
+        /// Dispatches a console-tool call to the injected runner (tests) or the
+        /// real subprocess (production).
+        bool RunCaptureChannel(ProcessCaptureRunner runner,
+                               const std::wstring& exe,
+                               const std::vector<std::wstring>& args,
+                               std::string& output, DWORD& exit_code) {
+            if (runner) {
+                return runner(exe, args, output, exit_code);
             }
-            if (0 != code) {
-                return true;  // task absent: nothing to remove
-            }
-            if (!RunProcessCapture(SchtasksExe(),
-                                   {L"/delete", L"/f", L"/tn",
-                                    L"VGWW-GrantAccess"},
-                                   out, code)) {
-                error = L"failed to start schtasks.exe (delete boot task)";
-                return false;
-            }
-            if (0 != code) {
-                error = L"schtasks /delete VGWW-GrantAccess failed (exit=" +
-                        std::to_wstring(code) + L")";
-                return false;
-            }
-            return true;
+            return RunProcessCapture(exe, args, output, exit_code);
         }
 
         /// Removes the %ProgramData%\VGWW\vgww.exe mirror (real
@@ -308,6 +313,41 @@ namespace vgww {
         }
 
         }  // namespace
+        /// Removes the VGWW-GrantAccess boot task (real implementation for
+        /// UninstallHooks::remove_boot_task). Queries first: deleting a
+        /// missing task exits non-zero, and "task absent" is exactly the
+        /// already-clean state (batch16 F5). Returns false + reason when a
+        /// present task cannot be removed, and also when the QUERY could not
+        /// complete at all (batch331 P2: a timed-out query is not "absent").
+        bool RemoveBootTask(std::wstring& error, ProcessCaptureRunner runner) {
+            std::string out;
+            DWORD code = 1;
+            if (!RunCaptureChannel(runner, SchtasksExe(),
+                                   {L"/query", L"/tn", L"VGWW-GrantAccess"},
+                                   out, code)) {
+                error = L"failed to query the VGWW-GrantAccess boot task "
+                        L"(schtasks.exe did not complete)";
+                return false;
+            }
+            if (0 != code) {
+                return true;  // query ran and reported: task absent
+            }
+            if (!RunCaptureChannel(runner, SchtasksExe(),
+                                   {L"/delete", L"/f", L"/tn",
+                                    L"VGWW-GrantAccess"},
+                                   out, code)) {
+                error = L"failed to delete the VGWW-GrantAccess boot task "
+                        L"(schtasks.exe did not complete)";
+                return false;
+            }
+            if (0 != code) {
+                error = L"schtasks /delete VGWW-GrantAccess failed (exit=" +
+                        std::to_wstring(code) + L")";
+                return false;
+            }
+            return true;
+        }
+
 
         bool GrantDeviceAccessWithRetries(const std::function<bool()>& attempt,
                                           int attempts, DWORD delay_ms) {
@@ -482,7 +522,13 @@ namespace vgww {
             }
             ::CloseHandle(pi.hThread);
             ::CloseHandle(pi.hProcess);
-            return true;
+            // batch331 P2: "spawned and exited" is the contract. A child the
+            // deadline had to terminate never exited on its own, so its
+            // forced exit code must NOT be reported as a real result - the
+            // caller cannot otherwise tell "tool said non-zero" from "tool
+            // hung" (that conflation made RemoveBootTask read a hung query as
+            // "task absent").
+            return exited;
         }
 
         std::vector<std::string> ParsePnputilNdisrdOems(
@@ -1645,14 +1691,18 @@ namespace vgww {
 
         ElevatedInstallResult RunElevatedInstallAndWait(DWORD wait_ms) {
             ElevatedInstallResult result;
-            wchar_t exe[MAX_PATH] = {0};
-            const DWORD got = ::GetModuleFileNameW(nullptr, exe, MAX_PATH);
-            if (0 == got || got >= MAX_PATH) {
+            // batch331 P2: MAX_PATH truncated a vgww.exe living in a long
+            // directory, so "repair driver" reported "cannot locate".
+            // ExecutablePath() grows past MAX_PATH (same rule as ExeDir()) and
+            // returns empty only on a real resolution failure.
+            const std::wstring exe_w = ExecutablePath();
+            if (exe_w.empty()) {
                 result.outcome = ElevatedInstallOutcome::ElevationRefused;
                 result.spawn_error = ERROR_FILE_NOT_FOUND;
                 result.detail = "cannot locate the vgww.exe path";
                 return result;
             }
+            const wchar_t* exe = exe_w.c_str();
             const std::filesystem::path report = DefaultInstallReportPath();
             // Best-effort: drop a stale report so a child that crashes
             // before writing cannot be misread. Correctness does NOT depend
@@ -1718,11 +1768,27 @@ namespace vgww {
         }
 
         bool RunElevatedGrantAccessOnlyWait(DWORD wait_ms) {
-            wchar_t exe[MAX_PATH] = {0};
-            const DWORD got = ::GetModuleFileNameW(nullptr, exe, MAX_PATH);
-            if (0 == got || got >= MAX_PATH) {
-                return false;
+            // batch331 P2: long-path tolerant resolution (same reason and
+            // pattern as RunElevatedInstallAndWait).
+            std::wstring exe_w;
+            DWORD cap = MAX_PATH;
+            while (true) {
+                exe_w.resize(cap);
+                const DWORD got =
+                    ::GetModuleFileNameW(nullptr, exe_w.data(), cap);
+                if (0 == got) {
+                    return false;
+                }
+                if (got < cap) {
+                    exe_w.resize(got);
+                    break;
+                }
+                if (cap >= 32767) {
+                    return false;
+                }
+                cap *= 2;
             }
+            const wchar_t* exe = exe_w.c_str();
             std::wstring params = L"--grant-access-only";
             SHELLEXECUTEINFOW sei{};
             sei.cbSize = sizeof(sei);

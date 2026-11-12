@@ -719,6 +719,17 @@ namespace vgww {
             bool OnMouseMove(Point p) override;
             bool OnMouseDown(Point p) override;
             bool OnMouseUp(Point p) override;
+            /// batch332 P1: a column resize that never saw its mouse-up (the
+            /// release went to another window / the app hid to the tray) used
+            /// to keep resizing_ true, so every later hover re-applied
+            /// ApplyResize and the SizeWE cursor stuck. Aborts the grab.
+            void CancelDrag() noexcept override {
+                resizing_ = false;
+                resize_col_ = 0;
+                resize_start_x_ = 0.0f;
+                resize_start_left_ = 0.0f;
+                resize_start_right_ = 0.0f;
+            }
             /// batch37e (user): double-clicking a header divider auto-fits that
             /// column to its measured content width (standard list behaviour).
             bool OnMouseDoubleClick(Point p) override;
@@ -1115,6 +1126,11 @@ namespace vgww {
             bool OnMouseDown(Point p) override;
             bool OnMouseMove(Point p) override;
             bool OnMouseUp(Point p) override;
+            /// batch332 P1: a drag-select that never saw its mouse-up kept
+            /// dragging_ true, so every later hover moved the caret and grew
+            /// the selection. Aborts the drag; the current selection (caret +
+            /// anchor) is left exactly as-is.
+            void CancelDrag() noexcept override { dragging_ = false; }
 
             /// Caret blink phase: true = the caret is drawn while focused.
             bool caret_visible() const noexcept { return caret_visible_; }

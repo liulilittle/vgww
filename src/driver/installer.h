@@ -47,11 +47,32 @@ namespace vgww {
         /// stdout+stderr into `output`. `timeout_ms` bounds the wait for the
         /// child; a child still running at the deadline is terminated (U2).
         /// Returns true once the process has exited; `exit_code` holds its
-        /// status.
+        /// status. A child terminated at the deadline did NOT exit on its own,
+        /// so that path returns false (batch331 P2): a caller must be able to
+        /// tell "ran and reported non-zero" from "never completed".
         bool RunProcessCapture(const std::wstring& exe,
                                const std::vector<std::wstring>& args,
                                std::string& output, DWORD& exit_code,
                                DWORD timeout_ms = 120000);
+
+        /// Replaces the console-tool subprocess boundary for one call, so a
+        /// test can script the result (including a timeout, reported as
+        /// `false`) without spawning schtasks.exe. nullptr = RunProcessCapture.
+        using ProcessCaptureRunner =
+            std::function<bool(const std::wstring&,
+                               const std::vector<std::wstring>&,
+                               std::string&, DWORD&)>;
+
+        /// Removes the legacy VGWW-GrantAccess boot task (batch23: the
+        /// installer no longer creates it; older releases did, so install and
+        /// uninstall retire it). Queries first: deleting a missing task exits
+        /// non-zero, and "task absent" is the already-clean success state. A
+        /// query that never completed (spawn failure or timeout) is NOT
+        /// "absent": it returns false + a reason, so a hung query can never
+        /// silently keep the task registered (batch331 P2). `runner` injects
+        /// the subprocess boundary (tests); nullptr = the real schtasks.exe.
+        bool RemoveBootTask(std::wstring& error,
+                            ProcessCaptureRunner runner = nullptr);
 
         // -------------------------------------------------------------------
         // S5.9: INetCfg programming channel (NDIS LWF component install +

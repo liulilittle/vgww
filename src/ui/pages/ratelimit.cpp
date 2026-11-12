@@ -261,12 +261,19 @@ namespace vgww {
             void RatelimitPage::OnRowAction(const std::string& row_id,
                                             std::size_t action) {
                 if (action == 0) {  // [edit]
+                    // batch333: an id that no longer matches any rule (the
+                    // table was refreshed between the click and this call)
+                    // must NOT open the form. It used to open with empty
+                    // up/down, and a submit then reported the misleading
+                    // "up and down cannot both be 0". The sibling pages
+                    // (portmap/firewall) already return early.
                     const vgww::web::RateLimitRule* rule = FindRule(row_id);
+                    if (rule == nullptr) {
+                        return;
+                    }
                     ShowForm(Str::CommonEdit, Widen(row_id),
-                             rule != nullptr ? std::to_wstring(rule->uplink_kbps)
-                                             : std::wstring(),
-                             rule != nullptr ? std::to_wstring(rule->downlink_kbps)
-                                             : std::wstring(),
+                             std::to_wstring(rule->uplink_kbps),
+                             std::to_wstring(rule->downlink_kbps),
                              Widen(row_id));
                     return;
                 }

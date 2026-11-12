@@ -3735,9 +3735,9 @@ namespace vgww {
                 std::vector<INTERMEDIATE_BUFFER>& items = batch.items;
                 items.emplace_back();
                 INTERMEDIATE_BUFFER& ib = items.back();
-                // P2: emplace_back() 值初始化已零化 POD INTERMEDIATE_BUFFER，
-                // 无需再 memset 1566B；驱动只消费 m_Length 字节的 m_IBuffer，
-                // 且所有被消费字段在下方显式设置。
+                // P2: emplace_back() value-initialises the POD INTERMEDIATE_BUFFER,
+                // so the 1566-byte memset is not needed - only the m_Length bytes
+                // of m_IBuffer are written below.
                 ib.m_dwDeviceFlags = PACKET_FLAG_ON_SEND;
                 // C8: the frame is tagged with its batch's egress handle so
                 // the driver attributes it to the port it will actually leave.

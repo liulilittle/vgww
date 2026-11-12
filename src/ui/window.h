@@ -737,6 +737,11 @@ namespace vgww {
                                       LPARAM lparam) noexcept;
 
             void ApplyDpi(float dpi) noexcept;
+            /// batch331: re-derives the scale from the desktop DPI, the ONE
+            /// rule Create() and SetUiScale(0) share. With a live window it
+            /// takes GetDpiForWindow (48..768); headless it restores the
+            /// remembered desktop scale so a pre-Create override is not lost.
+            void ApplyAutoDpi() noexcept;
             /// batch28: records the live window rect while the window is in
             /// its normal (not zoomed/iconic) state.
             void CaptureNormalRect() noexcept;
@@ -1021,6 +1026,11 @@ namespace vgww {
             HICON big_icon_ = nullptr;
             float dpi_ = 96.0f;
             float scale_ = 1.0f;
+            /// batch331: the desktop-driven scale, remembered while a FIXED
+            /// ui_scale_ override is in force so switching back to auto can
+            /// restore it without a live HWND (headless tests, and the window
+            /// before Create()).
+            float desktop_scale_ = 1.0f;
             /// batch20: fixed UI scale override; <= 0 means auto (desktop DPI).
             float ui_scale_ = 0.0f;
             /// batch20 P1: set at Create; the first WM_DPICHANGED must use the

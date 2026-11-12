@@ -111,7 +111,7 @@ namespace vgww {
                 L"有 DHCP 报文因格式不合法被丢弃(计数见状态页)。",  // LeasesParseRejected
                 L"控制台环形缓冲已丢弃部分历史行。",  // ConsoleDropped
                 L"有端口映射的 WAN 端口被占用,该规则不会转发任何流量。请换一个端口。",  // PortmapPortBusy
-                L"端口映射运行中:已接受 %s 个连接,拨号失败 %s 次。",  // PortmapLiveSummary
+                L"端口映射运行中:已接受 {0} 个连接,拨号失败 {1} 次。",  // PortmapLiveSummary
                 L"MAC 地址",  // FormMac
                 L"IP 地址",  // FormIp
                 L"主机名",  // FormHostname
@@ -510,7 +510,7 @@ namespace vgww {
                 L"Some DHCP messages were dropped as malformed (see the status counters).",  // LeasesParseRejected
                 L"The console ring buffer has dropped some older lines.",  // ConsoleDropped
                 L"A port-map WAN port is already in use; that rule forwards no traffic. Pick another port.",  // PortmapPortBusy
-                L"Port forwarding is live: %s connection(s) accepted, %s dial failure(s).",  // PortmapLiveSummary
+                L"Port forwarding is live: {0} connection(s) accepted, {1} dial failure(s).",  // PortmapLiveSummary
                 L"MAC address",  // FormMac
                 L"IP address",  // FormIp
                 L"Hostname",  // FormHostname

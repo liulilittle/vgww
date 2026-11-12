@@ -1735,6 +1735,88 @@ namespace {
     }
 
     // ------------------------------------------------------------------
+    // batch331 P2: RemoveBootTask must distinguish "the query ran and said
+    // no such task" from "the query never completed". The old code treated
+    // every non-zero exit -- including the forced code of a TIMED OUT
+    // capture -- as "task absent", so a hung schtasks silently kept a
+    // legacy VGWW-GrantAccess task alive. RunProcessCapture now reports a
+    // terminated child as a failure (exited=false), and the query helper
+    // must propagate that.
+    // ------------------------------------------------------------------
+    void TestRemoveBootTaskTimeoutIsFailure() {
+        using vgww::driver::ProcessCaptureRunner;
+        using Args = std::vector<std::wstring>;
+        struct Fake {
+            std::size_t calls = 0;
+            bool query_ok = true;
+            DWORD query_code = 0;
+            bool delete_ok = true;
+            DWORD delete_code = 0;
+            ProcessCaptureRunner runner() {
+                return [this](const std::wstring&, const Args&, std::string&,
+                              DWORD& code) {
+                    ++calls;
+                    if (calls == 1) {
+                        code = query_code;
+                        return query_ok;
+                    }
+                    code = delete_code;
+                    return delete_ok;
+                };
+            }
+        };
+
+        // The query times out (spawned but never exited): NOT "absent".
+        {
+            Fake f;
+            f.query_ok = false;
+            std::wstring err;
+            CHECK(!vgww::driver::RemoveBootTask(err, f.runner()));
+            CHECK(!err.empty());
+            CHECK(f.calls == 1);  // no delete after a failed query
+        }
+
+        // The query ran and reported a non-zero exit: genuinely absent.
+        {
+            Fake f;
+            f.query_code = 1;
+            std::wstring err;
+            CHECK(vgww::driver::RemoveBootTask(err, f.runner()));
+            CHECK(err.empty());
+            CHECK(f.calls == 1);
+        }
+
+        // Query ok, delete times out: the task survived -> failure + reason.
+        {
+            Fake f;
+            f.delete_ok = false;
+            std::wstring err;
+            CHECK(!vgww::driver::RemoveBootTask(err, f.runner()));
+            CHECK(!err.empty());
+            CHECK(f.calls == 2);
+        }
+
+        // Query ok, delete exits non-zero: failure naming the exit code.
+        {
+            Fake f;
+            f.delete_code = 5;
+            std::wstring err;
+            CHECK(!vgww::driver::RemoveBootTask(err, f.runner()));
+            CHECK(err.find(L"5") != std::wstring::npos);
+            CHECK(f.calls == 2);
+        }
+
+        // Happy path: both calls run, task removed.
+        {
+            Fake f;
+            std::wstring err;
+            CHECK(vgww::driver::RemoveBootTask(err, f.runner()));
+            CHECK(err.empty());
+            CHECK(f.calls == 2);
+        }
+    }
+
+    // ------------------------------------------------------------------
     // batch268: RunProcessCapture must hand every argument to the child
     // VERBATIM. The Windows argv splitter (CommandLineToArgvW and the
     // MSVC runtime) treats a run of backslashes as literal ONLY until a
@@ -1855,7 +1937,11 @@ namespace {
             const bool ok = vgww::driver::RunProcessCapture(
                 exe, {L"--sleep-pid", L"20000"}, out, code, 1200);
             const ULONGLONG elapsed = ::GetTickCount64() - t0;
-            CHECK(ok);
+            // batch331 P2: a capture the deadline had to terminate is NOT a
+            // clean exit; reporting true would let a caller read the forced
+            // exit code as a real result (the RemoveBootTask "task absent"
+            // misdiagnosis).
+            CHECK(!ok);
             CHECK(code != 0);
             CHECK(elapsed < 8000);
 

@@ -122,6 +122,23 @@ namespace vgww {
                 return CaptureWidestBounds(e);
             }
 
+            /// batch332 P1: abort every in-flight pointer drag in the tree.
+            /// A control that latches "button is down" in OnMouseDown and only
+            /// clears it in OnMouseUp would otherwise keep resizing a column /
+            /// extending a selection after a mouse-up the window never saw
+            /// (WM_KILLFOCUS: Alt+Tab or hide-to-tray; or a release that
+            /// reached another window). Pre-order walk; CancelDrag is a no-op
+            /// on controls that hold no drag state.
+            void CancelDragsIn(Element* node) noexcept {
+                if (node == nullptr) {
+                    return;
+                }
+                node->CancelDrag();
+                for (const auto& child : node->children()) {
+                    CancelDragsIn(child.get());
+                }
+            }
+
 
             /// R3: clipboard helpers live in controls.cpp (shared with the
             /// console log); the window just calls ui::SetClipboardText.
@@ -167,6 +184,12 @@ namespace vgww {
             scale_ = std::max(dpi / 96.0f, kMinScale);
             dpi_ = 96.0f * scale_;
             renderer_.SetDpi(dpi_);
+            // batch331: remember the desktop-driven scale while no fixed
+            // override is in force, so SetUiScale(0) can restore it even
+            // without a live HWND (headless tests / pre-Create).
+            if (ui_scale_ <= 0.0f) {
+                desktop_scale_ = scale_;
+            }
         }
 
         void VgwwWindow::SetDpiForTest(float scale) noexcept {
@@ -339,10 +362,43 @@ namespace vgww {
             (void)ui_state::Save(state);
         }
 
+        void VgwwWindow::ApplyAutoDpi() noexcept {
+            // batch331: ONE source of truth for "follow the desktop": the
+            // creation path and the back-to-auto override both call this.
+            if (hwnd_ == nullptr) {
+                // No live window: restore the remembered desktop scale
+                // (Create() will re-derive it from the monitor anyway).
+                ApplyDpi(96.0f * desktop_scale_);
+                return;
+            }
+            // The monitor the window actually sits on, clamped to the legal
+            // band a renderer accepts.
+            const UINT monitor_dpi = ::GetDpiForWindow(hwnd_);
+            if (monitor_dpi >= 48 && monitor_dpi <= 768) {
+                ApplyDpi(static_cast<float>(monitor_dpi));
+            }
+        }
+
         void VgwwWindow::SetUiScale(float scale) {
             ui_scale_ = (scale > 0.0f) ? scale : 0.0f;
+            // batch331: switching back to "auto" (scale <= 0) must RE-DERIVE the
+            // scale from the desktop. The old early return left scale_ at the
+            // last fixed value, so the settings page's "auto" pick changed
+            // nothing on screen until the next launch. ApplyAutoDpi() is the
+            // same desktop-DPI rule Create() applies (one rule, not two).
             if (ui_scale_ <= 0.0f) {
-                return;  // auto: keep the desktop-driven scale
+                ApplyAutoDpi();
+                if (hwnd_ == nullptr) {
+                    return;  // Create() will re-derive it from the monitor
+                }
+                const Size auto_target = scaled_client_size();
+                ::SetWindowPos(hwnd_, nullptr, 0, 0,
+                               static_cast<int>(auto_target.w),
+                               static_cast<int>(auto_target.h),
+                               SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE);
+                Relayout();
+                Invalidate();
+                return;
             }
             ApplyDpi(96.0f * ui_scale_);
             if (hwnd_ == nullptr) {
@@ -522,6 +578,18 @@ namespace vgww {
             // A5: the application icon must reach the window class AND the
             // instance (taskbar/Alt-Tab); fall back to the stock application
             // icon when the painter failed.
+            // batch332 P3: Create() is reusable-retry (see the reset above), so
+            // a second call after a failed renderer_.Initialize would overwrite
+            // these handles and leak the previous HICONs. Release them first
+            // (same ownership the destructor already assumes).
+            if (small_icon_ != nullptr) {
+                ::DestroyIcon(small_icon_);
+                small_icon_ = nullptr;
+            }
+            if (big_icon_ != nullptr) {
+                ::DestroyIcon(big_icon_);
+                big_icon_ = nullptr;
+            }
             tray::MakeAppIcon(&small_icon_, &big_icon_);
             wc.hIcon = big_icon_ != nullptr
                            ? big_icon_
@@ -576,10 +644,7 @@ namespace vgww {
             // 980x640 px window (784x512 logical viewport = "everything is
             // cut off / got smaller"). A FIXED ui_scale keeps its own DPI.
             if (ui_scale_ <= 0.0f) {
-                const UINT monitor_dpi = ::GetDpiForWindow(hwnd_);
-                if (monitor_dpi >= 48 && monitor_dpi <= 768) {
-                    ApplyDpi(static_cast<float>(monitor_dpi));
-                }
+                ApplyAutoDpi();
             }
             {
                 // batch28: a restored geometry wins over the design size - it
@@ -728,6 +793,11 @@ namespace vgww {
             // Defensive: no half-pressed state survives focus loss, and hover
             // must not stick while unfocused (T6-F1 M3).
             mouse_capture_ = nullptr;
+            // batch332 P1: a drag latched in a control (column resize, text
+            // drag-select) must be aborted too. The release that would have
+            // cleared it goes to the window that took activation, so without
+            // this the control kept resizing / extending on every later hover.
+            CancelDragsIn(root_);
             ClearHover();
             // batch26 P0: a popup left open while the app loses focus
             // (another window / Alt+Tab) used to stay on screen after
@@ -3121,6 +3191,13 @@ namespace vgww {
                 if (target) {
                     target->OnMouseUp(logical);
                 }
+                // batch332 P1: a release that reaches us must end EVERY
+                // in-flight drag, not just the captured element's. When the
+                // press element was lost (capture dropped, tree rebuilt) the
+                // release routes elsewhere and the original control would keep
+                // resizing / extending on later hovers. CancelDrag is a no-op
+                // for a control that already cleared its own state above.
+                CancelDragsIn(root_);
                 Invalidate();  // button release / drag end must repaint (G5)
                 return target != nullptr;
             }

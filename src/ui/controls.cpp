@@ -1474,7 +1474,12 @@ namespace vgww {
                 return false;
             }
             const float rel = p.y - bounds_.y;
-            if (rel <= kPickerRowH) {
+            // batch332 P3: RenderCore paints the collapsed box as the half-open
+            // band [0, kPickerRowH) and the search row as [kPickerRowH,
+            // 2*kPickerRowH). `<=` claimed the boundary pixel for the box, so
+            // the one pixel that is PAINTED as the search row toggled the popup
+            // instead of focusing the field. Hit and paint must agree.
+            if (rel < kPickerRowH) {
                 SetExpanded(!expanded_);
                 return true;
             }
@@ -4013,14 +4018,21 @@ namespace vgww {
                 if (options_.empty()) {
                     return true;
                 }
-                std::size_t index = 0;
+                // batch332 P2: options_.size() is the "no current selection"
+                // sentinel. Using 0 for both "first option" and "not found"
+                // made Down skip options_[0] (0+1) and Up land on the last
+                // entry. With no selection Down must pick the FIRST option and
+                // Up the LAST.
+                std::size_t index = options_.size();
                 for (std::size_t i = 0; i < options_.size(); ++i) {
                     if (options_[i].first == selected_) {
                         index = i;
                         break;
                     }
                 }
-                if (vk == kVkDown) {
+                if (index == options_.size()) {
+                    index = (vk == kVkDown) ? 0 : options_.size() - 1;
+                } else if (vk == kVkDown) {
                     index = (index + 1) % options_.size();
                 } else {
                     index = (index + options_.size() - 1) % options_.size();

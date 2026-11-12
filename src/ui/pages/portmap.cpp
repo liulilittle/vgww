@@ -307,23 +307,17 @@ namespace vgww {
                         status_->SetText(busy_line);
                         status_->SetColor(ColorToken::Warning);
                     } else if (!snapshot.portmaps.empty()) {
-                        const std::wstring a =
-                            std::to_wstring(st.accepted);
-                        const std::wstring d =
-                            std::to_wstring(st.dial_failed);
-                        std::wstring line =
-                            i18n.T(Str::PortmapLiveSummary);
-                        const auto sub = [&](const wchar_t* needle,
-                                             const std::wstring& value) {
-                            const std::wstring key(needle);
-                            const size_t at = line.find(key);
-                            if (at != std::wstring::npos) {
-                                line.replace(at, key.size(), value);
-                            }
-                        };
-                        sub(L"%s", a);
-                        sub(L"%s", d);
-                        status_->SetText(line);
+                        // batch333: format the template through I18n::Format
+                        // instead of hand-replacing two literal "%s" tokens
+                        // positionally. The old loop silently dropped the
+                        // dial-failure count when the template carried only
+                        // one token and swapped the two numbers when a
+                        // translation reordered them; the indexed template
+                        // "{0}"/"{1}" is checked for order by the i18n gate
+                        // across every language.
+                        status_->SetText(i18n.Format(Str::PortmapLiveSummary,
+                                                     {std::to_wstring(st.accepted),
+                                                      std::to_wstring(st.dial_failed)}));
                         status_->SetColor(ColorToken::TextDim);
                     } else {
                         status_->SetText(std::wstring());

@@ -17395,6 +17395,44 @@ static void TestB19RtlTableColumnAndDangerEdge() {
     i18n.SetLangCode("zh-CN");
 }
 
+// ---------------------------------------------------------------------------
+// batch331 P2: switching the UI scale back to "auto" left the window stuck at
+// the last FIXED scale. SetUiScale(0) used to return before touching scale_,
+// and scale_ had already been overwritten by the fixed value, so "auto" did
+// not follow the desktop any more. Reported by the settings page, which
+// passes 0.0f for "auto" (app.cpp: app_ui_scale -> SetUiScale).
+static void TestB331UiScaleAutoRestoresDesktop() {
+    using namespace vgww::ui;
+    FixTextMetrics();
+
+    // Desktop at 125%: a fixed 150% then back to auto must land on 125%
+    // again (red before the fix: it stayed at 150%).
+    {
+        VgwwWindow window;
+        window.SetDpiForTest(1.25f);
+        CHECK(std::fabs(window.scale() - 1.25f) < 1e-4f);
+        window.SetUiScale(1.5f);
+        CHECK(!window.ui_scale_auto());
+        CHECK(std::fabs(window.scale() - 1.5f) < 1e-4f);
+        window.SetUiScale(0.0f);
+        CHECK(window.ui_scale_auto());
+        CHECK(std::fabs(window.scale() - 1.25f) < 1e-4f);
+        // ...and auto keeps following the desktop afterwards.
+        CHECK(window.ApplyDesktopDpiForTest(192.0f));
+        CHECK(std::fabs(window.scale() - 2.0f) < 1e-4f);
+    }
+
+    // Regression guard: a window that was never pinned stays on the desktop
+    // scale when "auto" is (re)selected.
+    {
+        VgwwWindow window;
+        window.SetDpiForTest(1.75f);
+        window.SetUiScale(0.0f);
+        CHECK(window.ui_scale_auto());
+        CHECK(std::fabs(window.scale() - 1.75f) < 1e-4f);
+    }
+}
+
 // ============================================================================
 // Batch20: DPI / UI scale.
 //  (1) the window override: a fixed scale wins over the desktop DPI, resizes
@@ -36049,8 +36087,382 @@ void TestConsoleReaderThrowIsContained() {
     console_log::ClearForTest();
 }
 
+// ============================================================================
+// batch332 P1: a drag that never sees its mouse-up must not latch forever.
+//
+// Repro: press the left button on a column boundary (TableElement::resizing_)
+// or inside a text editor (TextInputElement::dragging_), then take the release
+// somewhere the window never sees it - outside the client area, or through an
+// Alt+Tab / hide-to-tray that kills activation. resizing_/dragging_ stayed
+// true, so afterwards merely MOVING the pointer kept resizing the column /
+// extending the selection, and the resize cursor stuck.
+//
+// Fix contract: Element::CancelDrag() is the single "abort the in-flight
+// drag" hook; the window calls it for every element on WM_KILLFOCUS and on
+// WM_LBUTTONUP (a release that reaches us still ends the drag even when the
+// press element was lost).
+// ============================================================================
+static void TestB332CancelDragOnKillFocus() {
+    using namespace vgww::ui;
+    FixTextMetrics();
+    VgwwWindow window;
+    auto table = std::make_unique<TableElement>();
+    table->id = "b332.table";
+    TableColumn c0;
+    c0.id = "a"; c0.header = Str::ColIp; c0.width = 100.0f; c0.align = Align::Start;
+    TableColumn c1;
+    c1.id = "b"; c1.header = Str::ColMac; c1.width = 100.0f; c1.align = Align::Start;
+    table->SetColumns({c0, c1});
+    table->SetRows({{"r0", {L"A0", L"B0"}, false}});
+    TableElement* tbl = table.get();
+    auto input = std::make_unique<TextInputElement>();
+    input->id = "b332.input";
+    input->SetValue(L"abcdef");
+    TextInputElement* ti = input.get();
+    auto root = std::make_unique<StackPanel>(Orientation::Vertical, 4.0f);
+    root->Add(std::move(table));
+    root->Add(std::move(input));
+    window.SetRoot(root.get());
+    window.ResizeForTest(400.0f, 300.0f);
+
+    // --- Table: grab the column boundary, then lose activation. -----------
+    const Rect tb = tbl->bounds();
+    CHECK(tb.w > 0.0f && tb.h > 0.0f);
+    const float body_y = tb.y + 44.0f;  // below the 40 px header band
+    CHECK(body_y < tb.y + tb.h);
+    const float boundary_x = tb.x + tbl->resolved_widths()[0];
+    const float header_y = tb.y + 8.0f;
+    const float width_before = tbl->resolved_widths()[0];
+    CHECK(window.RouteMouseForTest(WM_LBUTTONDOWN,
+                                   Point{boundary_x, header_y}));
+    // Sanity: while the drag is live a move DOES resize (this is the
+    // behaviour the latch leaks).
+    CHECK(window.RouteMouseForTest(WM_MOUSEMOVE,
+                                   Point{boundary_x + 15.0f, body_y}));
+    CHECK(std::fabs(tbl->resolved_widths()[0] - width_before) > 1.0f);
+
+    // Lose activation with the button still "down": the drag must be aborted.
+    window.HandleKillFocusForTest();
+    const float width_after_kill = tbl->resolved_widths()[0];
+    // Moving the pointer afterwards must not touch the columns any more.
+    window.RouteMouseForTest(WM_MOUSEMOVE, Point{boundary_x + 40.0f, body_y});
+    CHECK(std::fabs(tbl->resolved_widths()[0] - width_after_kill) < 1e-4f);
+    // ...and the resize cursor is gone (resizing_ was the trigger).
+    CHECK(window.CursorHintForTest(Point{boundary_x + 40.0f, body_y}) !=
+          CursorKind::SizeWE);
+
+    // --- Text input: drag-select, then lose activation. -------------------
+    const Rect ib = ti->bounds();
+    CHECK(ib.w > 0.0f && ib.h > 0.0f);
+    const std::size_t anchor_before = ti->selection_anchor();
+    CHECK(window.RouteMouseForTest(
+        WM_LBUTTONDOWN, Point{ib.x + ib.w - 8.0f, ib.y + 5.0f}));
+    // Sanity: the live drag DOES move the caret/selection.
+    CHECK(window.RouteMouseForTest(WM_MOUSEMOVE,
+                                   Point{ib.x + 8.0f, ib.y + 5.0f}));
+    CHECK(ti->caret_index() != anchor_before);
+    window.HandleKillFocusForTest();
+    const std::size_t caret_after_kill = ti->caret_index();
+    const std::size_t anchor_after_kill = ti->selection_anchor();
+    // A later move must not extend the selection any more.
+    window.RouteMouseForTest(WM_MOUSEMOVE,
+                             Point{ib.x + ib.w - 2.0f, ib.y + 5.0f});
+    CHECK(ti->caret_index() == caret_after_kill);
+    CHECK(ti->selection_anchor() == anchor_after_kill);
+
+    // --- The release itself is the other abort point. ---------------------
+    // A press whose capture was lost (the window's mouse_capture_ is null, so
+    // the release routes to whatever is under the pointer) must still end the
+    // in-flight drag: the button-up fallback aborts every element's drag.
+    const float boundary_x2 = tb.x + tbl->resolved_widths()[0];
+    CHECK(tbl->OnMouseDown(Point{boundary_x2, header_y}));  // resizing_ = true
+    CHECK(window.RouteMouseForTest(
+        WM_LBUTTONUP, Point{ib.x + 8.0f, ib.y + 5.0f}));   // release elsewhere
+    const float width_after_up = tbl->resolved_widths()[0];
+    window.RouteMouseForTest(WM_MOUSEMOVE, Point{boundary_x2 + 60.0f, body_y});
+    CHECK(std::fabs(tbl->resolved_widths()[0] - width_after_up) < 1e-4f);
+
+    window.SetRoot(nullptr);
+}
+
+// ============================================================================
+// batch332 P2: SelectElement arrow keys with NO current selection.
+//
+// `index = 0` doubled as both "first option" and "not found", so Down from an
+// empty selection went to options_[1] (the first entry was skipped) and Up
+// landed on the last one. With no selection Down must pick the FIRST option
+// and Up the LAST (standard list behaviour).
+// ============================================================================
+static void TestB332SelectArrowWithoutSelection() {
+    using namespace vgww::ui;
+    FixTextMetrics();
+
+    const auto down = [](std::size_t count) {
+        SelectElement select;
+        std::vector<std::pair<std::wstring, std::wstring>> options;
+        for (std::size_t i = 0; i < count; ++i) {
+            options.emplace_back(L"v" + std::to_wstring(i),
+                                 L"L" + std::to_wstring(i));
+        }
+        select.SetOptions(std::move(options));
+        select.SetExpanded(true);
+        select.OnKeyDown(0x28);  // VK_DOWN
+        return select.selected_value();
+    };
+    const auto up = [](std::size_t count) {
+        SelectElement select;
+        std::vector<std::pair<std::wstring, std::wstring>> options;
+        for (std::size_t i = 0; i < count; ++i) {
+            options.emplace_back(L"v" + std::to_wstring(i),
+                                 L"L" + std::to_wstring(i));
+        }
+        select.SetOptions(std::move(options));
+        select.SetExpanded(true);
+        select.OnKeyDown(0x26);  // VK_UP
+        return select.selected_value();
+    };
+
+    CHECK(down(2) == L"v0");   // was v1 (options_[0] skipped)
+    CHECK(down(5) == L"v0");
+    CHECK(up(2) == L"v1");     // last option
+    CHECK(up(5) == L"v4");
+    CHECK(down(1) == L"v0");   // single option wraps onto itself
+    CHECK(up(1) == L"v0");
+
+    // A real selection keeps the plain +1 / -1 step (unchanged behaviour).
+    SelectElement sel;
+    sel.SetOptions({{L"a", L"A"}, {L"b", L"B"}, {L"c", L"C"}});
+    sel.SetSelectedValue(L"b");
+    sel.SetExpanded(true);
+    CHECK(sel.OnKeyDown(0x28) && sel.selected_value() == L"c");
+    CHECK(sel.OnKeyDown(0x28) && sel.selected_value() == L"a");  // wraps
+    CHECK(sel.OnKeyDown(0x26) && sel.selected_value() == L"c");
+}
+
+// ============================================================================
+// batch333 P3: the LanguagePicker search row's TOP edge belongs to the search
+// row, not the collapsed trigger box.
+//
+// RenderCore paints the collapsed box as [0, kPickerRowH) and the search row
+// as [kPickerRowH, 2*kPickerRowH), but OnMouseDown used `rel <= kPickerRowH`,
+// so the single pixel exactly on kPickerRowH toggled the popup instead of
+// focusing the search field - hit and paint disagreed on the same pixel.
+// ============================================================================
+static void TestB332PickerRowBoundaryBelongsToSearch() {
+    using namespace vgww::ui;
+    FixTextMetrics();
+    constexpr float kRow = 28.0f;  // controls.cpp LanguagePicker kPickerRowH
+
+    LanguagePicker picker;
+    picker.SetLanguages({{L"English", "en"}, {L"中文", "zh-CN"}}, "en");
+    picker.Arrange(Rect{0.0f, 0.0f, 200.0f, 200.0f});
+    picker.SetExpanded(true);
+    CHECK(picker.expanded());
+
+    // The exact boundary pixel of the search row: clicking it must keep the
+    // popup open and hand the caret to the search field, not toggle the box.
+    const Point boundary{picker.bounds().x + 20.0f,
+                         picker.bounds().y + kRow};
+    CHECK(picker.OnMouseDown(boundary));
+    CHECK(picker.expanded());        // was toggled CLOSED by the old <= test
+    CHECK(picker.search_active());
+
+    // The last row pixel of the trigger box still toggles it (unchanged).
+    picker.SetExpanded(true);
+    const Point last_box_px{picker.bounds().x + 20.0f,
+                            picker.bounds().y + kRow - 0.5f};
+    CHECK(picker.OnMouseDown(last_box_px));
+    CHECK(!picker.expanded());
+}
+
+// batch333 P3: editing a rule that vanished between the render and the click
+// must not open an empty form. The table still carries the stale row id, so
+// FindRule returns nullptr; the page used to open the form with empty up/down
+// and a submit then produced the misleading "up and down cannot both be 0"
+// error. The sibling pages (portmap/firewall) already return early.
+static void TestB333RatelimitEditVanishedRuleOpensNoForm() {
+    using namespace vgww::ui;
+    FixTextMetrics();
+    I18n::Instance().SetLang(Lang::ZhCN);
+
+    ShellFakeSource source;
+    RecordingExecutor executor;
+    UiController controller(source, executor);
+    std::string start_error;
+    CHECK(controller.Start(start_error));
+
+    UiSnapshot snapshot = MakeRulesSnapshot(1, 1);
+    snapshot.ratelimits.push_back(
+        vgww::web::RateLimitRule{"11:22:33:44:55:66", 100, 200});
+
+    UiApp app;
+    app.Compose(controller, snapshot);
+    app.root().Arrange({0.0f, 0.0f, 1280.0f, 800.0f});
+    app.router().Navigate("ratelimit");
+    app.Update(snapshot);
+    app.root().Arrange({0.0f, 0.0f, 1280.0f, 800.0f});
+
+    auto* table =
+        dynamic_cast<TableElement*>(FindById(app.root(), "ratelimit.table"));
+    auto* dialog =
+        dynamic_cast<DialogHost*>(FindById(app.root(), "ratelimit.dialog"));
+    CHECK(table != nullptr && dialog != nullptr);
+    if (table == nullptr || dialog == nullptr) {
+        controller.Stop();
+        return;
+    }
+    CHECK(table->row_count() == 1);
+    CHECK(!dialog->open());
+
+    // The rule disappears (deleted from the WebUI / another client) while the
+    // table still holds the old row id.
+    UiSnapshot none = MakeRulesSnapshot(2, 2);
+    app.Update(none);
+    CHECK(table->row_count() == 0);
+    CHECK(!dialog->open());
+
+    table->on_row_action("11:22:33:44:55:66", 0);  // [edit] on the vanished row
+    CHECK(!dialog->open());  // RED: opens an empty form today
+    CHECK(executor.commands.empty());
+
+    controller.Stop();
+}
+
+// batch333 P3: the console empty-state text must follow a language switch. The
+// placeholder was refreshed only on the hidden->visible edge, so switching the
+// language while the ring stayed empty left the old language on screen.
+static void TestB333ConsoleEmptyHintFollowsLanguageSwitch() {
+    using namespace vgww::ui;
+    FixTextMetrics();
+    console_log::ClearForTest();
+    I18n& i18n = I18n::Instance();
+    i18n.SetLang(Lang::ZhCN);
+
+    ShellFakeSource source;
+    ShellFakeExecutor executor;
+    UiController controller(source, executor);
+
+    UiSnapshot snapshot;
+    snapshot.seq = 1;
+
+    UiApp app;
+    app.Compose(controller, snapshot);
+    app.router().Navigate("console");
+    app.Update(snapshot);
+    app.root().Arrange({0.0f, 0.0f, 1280.0f, 800.0f});
+
+    auto* placeholder =
+        dynamic_cast<Text*>(FindById(app.root(), "console.empty"));
+    CHECK(placeholder != nullptr);
+    if (placeholder == nullptr) {
+        controller.Stop();
+        return;
+    }
+    CHECK(placeholder->visible);
+    const std::wstring zh = placeholder->text();
+    CHECK(!zh.empty());
+    CHECK(zh == i18n.T(Str::ConsoleEmptyHint));
+
+    // Switch to English while the ring is STILL empty: the placeholder stays
+    // visible, so the old edge-triggered refresh never fires.
+    i18n.SetLang(Lang::En);
+    app.ApplyLanguage();
+    app.Update(snapshot);
+    app.root().Arrange({0.0f, 0.0f, 1280.0f, 800.0f});
+    placeholder = dynamic_cast<Text*>(FindById(app.root(), "console.empty"));
+    CHECK(placeholder != nullptr);
+    if (placeholder != nullptr) {
+        CHECK(placeholder->visible);
+        CHECK(placeholder->text() == i18n.T(Str::ConsoleEmptyHint));  // RED: zh
+        CHECK(placeholder->text() != zh);
+    }
+
+    i18n.SetLang(Lang::ZhCN);
+    app.ApplyLanguage();
+    console_log::ClearForTest();
+    controller.Stop();
+}
+
+// batch333 P3: the live-forwarding status line must render both counters from
+// the INDEXED template. The old code hand-replaced two literal "%s" tokens
+// positionally: a missing second token silently dropped the dial-failure count,
+// and a translation that reordered them swapped the two numbers. The template
+// is now "{0}"/"{1}" and goes through I18n::Format.
+//
+// NOTE: the "missing placeholder" scenario is NOT unit-tested - the template is
+// a compiled-in table with no injection seam, so a malformed translation cannot
+// be fed to the page from a test. This case is the regression guard for the
+// normal (well-formed) languages.
+static void TestB333PortmapLiveSummaryRendersBothCounters() {
+    using namespace vgww::ui;
+    FixTextMetrics();
+    I18n& i18n = I18n::Instance();
+    i18n.SetLang(Lang::ZhCN);
+
+    // The template itself must be indexed, not positional.
+    CHECK(std::wstring(i18n.T(Str::PortmapLiveSummary)).find(L"%s") ==
+          std::wstring::npos);
+
+    ShellFakeSource source;
+    RecordingExecutor executor;
+    UiController controller(source, executor);
+    std::string start_error;
+    CHECK(controller.Start(start_error));
+
+    UiSnapshot snapshot = MakeRulesSnapshot(1, 1);
+    snapshot.portmaps.push_back(
+        vgww::web::PortMappingRule{"tcp", 8080, "192.168.1.10", 80, 7});
+    snapshot.portmap_stats.accepted = 3;
+    snapshot.portmap_stats.dial_failed = 1;
+
+    UiApp app;
+    app.Compose(controller, snapshot);
+    app.root().Arrange({0.0f, 0.0f, 1280.0f, 800.0f});
+    app.router().Navigate("portmap");
+    app.Update(snapshot);
+    app.root().Arrange({0.0f, 0.0f, 1280.0f, 800.0f});
+
+    const auto check_line = [&](const wchar_t* lang) {
+        auto* status =
+            dynamic_cast<Text*>(FindById(app.root(), "portmap.status"));
+        CHECK(status != nullptr);
+        if (status == nullptr) {
+            return;
+        }
+        const std::wstring text = status->text();
+        CHECK(!text.empty());
+        // No placeholder may leak into the rendered line.
+        CHECK(text.find(L"%s") == std::wstring::npos);
+        CHECK(text.find(L"{0}") == std::wstring::npos);
+        CHECK(text.find(L"{1}") == std::wstring::npos);
+        // Both counters are present, in the template's own order.
+        CHECK(text == i18n.Format(Str::PortmapLiveSummary, {L"3", L"1"}));
+        CHECK(text.find(L"3") != std::wstring::npos);
+        CHECK(text.find(L"1") != std::wstring::npos);
+        (void)lang;
+    };
+
+    check_line(L"zh");
+
+    i18n.SetLang(Lang::En);
+    app.ApplyLanguage();
+    app.Update(snapshot);
+    app.root().Arrange({0.0f, 0.0f, 1280.0f, 800.0f});
+    check_line(L"en");
+
+    i18n.SetLang(Lang::ZhCN);
+    app.ApplyLanguage();
+    controller.Stop();
+}
+
 int main() {
 
+    TestB332CancelDragOnKillFocus();
+    TestB332SelectArrowWithoutSelection();
+    TestB332PickerRowBoundaryBelongsToSearch();
+    TestB333RatelimitEditVanishedRuleOpensNoForm();
+    TestB333ConsoleEmptyHintFollowsLanguageSwitch();
+    TestB333PortmapLiveSummaryRendersBothCounters();
     TestWndProcThrowIsContained();
     TestConsoleReaderThrowIsContained();
     TestB79SparklineOpsBoundedByDataNotWidth();
@@ -36329,6 +36741,7 @@ int main() {
     TestB199AboutWebOpenFailure();
     TestB19RtlTableColumnAndDangerEdge();
     TestB20UiScale();
+    TestB331UiScaleAutoRestoresDesktop();
     TestB20LanguagePickerCorners();
     TestB62LanguagePickerFilterAllocationBudget();
     TestB20LanguagePickerExpandLayout();

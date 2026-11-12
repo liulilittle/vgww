@@ -8658,14 +8658,16 @@ int main(int argc, char** argv) {
         const auto u2_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
                                std::chrono::steady_clock::now() - u2t0)
                                .count();
-        CHECK(spawned);
+        // batch331 P2: a child terminated at the deadline did NOT exit on its
+        // own, so RunProcessCapture reports false (installer.h:50-52). The
+        // caller must be able to tell "ran and reported non-zero" from
+        // "never completed" - that distinction is what keeps a hung
+        // schtasks query from being read as "task absent".
+        CHECK(!spawned);
         CHECK(u2_ms < 4000);  // U2 red: old code waits for ping to exit
         CHECK(code != 0);     // U2 red: child was terminated
     }
 
-    // Every response carries the admin-surface hardening headers: the UI
-    // must not be frameable (clickjacking), bodies must not be MIME
-    // sniffed, and polled API state must never be heuristically cached.
     {
         std::string raw;
         CHECK(HttpRawFull(kPort,

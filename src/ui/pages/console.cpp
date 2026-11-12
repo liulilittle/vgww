@@ -929,11 +929,13 @@ namespace vgww {
                 // early and leave the placeholder hidden on an empty console.
                 const bool has_content = 0 != console_log::LineCount();
                 if (empty_ != nullptr) {
-                    const bool was_visible = empty_->visible;
                     empty_->visible = !has_content;
-                    if (was_visible != empty_->visible && empty_->visible) {
-                        empty_->SetMessage(Str::ConsoleEmptyHint);  // language
-                    }
+                    // batch333: relabel on EVERY tick, not only on the
+                    // hidden->visible edge. A language switch while the ring
+                    // stays empty never crosses that edge, so the placeholder
+                    // kept the old language. SetText short-circuits on an
+                    // unchanged value, so this costs nothing per tick.
+                    empty_->SetMessage(Str::ConsoleEmptyHint);
                 }
                 const std::uint64_t rev = console_log::Revision();
                 if (rev == last_rev_) {

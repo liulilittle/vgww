@@ -305,6 +305,15 @@ namespace vgww {
             virtual bool OnMouseDown(Point) { return false; }
             virtual bool OnMouseUp(Point) { return false; }
             virtual bool OnMouseMove(Point) { return false; }
+            /// batch332 P1: abort an in-flight pointer drag (a column resize, a
+            /// text drag-select). A control that latches a "button is down"
+            /// flag in OnMouseDown and only clears it in OnMouseUp MUST override
+            /// this: the window calls it when the release can never arrive
+            /// (WM_KILLFOCUS: Alt+Tab / hide-to-tray) and as a WM_LBUTTONUP
+            /// fallback, so a lost mouse-up cannot leave the control resizing
+            /// or extending a selection on every later hover. Default: no drag
+            /// state, nothing to cancel.
+            virtual void CancelDrag() noexcept {}
             /// batch37e: a real double click (WM_LBUTTONDBLCLK). Windows sends
             /// this INSTEAD of the second button-down, so a control that wants
             /// double-click semantics overrides this rather than counting downs.
