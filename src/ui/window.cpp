@@ -2221,16 +2221,36 @@ namespace vgww {
         // after reading the composition strings, and what tests drive directly
         // (no real IME available headless).
 
+        // The LanguagePicker keeps its in-popup search box as a private member,
+        // NOT a tree child, so focused_ names the picker container rather than
+        // the editor. While that search row is active, TextInput-specific window
+        // paths (IME commit, caret phase, edit shortcuts, IME anchor) must
+        // resolve to the internal editor. C9 (tests/test_ui.cpp:18039) forbids
+        // pointing focused_ at the editor, so this read-only resolver is the
+        // single choke point instead. search_active() gates it: OnFocus alone
+        // does not hand the picker IME focus.
+        TextInputElement* VgwwWindow::FocusedTextInput() {
+            if (focused_ != nullptr && !ElementInTree(root_, focused_)) {
+                focused_ = nullptr;
+            }
+            if (auto* picker = dynamic_cast<LanguagePicker*>(focused_)) {
+                if (picker->search_active()) {
+                    return picker->search_editor();
+                }
+            }
+            return dynamic_cast<TextInputElement*>(focused_);
+        }
+
         void VgwwWindow::ImeStartComposition() {
             if (focused_ != nullptr && !ElementInTree(root_, focused_)) {
                 focused_ = nullptr;
             }
-            auto* input = dynamic_cast<TextInputElement*>(focused_);
+            auto* input = FocusedTextInput();
             if (input == nullptr) {
                 return;
             }
             input->SetCompositionForTest(std::wstring(), 0);
-            InvalidateElement(input);
+            InvalidateLiveElement(focused_);
         }
 
         void VgwwWindow::ImeUpdateComposition(const std::wstring& composition,
@@ -2238,25 +2258,25 @@ namespace vgww {
             if (focused_ != nullptr && !ElementInTree(root_, focused_)) {
                 focused_ = nullptr;
             }
-            auto* input = dynamic_cast<TextInputElement*>(focused_);
+            auto* input = FocusedTextInput();
             if (input == nullptr) {
                 return;
             }
             input->SetCompositionForTest(composition, caret);
-            InvalidateElement(input);
+            InvalidateLiveElement(focused_);
         }
 
         void VgwwWindow::ImeCommitResult(const std::wstring& result) {
             if (focused_ != nullptr && !ElementInTree(root_, focused_)) {
                 focused_ = nullptr;
             }
-            auto* input = dynamic_cast<TextInputElement*>(focused_);
+            auto* input = FocusedTextInput();
             if (input == nullptr) {
                 return;
             }
-            const Rect before = KeyInvalidationBounds(input);
+            const Rect before = KeyInvalidationBounds(focused_);
             input->CommitComposition(result);
-            const Rect after = KeyInvalidationBounds(input);
+            const Rect after = KeyInvalidationBounds(focused_);
             InvalidateRect(UnionRects(before, after));
         }
 
@@ -2264,12 +2284,12 @@ namespace vgww {
             if (focused_ != nullptr && !ElementInTree(root_, focused_)) {
                 focused_ = nullptr;
             }
-            auto* input = dynamic_cast<TextInputElement*>(focused_);
+            auto* input = FocusedTextInput();
             if (input == nullptr) {
                 return;
             }
             input->ClearComposition();
-            InvalidateElement(input);
+            InvalidateLiveElement(focused_);
         }
 
         void VgwwWindow::PlaceImeWindows() {
@@ -2280,7 +2300,7 @@ namespace vgww {
             if (focused_ != nullptr && !ElementInTree(root_, focused_)) {
                 focused_ = nullptr;
             }
-            auto* input = dynamic_cast<TextInputElement*>(focused_);
+            auto* input = FocusedTextInput();
             if (input == nullptr || hwnd_ == nullptr) {
                 return;
             }
@@ -2774,8 +2794,7 @@ namespace vgww {
                             return true;
                         }
                     }
-                    if (auto* input =
-                            dynamic_cast<TextInputElement*>(focused_)) {
+                    if (auto* input = FocusedTextInput()) {
                         const Rect old_r = KeyInvalidationBounds(input);
                         bool handled = false;
                         if (ctrl && (vk == 0x5A || vk == 0x59)) {
@@ -3859,7 +3878,7 @@ namespace vgww {
                         !ElementInTree(root_, focused_)) {
                         focused_ = nullptr;
                     }
-                    auto* input = dynamic_cast<TextInputElement*>(focused_);
+                    auto* input = FocusedTextInput();
                     if (input == nullptr || hwnd_ == nullptr) {
                         break;
                     }

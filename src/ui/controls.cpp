@@ -1250,6 +1250,27 @@ namespace vgww {
             return Size{w, kPickerRowH * (1.0f + search_rows + rows)};
         }
 
+        void LanguagePicker::ArrangeCore(Rect final_rect) {
+            // The private search editor is NOT a tree child, so no layout
+            // pass ever arranges it. Arrange it explicitly with the same
+            // field rect DrawSearchRow paints, so IME anchors, the caret
+            // repaint and composition placement read a real (non-zero) box.
+            // Collapsed: zero it so a stale anchor cannot survive a re-open.
+            if (search_ == nullptr) {
+                return;
+            }
+            if (expanded_) {
+                const Rect field{
+                    final_rect.x + 4.0f,
+                    final_rect.y + kPickerRowH + 4.0f,
+                    std::max(final_rect.w - 8.0f, 0.0f),
+                    std::max(kPickerRowH - 8.0f, 0.0f)};
+                search_->Arrange(field);
+            } else {
+                search_->Arrange(Rect{final_rect.x, final_rect.y, 0.0f, 0.0f});
+            }
+        }
+
         void LanguagePicker::RenderCore(RenderCtx& ctx) {
             if (bounds_.w <= 0.0f || bounds_.h <= 0.0f) {
                 return;
@@ -1368,7 +1389,7 @@ namespace vgww {
                 placeholder ? ColorFor(ColorToken::TextDim)
                             : ColorFor(ColorToken::Text),
                 Align::Start);
-            if (search_focused_ && search_ != nullptr) {
+            if (search_focused_ && search_ != nullptr && search_->caret_visible()) {
                 const std::size_t caret = search_->caret_index();
                 const float prefix_w =
                     caret > 0
@@ -1515,6 +1536,13 @@ namespace vgww {
                 ++content_rev;
             }
             return handled;
+        }
+
+        bool LanguagePicker::OnCaretBlinkTick() noexcept {
+            if (!expanded_ || !search_focused_ || search_ == nullptr) {
+                return false;
+            }
+            return search_->OnCaretBlinkTick();
         }
 
         std::wstring LanguagePicker::tooltip_text(Point p) const {

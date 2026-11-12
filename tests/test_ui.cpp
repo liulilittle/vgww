@@ -22194,6 +22194,127 @@ static void TestB101ImeCommitIsUndoableAndCapped() {
     I18n::Instance().SetLang(Lang::ZhCN);
 }
 
+// ============================================================================
+// LanguagePicker in-popup search editor: IME commit / caret blink / geometry.
+// The search editor is a private member (NOT a tree child), so the window's
+// TextInput-specific paths (IME commit, caret phase, invalidation, IME anchor)
+// must be routed to it through the focused LanguagePicker, without ever making
+// focused_ point at the editor itself (C9 contract).
+// ============================================================================
+static void TestLanguagePickerSearchEditorImeCaretAndBounds() {
+    using namespace vgww::ui;
+    FixTextMetrics();
+    I18n::Instance().SetLang(Lang::ZhCN);
+
+    auto root = std::make_unique<StackPanel>(Orientation::Vertical, 0.0f);
+    auto* picker = static_cast<LanguagePicker*>(
+        root->Add(std::make_unique<LanguagePicker>()));
+    picker->SetLanguages({{L"English", "en"},
+                          {L"Chinese", "zh-CN"}},
+                         "zh-CN");
+    root->Arrange({0.0f, 0.0f, 320.0f, 160.0f});
+
+    VgwwWindow window;
+    window.SetRoot(root.get());
+    // Clicking the picker focuses the LanguagePicker container, NOT its
+    // internal search editor (C9, tests/test_ui.cpp:18039).
+    window.SetFocusForTest(picker);
+    CHECK(window.FocusedForTest() == picker);
+    CHECK(window.FocusedForTest() != picker->search_editor());
+
+    // Open the popup: search row becomes active (search_focused_ = true).
+    // Arrange the picker directly so its bounds (and hence the IME / caret
+    // repaint region and the field rect) are deterministic headless.
+    picker->SetExpanded(true);
+    root->Arrange({0.0f, 0.0f, 320.0f, 160.0f});
+    picker->Arrange({0.0f, 0.0f, 320.0f, 112.0f});
+    CHECK(picker->search_active());
+    CHECK(picker->search_editor() != nullptr);
+    auto* search = picker->search_editor();
+
+    // (1) IME commit through the WINDOW seam must reach the internal editor.
+    // The old code dynamic_cast<TextInputElement*>(focused_) on the picker
+    // returned null, so the CJK commit was silently dropped.
+    window.ImeStartComposition();
+    window.ImeUpdateComposition(L"zhongwen", 8);
+    window.ImeCommitResult(L"\u4e2d\u6587");
+    window.ImeEndComposition();
+    CHECK(search->value() == L"\u4e2d\u6587");
+    CHECK(!search->has_composition());
+    CHECK(window.FocusedForTest() != picker->search_editor());
+
+    // (2) IME entry points must request a NON-EMPTY repaint region covering
+    // the search row. InvalidateElement(input) used the non-tree editor and
+    // was a no-op (ElementInTree guard).
+    window.ResetInvalidationStatsForTest();
+    window.ImeUpdateComposition(L"p", 1);
+    const Rect ime_region = window.invalidation_union_for_test();
+    CHECK(ime_region.w > 0.0f && ime_region.h > 0.0f);
+    CHECK(ime_region.y <= picker->bounds().y + 28.0f);
+    CHECK(ime_region.y + ime_region.h >= picker->bounds().y + 56.0f);
+    window.ImeEndComposition();
+
+    // (3) The internal editor must have a real (non-degenerate) bound on the
+    // search row: the IME anchor and caret repaint use it. It was never
+    // Arranged (search_->Arrange has no caller), so bounds() stayed {0,0,0,0}.
+    CHECK(search->bounds().w > 0.0f && search->bounds().h > 0.0f);
+    CHECK(search->bounds().x >= picker->bounds().x);
+    CHECK(search->bounds().y >= picker->bounds().y + 28.0f);
+    CHECK(search->bounds().y + search->bounds().h <=
+          picker->bounds().y + 56.0f);
+
+    // (4) Count the 1 px Text-coloured FillRect drawn in the search field
+    // band: it is the caret. It must equal exactly 1 when the phase is
+    // visible and 0 when hidden (DrawSearchRow honours caret_visible()).
+    const auto count_caret_fills = [&]() {
+        RenderCtx ctx;
+        ctx.BeginRecord();
+        picker->Render(ctx);
+        ctx.EndRecord();
+        std::size_t n = 0;
+        const Color text_color = ColorFor(ColorToken::Text);
+        for (const auto& op : ctx.ops()) {
+            if (op.kind != DrawOp::Kind::FillRect) {
+                continue;
+            }
+            if (std::fabs(op.rect.w - 1.0f) > 0.01f) {
+                continue;
+            }
+            if (std::fabs(op.color.r - text_color.r) > 0.01f ||
+                std::fabs(op.color.g - text_color.g) > 0.01f ||
+                std::fabs(op.color.b - text_color.b) > 0.01f) {
+                continue;
+            }
+            if (op.rect.y >= picker->bounds().y + 28.0f &&
+                op.rect.y < picker->bounds().y + 56.0f) {
+                ++n;
+            }
+        }
+        return n;
+    };
+    // Blur + refocus the editor resets the phase to visible deterministically
+    // (OnFocus early-returns when already focused, so a single call is a no-op).
+    search->OnFocus(false);
+    search->OnFocus(true);
+    CHECK(search->caret_visible());
+    const std::size_t visible_fills = count_caret_fills();
+    CHECK(visible_fills == 1);
+
+    // (5) A caret-blink tick driven through the WINDOW must flip the internal
+    // editor phase. The picker did not override OnCaretBlinkTick, so the old
+    // code left the phase (and the drawn caret) unchanged: forever solid.
+    const bool caret_before = search->caret_visible();
+    window.OnCaretBlinkTickForTest(1);
+    CHECK(search->caret_visible() != caret_before);
+    CHECK(!search->caret_visible());
+    CHECK(count_caret_fills() == 0);
+    window.OnCaretBlinkTickForTest(1);
+    CHECK(search->caret_visible());
+    CHECK(count_caret_fills() == 1);
+
+    window.SetRoot(nullptr);
+    I18n::Instance().SetLang(Lang::ZhCN);
+}
 static void TestB24ImeComposition() {
     using namespace vgww::ui;
     FixTextMetrics();
@@ -36839,6 +36960,7 @@ int main() {
     TestB24LanguagePickerInlineSearch();
     TestB24StrokeDevicePixelSnap();
     TestB24ConsoleScrollSemantics();
+    TestLanguagePickerSearchEditorImeCaretAndBounds();
     TestB24ImeComposition();
     TestB101ImeCommitIsUndoableAndCapped();
     TestB102WordDeleteNoOpDoesNotTouchHistory();

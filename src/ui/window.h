@@ -54,6 +54,8 @@ namespace vgww {
     namespace ui {
 
         class ContextMenu;
+        class TextInputElement;
+        class LanguagePicker;
 
         /// Caption-button hover state (pure; test seam for T6 review M5).
         /// Update() recomputes the flags from the pointer position, Clear()
@@ -796,6 +798,11 @@ namespace vgww {
             bool RouteClientPointer(UINT message, Point logical, int wheel_delta);
             bool RouteKey(UINT message, WPARAM wparam);
             void SetFocusElement(Element* element);
+            /// Resolves the focused TextInput for IME/caret/edit-shortcut
+            /// paths. A focused LanguagePicker with an active in-popup search
+            /// row returns its private (non-tree) search editor; C9 forbids
+            /// pointing focused_ at it directly. See window.cpp.
+            TextInputElement* FocusedTextInput();
             void CycleFocus(bool backward, Element* scope = nullptr);
             Element* FindOpenDialog() const;
             /// True when a top-layer surface (open dialog, active toast,

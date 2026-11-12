@@ -1036,11 +1036,18 @@ namespace vgww {
             bool OnKeyDown(uint32_t vk) override;
             /// batch24 P2-6: printable input feeds the in-popup search editor.
             bool OnChar(wchar_t ch) override;
+            /// Forward the caret phase to the private search editor so the
+            /// window's blink tick flips it (and repaints the picker bounds).
+            bool OnCaretBlinkTick() noexcept override;
             /// batch26: full language name for the hovered/collapsed row.
             std::wstring tooltip_text(Point p) const override;
 
         protected:
             Size MeasureCore(Size available) override;
+            /// Give the private (non-tree) search editor a real box on the
+            /// search row: IME anchors, caret repaint and composition use its
+            /// bounds(). Collapsed: zero it so no stale anchor survives.
+            void ArrangeCore(Rect final_rect) override;
             void RenderCore(RenderCtx& ctx) override;
 
         private:
