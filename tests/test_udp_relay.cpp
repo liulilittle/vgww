@@ -399,9 +399,51 @@ namespace vgww {
         }
         return 0;
     }
+    /// batch304 regression: a failed flow creation must NOT evict the coldest
+    /// flow. GetOrCreate opens/binds/connects the new socket with error_code
+    /// overloads, so a build failure just returns nullptr (drop-not-grow).
+    /// Evicting the LRU tail BEFORE that check killed an unrelated live flow
+    /// and inflated Evictions() on every dropped packet at a full table.
+    /// The failing key uses the unspecified v4 remote 0.0.0.0: connect()
+    /// deterministically fails with WSAEADDRNOTAVAIL (10049) on Windows.
+    int TestFailedBuildDoesNotEvict() {
+        asio::io_context io;
+        const net::IpAddress client =
+            net::IpAddress::FromV4BigEndian(std::array<uint8_t, 4>{192, 168, 0, 9}.data());
+        const net::IpAddress remote =
+            net::IpAddress::FromV4BigEndian(std::array<uint8_t, 4>{8, 8, 8, 8}.data());
+
+        relay::UdpRelay::FlowKey key_a{};
+        key_a.client_ip = client;
+        key_a.remote_ip = remote;
+        key_a.client_port = 5000;
+        key_a.remote_port = 53;
+
+        // A distinct key whose remote_ip is the all-zero (unspecified)
+        // address: connect() fails deterministically -> nullptr.
+        relay::UdpRelay::FlowKey key_bad = key_a;
+        key_bad.client_port = 5001;
+        key_bad.remote_ip = net::IpAddress();
+
+        relay::UdpFlowTable table(1, std::chrono::seconds(60));
+        auto a = table.GetOrCreate(key_a, io);
+        CHECK(nullptr != a);
+        CHECK(a->IsOpen());
+        CHECK(0 == table.Evictions());
+
+        // Full table + failing build: the existing cold flow must survive.
+        auto bad = table.GetOrCreate(key_bad, io);
+        CHECK(nullptr == bad);
+        CHECK(a->IsOpen());
+        CHECK(1 == table.Size());
+        CHECK(0 == table.Evictions());
+        return 0;
+    }
+
 }  // namespace vgww
 
 int main() {
     if (const int rc = vgww::RunTests()) return rc;
+    if (const int rc = vgww::TestFailedBuildDoesNotEvict()) return rc;
     return vgww::TestFlowHashSpreadsBuckets();
 }

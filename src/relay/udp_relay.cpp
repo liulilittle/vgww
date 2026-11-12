@@ -102,30 +102,6 @@ namespace vgww {
                 it->second->Touch(Clock::now());
                 return it->second;
             }
-            if (flows_.size() >= capacity_) {
-                if (nullptr == lru_tail_) {
-                    // capacity_ <= 0 disables all flows; drop without
-                    // dereferencing an empty LRU list.
-                    return nullptr;
-                }
-                // batch304: O(1) LRU eviction. The tail is the least recently
-                // active flow; the old code scanned the whole table (up to
-                // 8192 relays) on every new flow at capacity. Closing the
-                // socket aborts the pending receive - without this the evicted
-                // flow would live on as a ghost (leaked socket + stale
-                // forwarding).
-                UdpRelay* tail = lru_tail_;
-                Unlink(*tail);
-                const auto victim_it = flows_.find(tail->Key());
-                if (victim_it != flows_.end()) {
-                    auto victim = std::move(victim_it->second);
-                    flows_.erase(victim_it);
-                    victim->Shutdown();
-                }
-                // batch34j: count the eviction. Shutdown() aborts the pending
-                // receive, so the peer UDP conversation dies with it.
-                ++evictions_;
-            }
             asio::ip::udp::socket socket(io);
             std::error_code err;
             // The socket family MUST follow the flow: a v6 flow needs a v6
@@ -170,6 +146,30 @@ namespace vgww {
             }
             if (err) {
                 return nullptr;
+            }
+            if (flows_.size() >= capacity_) {
+                if (nullptr == lru_tail_) {
+                    // capacity_ <= 0 disables all flows; drop without
+                    // dereferencing an empty LRU list.
+                    return nullptr;
+                }
+                // batch304: O(1) LRU eviction. The tail is the least recently
+                // active flow; the old code scanned the whole table (up to
+                // 8192 relays) on every new flow at capacity. Closing the
+                // socket aborts the pending receive - without this the evicted
+                // flow would live on as a ghost (leaked socket + stale
+                // forwarding).
+                UdpRelay* tail = lru_tail_;
+                Unlink(*tail);
+                const auto victim_it = flows_.find(tail->Key());
+                if (victim_it != flows_.end()) {
+                    auto victim = std::move(victim_it->second);
+                    flows_.erase(victim_it);
+                    victim->Shutdown();
+                }
+                // batch34j: count the eviction. Shutdown() aborts the pending
+                // receive, so the peer UDP conversation dies with it.
+                ++evictions_;
             }
             flows_.emplace(key, relay);
             LinkFront(*relay);
