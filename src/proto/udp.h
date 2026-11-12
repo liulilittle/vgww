@@ -100,6 +100,9 @@ namespace vgww {
                 return false;
             }
             const size_t held = ip_len - 40;
+            if (held < kUdpHeaderLen) {
+                return false;
+            }
             out_len = payload_len < held ? payload_len : held;
             return true;
         }

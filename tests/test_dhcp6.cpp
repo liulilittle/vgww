@@ -563,6 +563,38 @@ namespace {
         CHECK(leases[0].expires_in_s > 60);
     }
 
+    // P3: RFC 8415 21.14 requires the Rapid Commit option (14) to carry
+    // option-len 0. A non-zero length must be rejected, not silently accepted:
+    // accepting it lets a malformed SOLICIT skip the two-message handshake.
+    void TestParseDhcp6RejectsNonEmptyRapidCommit() {
+        Dhcp6View view;
+        std::vector<uint8_t> p = {kDhcp6MsgSolicit, 0, 0, 90};
+        PushOption(p, kDhcp6OptClientId, kClientDuid);
+        // Hand-built option 14 with option-len 4: {0,14, 0,4, 0,0,0,0}.
+        p.push_back(0);
+        p.push_back(14);
+        p.push_back(0);
+        p.push_back(4);
+        p.push_back(0);
+        p.push_back(0);
+        p.push_back(0);
+        p.push_back(0);
+        auto f = BuildFrameRaw(p, kClientLl, kDhcp6ClientPort,
+                               kDhcp6ServerPort);
+        const uint64_t before = ParseRejected6Count();
+        CHECK(!ParseDhcp6Frame(f.data(), f.size(), view));
+        CHECK(!view.rapid_commit);
+        CHECK(before + 1 == ParseRejected6Count());
+        // Control: the same SOLICIT with a zero-length option 14 parses.
+        std::vector<uint8_t> ok = {kDhcp6MsgSolicit, 0, 0, 91};
+        PushOption(ok, kDhcp6OptClientId, kClientDuid);
+        PushOption(ok, kDhcp6OptRapidCommit, {});
+        auto g = BuildFrameRaw(ok, kClientLl, kDhcp6ClientPort,
+                               kDhcp6ServerPort);
+        CHECK(ParseDhcp6Frame(g.data(), g.size(), view));
+        CHECK(view.rapid_commit);
+    }
+
     // --- 5. REQUEST -> REPLY ----------------------------------------------
     void TestRequestReply() {
         Dhcp6Server server(MakeConfig());
@@ -2755,6 +2787,7 @@ int main() {
     TestSolicitAdvertise();
     TestAcquireWalkSanitizesHostname();
     TestRapidCommit();
+    TestParseDhcp6RejectsNonEmptyRapidCommit();
     TestRequestReply();
     TestRenew();
     TestRebind();

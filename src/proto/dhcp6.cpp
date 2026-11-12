@@ -216,6 +216,9 @@ namespace vgww {
                         break;
                     }
                     case kDhcp6OptRapidCommit:
+                        if (0 != olen) {
+                            return fail();
+                        }
                         out.rapid_commit = true;
                         break;
                     default:

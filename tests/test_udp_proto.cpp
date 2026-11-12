@@ -509,6 +509,23 @@ namespace {
         CHECK(seg == 8);
     }
 
+    // P3: the helper's contract rejects a payload below 8. A short capture
+    // (ip_len 40..47, so held = ip_len-40 is 0..7) must also be rejected:
+    // otherwise a declared payload_len>=8 returns true with out_len<8.
+    void TestUdpSegmentLengthV6RejectsShortCaptureBelowHeader() {
+        size_t seg = 0;
+        for (size_t ip_len = 41; ip_len <= 47; ++ip_len) {
+            auto short_capture = MakeV6Packet(ip_len, 100);
+            CHECK(!UdpSegmentLengthV6(short_capture.data(),
+                                     short_capture.size(), seg));
+        }
+        // Control: held == 8 (ip_len 48) is still accepted with a declared
+        // payload of 100 (the short-capture fallback to 8 bytes).
+        auto held8 = MakeV6Packet(48, 100);
+        CHECK(UdpSegmentLengthV6(held8.data(), held8.size(), seg));
+        CHECK(seg == 8);
+    }
+
 }  // namespace
 
 int main() {
@@ -523,6 +540,7 @@ int main() {
     TestUdpSegmentLengthV6UsesThePayloadLength();
     TestUdpSegmentLengthV6RejectsMalformed();
     TestUdpSegmentLengthV6ToleratesAShortCapture();
+    TestUdpSegmentLengthV6RejectsShortCaptureBelowHeader();
 
     TestBuildUdpFrameIpv4WireImage();
     TestBuildUdpFrameIpv4EmptyPayload();
