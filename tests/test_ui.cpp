@@ -7518,6 +7518,42 @@ namespace {
         std::atomic<bool> release{false};
     };
 
+    /// Records the SaveConfigCmd count while blocking ONLY the first command
+    /// (the gate). A refused save (queue-full backpressure) is then
+    /// distinguishable from one that actually reached the queue. All
+    /// bookkeeping is atomic: the worker thread writes while the test thread
+    /// reads, with no shared vector. Only the gate command waits for release.
+    class GatedRecordingExecutor final : public vgww::ui::CommandExecutor {
+    public:
+        vgww::ui::CommandResult Execute(const vgww::ui::Command& cmd) override {
+            if (const auto* save =
+                    std::get_if<vgww::ui::SaveConfigCmd>(&cmd)) {
+                last_save_gateway.store(save->config.gateway.ipv4,
+                                        std::memory_order_release);
+                save_count.fetch_add(1, std::memory_order_release);
+            }
+            executed.fetch_add(1, std::memory_order_release);
+            if (!claimed.exchange(true, std::memory_order_acq_rel)) {
+                entered.store(true, std::memory_order_release);
+                while (!release.load(std::memory_order_acquire)) {
+                    std::this_thread::sleep_for(std::chrono::milliseconds(1));
+                }
+            }
+            vgww::ui::CommandResult result{true, L"ok"};
+            if (const auto* save =
+                    std::get_if<vgww::ui::SaveConfigCmd>(&cmd)) {
+                result.save_config = save->native_feedback;
+            }
+            return result;
+        }
+        std::atomic<bool> claimed{false};
+        std::atomic<bool> entered{false};
+        std::atomic<bool> release{false};
+        std::atomic<int> executed{0};
+        std::atomic<int> save_count{0};
+        std::atomic<uint32_t> last_save_gateway{0};
+    };
+
 }  // namespace
 
 static void TestSelectPopupHitTest() {
@@ -7692,6 +7728,175 @@ static void TestP108QueueRefusalIsAudited() {
     }
     CHECK(saw_down);
     console_log::ClearForTest();
+}
+
+// batchW11: SettingsPage::Save() must gate on the result of SubmitCommand.
+// When the command queue refuses the SaveConfigCmd (worker blocked plus the
+// 64-slot backpressure cap), Save() used to optimistically mark the draft
+// applied anyway, hiding the dirty badge and letting ConfirmLeave navigate
+// away even though nothing was ever persisted. The refusal path must
+// early-return false and leave the operator on the page with edits intact.
+static void TestW11SavePostRefusalKeepsDraft() {
+    using namespace vgww::ui;
+    FixTextMetrics();
+    I18n::Instance().SetLang(Lang::ZhCN);
+
+    ShellFakeSource source;
+    GatedRecordingExecutor executor;
+    UiController controller(source, executor);
+    std::string error;
+    CHECK(controller.Start(error));
+
+    UiSnapshot snapshot = MakeRulesSnapshot(1, 1);
+    ConfigView& view = snapshot.config;
+    view.adapter = "Ethernet 2";
+    view.mode = "main";
+    view.gateway_ip = "192.168.0.240";
+    view.gateway_mask = "255.255.255.0";
+    view.gateway_mac = "02:00:00:00:00:01";
+    view.dhcp_enabled = true;
+    view.dhcp_pool_start = "192.168.0.100";
+    view.dhcp_pool_end = "192.168.0.200";
+    view.dhcp_lease_s = 86400;
+    view.dhcp_dns = {"1.1.1.1"};
+    view.ipv6_enabled = true;
+    view.ula_prefix = "fd00:0000:0000:0000:0000:0000:0000:0000";
+    view.prefix_len = 64;
+    view.ra_lifetime_s = 1800;
+    view.ipv6_dns = {"fd00::1"};
+    view.dhcp6_enabled = true;
+    view.dhcp6_pool_start = "fd00:0000:0000:0000:0000:0000:0000:1000";
+    view.dhcp6_pool_end = "fd00:0000:0000:0000:0000:0000:0000:1fff";
+    view.dhcp6_lease_s = 3600;
+    view.web_port = 18080;
+    view.web_bind = "127.0.0.1";
+    view.vlan_id = 0;
+    view.bridge_enabled = false;
+    view.bridge_up = "NIC 1";
+    view.bridge_down = "NIC 2";
+    view.bridge_table_size = 4096;
+    view.perf_workers = 4;
+    view.perf_max_conns = 2048;
+    view.perf_dial_timeout_ms = 5000;
+    view.config_path = "";
+
+    UiApp app;
+    app.Compose(controller, snapshot);
+    app.root().Arrange({0.0f, 0.0f, 1280.0f, 1000.0f});
+    app.router().Navigate("settings");
+    app.Update(snapshot);
+    app.root().Arrange({0.0f, 0.0f, 1280.0f, 1000.0f});
+
+    auto* save = dynamic_cast<Button*>(FindById(app.root(), "settings.save"));
+    auto* gw = dynamic_cast<TextInputElement*>(
+        FindById(app.root(), "settings.gateway_ip"));
+    auto* dirty = FindById(app.root(), "settings.dirty");
+    auto* nav_about = dynamic_cast<Button*>(
+        FindById(app.root(), "shell.nav.about"));
+    CHECK(save != nullptr);
+    CHECK(gw != nullptr);
+    CHECK(dirty != nullptr);
+    CHECK(nav_about != nullptr);
+    CHECK(save != nullptr && save->enabled);
+    if (save == nullptr || gw == nullptr || dirty == nullptr ||
+        nav_about == nullptr) {
+        executor.release.store(true, std::memory_order_release);
+        controller.Stop();
+        return;
+    }
+
+    // Fill the 64-slot queue: one command executes (and blocks), 64 pending.
+    CHECK(controller.Post(Command{AddBanCmd{"mac", "gate"}}));
+    const auto deadline = std::chrono::steady_clock::now() +
+                          std::chrono::seconds(3);
+    while (!executor.entered.load(std::memory_order_acquire) &&
+           std::chrono::steady_clock::now() < deadline) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(2));
+    }
+    CHECK(executor.entered.load(std::memory_order_acquire));
+    for (int i = 0; i < 64; ++i) {
+        CHECK(controller.Post(
+            Command{AddBanCmd{"mac", "q" + std::to_string(i)}}));
+    }
+    CHECK(!controller.Post(Command{AddBanCmd{"mac", "fill-check"}}));
+
+    const auto current_page = [&app]() -> std::string {
+        return app.router().current() == nullptr
+                   ? std::string()
+                   : std::string(app.router().current()->id());
+    };
+
+    // A real edit: dirty badge on and the re-entry guard disarmed, so the
+    // retry-with-no-edit assertion below is meaningful.
+    TypeInto(*gw, L"192.168.0.253");
+    app.root().Arrange({0.0f, 0.0f, 1280.0f, 1000.0f});
+    CHECK(dirty->visible);
+    CHECK(executor.save_count.load(std::memory_order_acquire) == 0);
+    app.toasts().Clear();
+
+    // ---- Save against a full queue: the post is refused. ----
+    const std::size_t toast_base = app.toasts().active_count();
+    ClickElement(*save);
+    app.root().Arrange({0.0f, 0.0f, 1280.0f, 1000.0f});
+
+    // (1) No SaveConfigCmd reached the worker: the post was refused, so the
+    //     command count does not grow with a save.
+    CHECK(executor.save_count.load(std::memory_order_acquire) == 0);
+    // (2) The draft must NOT be marked applied: the dirty badge stays on and
+    //     the edit is intact. Red: applied_=draft hid the badge.
+    CHECK(dirty->visible);
+    CHECK(gw->value() == L"192.168.0.253");
+    // (3) SubmitCommand surfaces the busy toast on refusal.
+    CHECK(app.toasts().active_count() > toast_base);
+    // (4) ConfirmLeave (B275 semantic): a refused [Save] must NOT leave.
+    nav_about->on_click();
+    app.root().Arrange({0.0f, 0.0f, 1280.0f, 1000.0f});
+    CHECK(current_page() == "settings");
+    CHECK(executor.save_count.load(std::memory_order_acquire) == 0);
+
+    // Dismiss the leave prompt (fixed path) with Esc: bounds independent and
+    // never fires the save/discard callbacks.
+    if (current_page() == "settings") {
+        if (auto* dialog = dynamic_cast<DialogHost*>(
+                FindById(app.root(), "settings.dialog"))) {
+            if (dialog->open()) {
+                dialog->OnKeyDown(0x1B);
+            }
+        }
+    }
+
+    // ---- Release the queue; a retry with NO intervening edit must post. ----
+    // Fixed: save_guard_armed_ was disarmed on the refusal, so the very next
+    // click succeeds. Red: if the guard stays armed, the retry is silently
+    // dropped with no command at all.
+    executor.release.store(true, std::memory_order_release);
+    const auto drain_deadline = std::chrono::steady_clock::now() +
+                                std::chrono::seconds(3);
+    while (executor.executed.load(std::memory_order_acquire) < 65 &&
+           std::chrono::steady_clock::now() < drain_deadline) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(2));
+    }
+    CHECK(executor.executed.load(std::memory_order_acquire) >= 65);
+    CHECK(executor.save_count.load(std::memory_order_acquire) == 0);
+
+    if (current_page() == "settings") {
+        app.root().Arrange({0.0f, 0.0f, 1280.0f, 1000.0f});
+        ClickElement(*save);
+        const auto retry_deadline = std::chrono::steady_clock::now() +
+                                    std::chrono::seconds(3);
+        while (executor.save_count.load(std::memory_order_acquire) < 1 &&
+               std::chrono::steady_clock::now() < retry_deadline) {
+            controller.DrainResults();
+            std::this_thread::sleep_for(std::chrono::milliseconds(5));
+        }
+        // (5) The retry posts exactly one SaveConfigCmd carrying the edit.
+        CHECK(executor.save_count.load(std::memory_order_acquire) == 1);
+        bool ok = false;
+        CHECK(executor.last_save_gateway.load(std::memory_order_acquire) ==
+              vgww::core::ParseIpv4("192.168.0.253", ok));
+    }
+
+    controller.Stop();
 }
 
 static void TestPageUtilNarrow() {
@@ -36716,6 +36921,7 @@ int main() {
     TestSelectPopupHitTest(); TestModalTabStaysInsideDialog();
     TestBusyToastOnFullQueue();
     TestP108QueueRefusalIsAudited();
+    TestW11SavePostRefusalKeepsDraft();
     TestPageUtilNarrow();
     TestTextInputMouseCaret();
     TestM7CaretPrefixWidthCache();

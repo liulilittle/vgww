@@ -1719,7 +1719,10 @@ void SettingsPage::RefreshDirty() {
                     RelayoutHost(*host_);
                     return false;
                 }
-                SubmitCommand(*ctx_, Command{SaveConfigCmd{config, nullptr, true}});
+                if (!SubmitCommand(*ctx_, Command{SaveConfigCmd{config, nullptr, true}})) {
+                    save_guard_armed_ = false;
+                    return false;
+                }
                 applied_ = draft;
                 // batch269: the pending-clear flag is CONSUMED by this save.
                 // Leaving it set meant the next unrelated save wiped whatever
