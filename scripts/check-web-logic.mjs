@@ -5013,6 +5013,61 @@ cases.push(['a rejected save shows the field the server named', async () => {
   vm.runInContext('toasts.length = 0; renderToasts();', context);
 }]);
 
+// P129: the binding-cap refusal used to answer 409 with a server-composed
+// English sentence ("binding cap reached: N disk binding(s) not merged; ...").
+// The page translates the error value with t("err." + j.error), so a composed
+// value made the lookup miss and the 461-language fallback painted the raw
+// English (and the bare "err." prefix) into the toast. The value must be a
+// bare token that the language tables carry.
+cases.push(['the binding-cap refusal is a translated token', async () => {
+  configPayload = JSON.parse(JSON.stringify(SERVER_CONFIG));
+  resetSettingsForm();
+  await sandbox.loadSettings(true);
+  configPostReply = { error: 'too many bindings' };
+  configPostStatus = 409;
+  vm.runInContext('toasts.length = 0; renderToasts();', context);
+  try {
+    await sandbox.saveSettings();
+  } finally {
+    configPostReply = { ok: true };
+    configPostStatus = 200;
+  }
+  const texts = nodeFor('#toast').children.map(c => c.textContent);
+  const translated = vm.runInContext('t("err.too many bindings")', context);
+  ok(texts.some(x => x.includes(translated)),
+     'the error token must be translated, got: ' + JSON.stringify(texts));
+  ok(!texts.some(x => x.includes('err.')),
+     'the toast must never show the bare "err." key prefix, got: ' + JSON.stringify(texts));
+  ok(!texts.some(x => x.includes('binding cap reached')),
+     'the server-composed prose must not reach the toast, got: ' + JSON.stringify(texts));
+  ok(!texts.some(x => x.includes('disk binding')),
+     'the server-composed prose must not reach the toast, got: ' + JSON.stringify(texts));
+  vm.runInContext('toasts.length = 0; renderToasts();', context);
+  // B1 seam boundary: the stub above feeds the token, so the toast assertions
+  // prove the PAGE translates it. The server side of this contract is proven by
+  // test_web.cpp:3558/3559/3783/3784 (the 409 body must be the bare token).
+  // To keep this case from passing vacuously, re-run the page against the OLD
+  // composed value: t("err." + j.error) must miss and paint the bare key into
+  // the toast. That is the exact regression the token fixes.
+  configPostReply = {
+    error: 'binding cap reached: 2 disk binding(s) not merged; remove entries on the bindings page',
+  };
+  configPostStatus = 409;
+  vm.runInContext('toasts.length = 0; renderToasts();', context);
+  try {
+    await sandbox.saveSettings();
+  } finally {
+    configPostReply = { ok: true };
+    configPostStatus = 200;
+  }
+  const composedTexts = nodeFor('#toast').children.map(c => c.textContent);
+  ok(composedTexts.some(x => x.includes('err.')),
+     'a composed error value must miss t() and show the bare "err." prefix, got: ' + JSON.stringify(composedTexts));
+  ok(composedTexts.some(x => x.includes('binding cap reached')),
+     'a composed error value must reach the toast verbatim, got: ' + JSON.stringify(composedTexts));
+  vm.runInContext('toasts.length = 0; renderToasts();', context);
+}]);
+
 for (const [name, fn] of cases) {
   await run(name, fn);
 }
@@ -5023,9 +5078,9 @@ for (const [name, fn] of cases) {
 // zero while every run stayed green. This floor makes a deletion fail loudly.
 // Raise it when adding cases; the message says exactly what to do.
 //
-// The number is a FLOOR, not an equality: adding cases must never require
-// editing it, only removing them.
-const MIN_CASES = 87;
+// The floor is raised whenever cases are added; removing a case without
+// lowering it fails loudly.
+const MIN_CASES = 88;
 if (cases.length < MIN_CASES) {
   console.error(`FAIL ${NAME}: only ${cases.length} case(s) are registered, but at least ${MIN_CASES} are required.`);
   console.error('  A case was deleted (or never registered). Restore it, or - if the deletion was');

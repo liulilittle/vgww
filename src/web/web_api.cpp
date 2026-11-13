@@ -4043,11 +4043,7 @@ namespace vgww {
                                            audit("config save refused (binding cap reached)");
                                            return Response::Error(
                                                409,
-                                               "binding cap reached: " +
-                                                   std::to_string(dropped) +
-                                                   " disk binding(s) not "
-                                                   "merged; remove entries on "
-                                                   "the bindings page");
+                                               "too many bindings");
                                        }
                                        // batch142/P123: the submitted entry is
                                        // echoed verbatim, so a DUID the page

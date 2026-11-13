@@ -3549,6 +3549,15 @@ static void TestP122WebConfigBindingCapRefusalIsAudited() {
         }
     }
     CHECK(saw_cap_refusal);
+    // P129: a refused save must answer with a TRANSLATED error token, not a
+    // server-composed English sentence. The old body spliced the dropped count
+    // into prose ("binding cap reached: 2 disk binding(s) not merged; ..."),
+    // which the 461-language fallback painted verbatim into the operator's
+    // toast. The page reads err.<error> through t(), so the value must be a
+    // bare key that exists in the language tables.
+    CHECK(body.find("\"error\":\"too many bindings\"") != std::string::npos);
+    CHECK(body.find("binding cap reached") == std::string::npos);
+    CHECK(body.find("err.") == std::string::npos);
 
     api.Stop();
     std::string stop_error;
@@ -3768,6 +3777,12 @@ static void TestP124WebConfigV6BindingCapRefusalIsAudited() {
         }
     }
     CHECK(saw_cap_refusal);
+    // P129: the v6 refusal must answer with the translated token too, not the
+    // server-composed prose that leaked English through the 461-language
+    // fallback and left the bare "err." key in the toast.
+    CHECK(body.find("\"error\":\"too many bindings\"") != std::string::npos);
+    CHECK(body.find("binding cap reached") == std::string::npos);
+    CHECK(body.find("err.") == std::string::npos);
 
     api.Stop();
     std::string stop_error;
