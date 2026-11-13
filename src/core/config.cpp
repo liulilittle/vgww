@@ -43,6 +43,11 @@ namespace vgww {
             // open and prove the delete retries instead of leaking it.
             std::mutex g_predelete_hook_mutex;
             std::function<void(const std::string&)> g_predelete_hook;
+            // Test seam for the host's active-DNS enumeration (an external
+            // system boundary). When unset, FillDefaultDns calls
+            // GetAdaptersAddresses exactly as before.
+            std::mutex g_default_dns_probe_mutex;
+            std::function<std::vector<uint32_t>()> g_default_dns_probe;
 
             // batch94: one write lock per document path. Config::UpdateFile
             // holds it across load->mutate->publish, and whole-document
@@ -223,12 +228,63 @@ namespace vgww {
                 }
             }
 
+            /// C6: one rule set for every source of dhcp.dns values. A
+            /// resolver handed to LAN clients as option 6 must be a real host
+            /// on the LAN: never loopback, multicast/broadcast, the gateway
+            /// itself (this build runs no resolver) or the subnet's network /
+            /// broadcast address. Returns nullptr when usable, otherwise the
+            /// reason. Used by the explicit parser, the programmatic
+            /// validator AND the implicit host-DNS fallback.
+            const char* DnsResolverRejection(uint32_t ip, uint32_t gw,
+                                             uint32_t mask) noexcept {
+                if (0 == ip) {
+                    return nullptr;  // "no resolver" sentinel
+                }
+                const uint32_t host = HostOrder(ip);
+                const uint8_t first = static_cast<uint8_t>(host >> 24);
+                if (first == 127) {
+                    return "is a loopback address";
+                }
+                if (first >= 224) {
+                    return "is a multicast or broadcast address";
+                }
+                if (ip == gw) {
+                    return "is the gateway itself (it runs no DNS resolver)";
+                }
+                const uint32_t hmask = HostOrder(mask);
+                const uint32_t host_bits = ~hmask;
+                if (host_bits > 1u) {
+                    const uint32_t net = host & hmask;
+                    const uint32_t bcast = net | host_bits;
+                    if (host == net || host == bcast) {
+                        return "is the subnet network or broadcast address";
+                    }
+                }
+                return nullptr;
+            }
+
             /// Fills `out` with the host's active IPv4 DNS servers (project
             /// numeric convention: first octet in the LOW byte). Used when no
             /// DNS is configured: without a resolver the DHCP clients cannot
             /// do name resolution and the router is effectively broken out of
             /// the box.
-            void FillDefaultDns(std::vector<uint32_t>& out) {
+            void FillDefaultDns(std::vector<uint32_t>& out, uint32_t gw,
+                                uint32_t mask) {
+                {
+                    std::lock_guard<std::mutex> lock(g_default_dns_probe_mutex);
+                    if (g_default_dns_probe) {
+                        for (uint32_t candidate : g_default_dns_probe()) {
+                            if (DnsResolverRejection(candidate, gw, mask)) {
+                                continue;
+                            }
+                            out.push_back(candidate);
+                            if (out.size() >= limits::kMaxDhcpDns) {
+                                return;
+                            }
+                        }
+                        return;
+                    }
+                }
                 ULONG size = 0;
                 if (NO_ERROR !=
                     GetAdaptersAddresses(AF_INET,
@@ -268,10 +324,17 @@ namespace vgww {
                         if (0 == b[0] && 0 == b[1] && 0 == b[2] && 0 == b[3]) {
                             continue;  // unspecified
                         }
-                        out.push_back(static_cast<uint32_t>(b[0]) |
-                                      (static_cast<uint32_t>(b[1]) << 8) |
-                                      (static_cast<uint32_t>(b[2]) << 16) |
-                                      (static_cast<uint32_t>(b[3]) << 24));
+                        const uint32_t candidate =
+                            static_cast<uint32_t>(b[0]) |
+                            (static_cast<uint32_t>(b[1]) << 8) |
+                            (static_cast<uint32_t>(b[2]) << 16) |
+                            (static_cast<uint32_t>(b[3]) << 24);
+                        // C6: the host's own resolver list must obey the
+                        // same usability rule as an explicit dhcp.dns entry.
+                        if (DnsResolverRejection(candidate, gw, mask)) {
+                            continue;
+                        }
+                        out.push_back(candidate);
                         if (out.size() >= limits::kMaxDhcpDns) {
                             return;  // cap: a handful of servers is plenty
                         }
@@ -381,48 +444,13 @@ namespace vgww {
                         // Skip the unspecified address: handing clients a
                         // 0.0.0.0 resolver is a silent misconfiguration.
                         if (ip != 0) {
-                            // batch34m: an address no client can use as a
-                            // resolver makes name resolution fail for every
-                            // device on the LAN, invisibly. The list is handed
-                            // to clients verbatim as option 6, so reject the
-                            // categories that are never a usable resolver:
-                            // loopback (127/8), group/broadcast (224/4 and
-                            // 255.255.255.255), and the gateway itself (which
-                            // runs no resolver in this build).
-                            const uint32_t host = HostOrder(ip);
-                            const uint8_t first =
-                                static_cast<uint8_t>(host >> 24);
-                            if (first == 127) {
-                                error = "dhcp.dns entry is a loopback address";
+                            // C6: the same usability rule the programmatic
+                            // validator and the host-DNS fallback apply.
+                            if (const char* why = DnsResolverRejection(
+                                    ip, config.gateway.ipv4,
+                                    config.gateway.mask)) {
+                                error = std::string("dhcp.dns entry ") + why;
                                 return;
-                            }
-                            if (first >= 224) {
-                                error = "dhcp.dns entry is a multicast or "
-                                        "broadcast address";
-                                return;
-                            }
-                            if (ip == config.gateway.ipv4) {
-                                error = "dhcp.dns entry is the gateway itself "
-                                        "(it runs no DNS resolver)";
-                                return;
-                            }
-                            // The LAN subnet's own broadcast and network
-                            // addresses are not hosts either: a client sending
-                            // a query there reaches nobody.
-                            {
-                                const uint32_t hmask =
-                                    HostOrder(config.gateway.mask);
-                                const uint32_t host_bits = ~hmask;
-                                if (host_bits > 1u) {
-                                    const uint32_t net = host & hmask;
-                                    const uint32_t bcast = net | host_bits;
-                                    if (host == net || host == bcast) {
-                                        error =
-                                            "dhcp.dns entry is the subnet "
-                                            "network or broadcast address";
-                                        return;
-                                    }
-                                }
                             }
                             config.dhcp.dns.push_back(ip);
                         }
@@ -432,7 +460,8 @@ namespace vgww {
                     // Without a configured resolver the DHCP clients get no
                     // DNS option and name resolution fails entirely. Fall
                     // back to the host's active DNS servers.
-                    FillDefaultDns(config.dhcp.dns);
+                    FillDefaultDns(config.dhcp.dns, config.gateway.ipv4,
+                                   config.gateway.mask);
                 }
                 if (const auto e = it->find("static_bindings");
                     e != it->end()) {
@@ -1465,35 +1494,11 @@ namespace vgww {
                 const uint32_t host_bits = ~hmask;
                 const uint32_t gw_host = HostOrder(config.gateway.ipv4);
                 for (const uint32_t ip : config.dhcp.dns) {
-                    // 0.0.0.0 means "no resolver configured" in this config
-                    // (the loader skips it), so it stays accepted here.
-                    if (0 == ip) {
-                        continue;
-                    }
-                    const uint32_t host = HostOrder(ip);
-                    const uint8_t first = static_cast<uint8_t>(host >> 24);
-                    if (first == 127) {
-                        error = "dhcp.dns entry is a loopback address";
+                    // C6: one rule set for every source of dhcp.dns values.
+                    if (const char* why = DnsResolverRejection(
+                            ip, config.gateway.ipv4, config.gateway.mask)) {
+                        error = std::string("dhcp.dns entry ") + why;
                         return false;
-                    }
-                    if (first >= 224) {
-                        error = "dhcp.dns entry is a multicast or "
-                                "broadcast address";
-                        return false;
-                    }
-                    if (ip == config.gateway.ipv4) {
-                        error = "dhcp.dns entry is the gateway itself "
-                                "(it runs no DNS resolver)";
-                        return false;
-                    }
-                    if (host_bits > 1u) {
-                        const uint32_t net = host & hmask;
-                        const uint32_t bcast = net | host_bits;
-                        if (host == net || host == bcast) {
-                            error = "dhcp.dns entry is the subnet "
-                                    "network or broadcast address";
-                            return false;
-                        }
                     }
                 }
                 // Static bindings: the same identity/placement rules the parser
@@ -2371,6 +2376,12 @@ namespace vgww {
             g_predelete_hook = std::move(hook);
         }
 
+        void SetDefaultDnsProbeForTest(
+            std::function<std::vector<uint32_t>()> probe) {
+            std::lock_guard<std::mutex> lock(g_default_dns_probe_mutex);
+            g_default_dns_probe = std::move(probe);
+        }
+
         void SetConfigOpenFailureHookForTest(
             std::function<unsigned long(const std::string& path)> hook) {
             std::lock_guard<std::mutex> lock(g_open_hook_mutex);
@@ -2503,7 +2514,10 @@ namespace vgww {
             }
             if (validator && !validator(tmp)) {
                 DeleteFileWithRetry(tmp);
-                error = "validation rejected the temporary file: " + tmp;
+                if (error.empty()) {
+                    error = "validation rejected the temporary file";
+                }
+                error += ": " + tmp;
                 return AtomicWriteOutcome::kValidationFailed;
             }
             if (!Config::PublishConfigTempFile(tmp, path, error)) {
@@ -2531,7 +2545,10 @@ namespace vgww {
             if (validator && !validator(tmp)) {
                 std::error_code ignored;
                 std::filesystem::remove(tmp, ignored);
-                error = "validation rejected the temporary file: " + tmp;
+                if (error.empty()) {
+                    error = "validation rejected the temporary file";
+                }
+                error += ": " + tmp;
                 return AtomicWriteOutcome::kValidationFailed;
             }
             std::error_code ec;
@@ -2563,9 +2580,8 @@ namespace vgww {
             }
             // batch110: the publish itself refuses unloadable documents, so
             // every caller is covered even if it skipped ValidateConfig.
-            std::string ignored;
-            const auto validator = [&ignored](const std::string& temp) {
-                return Config::LoadFromFile(temp, ignored).has_value();
+            const auto validator = [&error](const std::string& temp) {
+                return Config::LoadFromFile(temp, error).has_value();
             };
             return AtomicWriteOutcome::kOk ==
                    WriteFileAtomicDurable(path, ToJsonString(), error,
@@ -2638,9 +2654,8 @@ namespace vgww {
                 }
             }
             // batch109: the merged document must still load; see UpdateFile.
-            std::string ignored;
-            const auto validator = [&ignored](const std::string& temp) {
-                return Config::LoadFromFile(temp, ignored).has_value();
+            const auto validator = [&error](const std::string& temp) {
+                return Config::LoadFromFile(temp, error).has_value();
             };
             return AtomicWriteOutcome::kOk ==
                    WriteFileAtomicDurable(path, merged.ToJsonString(), error,
@@ -2665,9 +2680,8 @@ namespace vgww {
             // batch109: never publish a document the loader refuses - one
             // such write would make every later start reject the config
             // wholesale ("brick"). Same validator the HTTP replace path uses.
-            std::string ignored;
-            const auto validator = [&ignored](const std::string& temp) {
-                return Config::LoadFromFile(temp, ignored).has_value();
+            const auto validator = [&error](const std::string& temp) {
+                return Config::LoadFromFile(temp, error).has_value();
             };
             return AtomicWriteOutcome::kOk ==
                    WriteFileAtomicDurable(path, disk->ToJsonString(), error,

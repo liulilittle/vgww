@@ -171,6 +171,13 @@ namespace vgww {
         /// function to restore the real FlushFileBuffers.
         void SetFileFlushHookForTest(std::function<bool(std::intptr_t)> hook);
 
+        /// Test seam: replaces the host's active-DNS enumeration used when a
+        /// config omits dhcp.dns. `probe` returns addresses in the project's
+        /// numeric convention (first octet in the LOW byte). Pass an empty
+        /// function to restore the real GetAdaptersAddresses enumeration.
+        void SetDefaultDnsProbeForTest(
+            std::function<std::vector<uint32_t>()> probe);
+
         /// Test seam: runs just before a temp file is deleted on a failure
         /// path (after the writer closed its handle). A test can hold the file
         /// open here to prove the delete retries instead of leaking

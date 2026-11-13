@@ -3139,6 +3139,64 @@ void TestB20WebEnabledDefault() {
     CHECK(!WebEnabledEffective(true, true, true));    // --no-web wins
 }
 
+// A1: an implicit default DNS resolver must obey the same usability rules as
+// an explicitly configured one. A host whose active DNS is a loopback address
+// (local proxy / VPN adapter) must not make the product refuse to load its own
+// config, or emit a file it refuses to save.
+static void TestDefaultDnsFallbackObeysResolverRules() {
+    bool ok = false;
+    const uint32_t loopback = vgww::core::ParseIpv4("127.0.0.1", ok);
+    CHECK(ok);
+    const uint32_t usable = vgww::core::ParseIpv4("8.8.8.8", ok);
+    CHECK(ok);
+    vgww::core::SetDefaultDnsProbeForTest(
+        [loopback, usable] {
+            return std::vector<uint32_t>{loopback, usable};
+        });
+
+    vgww::core::Config main_config = MakeFullConfig();
+    main_config.dhcp.dns.clear();
+    const std::string main_path = "a1_default_dns_main.json";
+    std::string error;
+    CHECK(WriteFile(main_path, main_config.ToJsonString()));
+    const auto loaded = vgww::core::Config::LoadFromFile(main_path, error);
+    CHECK(loaded.has_value());
+    if (loaded) {
+        CHECK(loaded->dhcp.dns.size() == 1);
+        CHECK(loaded->dhcp.dns.front() == usable);
+    }
+    std::remove(main_path.c_str());
+
+    vgww::core::Config bypass_config = MakeFullConfig();
+    bypass_config.mode = vgww::core::Mode::kBypass;
+    bypass_config.dhcp.dns.clear();
+    const std::string bypass_path = "a1_default_dns_bypass.json";
+    CHECK(WriteFile(bypass_path, bypass_config.ToJsonString()));
+    const auto reloaded =
+        vgww::core::Config::LoadFromFile(bypass_path, error);
+    CHECK(reloaded.has_value());
+    if (reloaded) {
+        CHECK(reloaded->dhcp.dns.size() == 1);
+        CHECK(reloaded->dhcp.dns.front() == usable);
+        std::string save_error;
+        CHECK(reloaded->SaveToFile(bypass_path, save_error));
+    }
+    std::remove(bypass_path.c_str());
+
+    // A2: a rejected temp file must surface the real validation reason, not
+    // only a generic "validation rejected" message with a temp path.
+    vgww::core::Config bad = MakeFullConfig();
+    const uint32_t start = bad.dhcp.pool_start;
+    bad.dhcp.pool_start = bad.dhcp.pool_end;
+    bad.dhcp.pool_end = start;
+    std::string save_error;
+    CHECK(!bad.SaveToFile("a1_default_dns_bad.json", save_error));
+    CHECK(save_error.find("validation rejected") == std::string::npos);
+    CHECK(save_error.find("pool") != std::string::npos);
+    std::remove("a1_default_dns_bad.json");
+    vgww::core::SetDefaultDnsProbeForTest({});
+}
+
 int main() {
     TestUiLanguagePersistence();
     TestUiScalePersistence();
@@ -3193,6 +3251,7 @@ int main() {
     TestB116SettingsSaveRefusesToDropDiskBindings();
     TestValidateConfigPublic();
     TestB105ProgrammaticConfigObeysLoaderRules();
+    TestDefaultDnsFallbackObeysResolverRules();
     TestB106CliOverrideMustValidate();
     TestExampleDhcpPoolKeys();
     TestApplyCliOverridesUsageFlags();
