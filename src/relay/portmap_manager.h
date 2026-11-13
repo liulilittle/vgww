@@ -35,6 +35,7 @@
 #include <map>
 #include <memory>
 #include <mutex>
+#include <set>
 #include <string>
 #include <thread>
 #include <vector>
@@ -202,6 +203,13 @@ namespace vgww {
                 return peak_pending_bytes_.load(std::memory_order_relaxed);
             }
 
+            /// W11 D2: FIN-era retransmissions dropped after shutdown(SD_SEND)
+            /// instead of being written to the shut WAN socket.
+            uint64_t LateAfterFinDropped() const noexcept {
+                return late_after_fin_dropped_.load(
+                    std::memory_order_relaxed);
+            }
+
             /// Packets dropped because a relay's `pending` reached
             /// kMaxPendingBytes (monotonic). Deliberately NOT added to the
             /// /api/status portmap_health object: its key set is a contract the
@@ -230,6 +238,10 @@ namespace vgww {
                 /// C5: WAN->LAN backpressure - the receive chain is paused
                 /// until RunLoop's resume probe re-arms it.
                 bool wan_read_paused = false;
+                /// W11 D2: set once shutdown(SD_SEND) has been issued after a
+                /// LAN half-close. Data arriving after this point is a FIN-era
+                /// retransmission and must not be written to the shut socket.
+                bool wan_send_shutdown = false;
             };
 
             void RunLoop();
@@ -279,6 +291,13 @@ namespace vgww {
             /// steady stream of identical states would grow state_queue_
             /// without bound and serialize the workers on queue_mutex_.
             std::map<uint64_t, int> last_state_;
+            /// W11 D2: LAN half-close intents, keyed by conn_id. Kept OUTSIDE
+            /// state_queue_ so a saturated queue (kMaxQueuedStates) or the
+            /// (conn_id,state) dedup can never swallow a FIN intent. Guarded
+            /// by queue_mutex_ (inserted from worker callbacks, drained by the
+            /// manager thread); the manager thread also erases entries lazily
+            /// when the owning relay disappears.
+            std::set<uint64_t> half_close_ids_;
 
             /// batch312: the RuleStore version the current acceptors were
             /// built from (manager thread only - no atomic needed).
@@ -290,6 +309,9 @@ namespace vgww {
             std::atomic<uint64_t> pending_dropped_{0};
             std::atomic<uint64_t> peak_pending_bytes_{0};
             std::atomic<uint64_t> last_relay_conn_id_{0};
+            /// W11 D2: FIN-era retransmissions dropped after shutdown(SD_SEND)
+            /// instead of being written to the shut WAN socket.
+            std::atomic<uint64_t> late_after_fin_dropped_{0};
             std::function<void()> accept_probe_;
             std::function<void()> loop_probe_;
             std::function<void()> accept_rearm_probe_;

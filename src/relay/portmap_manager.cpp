@@ -97,6 +97,7 @@ namespace vgww {
                 data_queue_.clear();
                 state_queue_.clear();
                 last_state_.clear();
+                half_close_ids_.clear();
             }
             // H4: io_context::stop() latches a terminated state; without
             // restart() every poll()/run_for() after the next Start returns
@@ -127,6 +128,16 @@ namespace vgww {
 
         void PortMapManager::OnStackState(uint64_t conn_id, int state) {
             std::lock_guard<std::mutex> lock(queue_mutex_);
+            // W11 D2: record a LAN half-close intent BEFORE the state-queue
+            // bound/dedup below. Those guards are lossy by design (cap 64,
+            // collapse repeats), so routing the FIN intent through
+            // state_queue_ would let a busy flow silently swallow it: the
+            // manager would never shut the WAN send direction and a peer that
+            // waits for EOF would hang. half_close_ids_ is a separate,
+            // non-lossy intent registry drained by RunLoop.
+            if (7 == state) {
+                half_close_ids_.insert(conn_id);
+            }
             // W11 D3: the stack calls the state handler for EVERY routed
             // packet, not only on a transition. Mirror data_queue_'s hard
             // bound and drop repeated (conn_id, state) pairs so a busy flow
@@ -176,6 +187,7 @@ namespace vgww {
                             state_queue_.pop_front();
                             if (state == 0 || state == 10) {
                                 last_state_.erase(conn_id);
+                                half_close_ids_.erase(conn_id);
                             }
                             const auto it = relays_.find(conn_id);
                             if (relays_.end() == it) continue;
@@ -218,6 +230,17 @@ namespace vgww {
                             // remote peer that simply stops reading can no
                             // longer drive an unbounded allocation.
                             Relay& relay = it->second;
+                            // W11 D2: after shutdown(SD_SEND) the WAN socket
+                            // must never see another async_write (it would
+                            // fail with WSAESHUTDOWN and force a RST teardown).
+                            // FIN-era bytes that arrive now are retransmissions
+                            // of already-delivered data; count and drop them
+                            // instead of writing or closing the relay.
+                            if (relay.wan_send_shutdown) {
+                                late_after_fin_dropped_.fetch_add(
+                                    1, std::memory_order_relaxed);
+                                continue;
+                            }
                             if (relay.pending_bytes + payload.size() >
                                 kMaxPendingBytes) {
                                 pending_dropped_.fetch_add(
@@ -235,6 +258,38 @@ namespace vgww {
                                        std::memory_order_relaxed)) {
                             }
                             PumpOne(conn_id, relay);
+                        }
+                        // W11 D2: drain LAN half-close intents AFTER this
+                        // pass's data has been moved into relay.pending and
+                        // pumped. A FIN intent is only actionable when the
+                        // relay has no queued bytes, no write in flight and
+                        // has not already been shut down; otherwise leave it
+                        // registered for a later pass (the write completion
+                        // clears write_in_flight, so this converges).
+                        for (auto hit = half_close_ids_.begin();
+                             hit != half_close_ids_.end();) {
+                            const uint64_t id = *hit;
+                            const auto it = relays_.find(id);
+                            if (relays_.end() == it) {
+                                hit = half_close_ids_.erase(hit);
+                                continue;
+                            }
+                            Relay& relay = it->second;
+                            if (relay.wan_send_shutdown) {
+                                hit = half_close_ids_.erase(hit);
+                                continue;
+                            }
+                            if (relay.wan && relay.wan->is_open() &&
+                                relay.pending.empty() &&
+                                !relay.write_in_flight) {
+                                std::error_code ignored;
+                                relay.wan->shutdown(
+                                    asio::socket_base::shutdown_send, ignored);
+                                relay.wan_send_shutdown = true;
+                                hit = half_close_ids_.erase(hit);
+                                continue;
+                            }
+                            ++hit;
                         }
                     }
 
