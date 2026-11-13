@@ -9044,6 +9044,48 @@ int main(int argc, char** argv) {
                        "\"ipv6\":{\"enabled\":false,"
                        "\"ula_prefix\":\"fdaa:0:0::\",\"prefix_len\":64,"
                        "\"ra_lifetime_s\":300},"
+                       "\"perf\":{\"workers\":\"8\",\"max_conns\":4096}}",
+                       body) == 400);
+        CHECK(body.find("invalid configuration rejected") != std::string::npos);
+        CHECK(body.find("reason") != std::string::npos);
+        // The reason must name the field the loader refused, not restate the
+        // generic sentence: the operator has twenty inputs to search.
+        CHECK(body.find("perf.workers") != std::string::npos);
+        body.clear();
+        // The reason is free text from the loader and can itself contain a
+        // double quote (config.cpp ParseMode: mode must be "bypass" or
+        // "main"). Response::Json does not escape, so without JsonEscaped the
+        // body stops being parseable JSON and the UI falls back to raw text.
+        CHECK(HttpPost(kPort + 2, "/api/config", "",
+                       "{\"adapter\":\"x\","
+                       "\"gateway\":{\"ipv4\":\"192.168.0.40\","
+                       "\"mask\":\"255.255.255.0\","
+                       "\"mac\":\"30:fc:68:88:b4:a9\"},"
+                       "\"mode\":\"bogus\","
+                       "\"ipv6\":{\"enabled\":false,"
+                       "\"ula_prefix\":\"fdaa:0:0::\",\"prefix_len\":64,"
+                       "\"ra_lifetime_s\":300},"
+                       "\"perf\":{\"workers\":8,\"max_conns\":4096}}",
+                       body) == 400);
+        {
+            const auto rejected = nlohmann::json::parse(body, nullptr, false);
+            CHECK(!rejected.is_discarded());
+            CHECK(rejected.contains("reason"));
+            if (rejected.contains("reason") &&
+                rejected["reason"].is_string()) {
+                CHECK(rejected["reason"].get<std::string>() ==
+                      "mode must be \"bypass\" or \"main\"");
+            }
+        }
+        body.clear();
+        CHECK(HttpPost(kPort + 2, "/api/config", "",
+                       "{\"adapter\":\"x\","
+                       "\"gateway\":{\"ipv4\":\"192.168.0.40\","
+                       "\"mask\":\"255.255.255.0\","
+                       "\"mac\":\"30:fc:68:88:b4:a9\"},"
+                       "\"ipv6\":{\"enabled\":false,"
+                       "\"ula_prefix\":\"fdaa:0:0::\",\"prefix_len\":64,"
+                       "\"ra_lifetime_s\":300},"
                        "\"perf\":{\"workers\":8,\"max_conns\":4096}}",
                        body) == 200);
         {

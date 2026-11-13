@@ -485,6 +485,13 @@ for (const rel of SERVER_TOKEN_SOURCES) {
   }
   for (const m of src.matchAll(/Response::Error\(\s*\d+\s*,\s*"([^"]*)"\s*\)/g)) serverTokens.add(m[1]);
   for (const m of src.matchAll(/\berror\s*=\s*"([^"]*)"\s*;/g)) serverTokens.add(m[1]);
+  // A handler that needs extra fields (the config 400 carries "reason" beside
+  // "error") builds the body by hand instead of calling Response::Error, so the
+  // token would silently leave this gate's coverage. Match the literal
+  // `\"error\":\"<token>\"` spelling too; a concatenated value
+  // (`\"error\":\"" + JsonEscaped(x)`) has no closing `\"` and is skipped, the
+  // same way the Response::Error pattern skips a non-literal argument.
+  for (const m of src.matchAll(/\\"error\\":\\"([^"\\]*)\\"/g)) serverTokens.add(m[1]);
 }
 // batch168: the same zero-coverage trap as the markup extractor. If both
 // producer patterns stop matching (a refactor to Response::Error(400, Status())

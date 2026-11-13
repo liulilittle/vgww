@@ -440,6 +440,10 @@ let configPayload = null;
 // batch181: config POST / apply-status replies, so the apply-outcome path is
 // reachable from a case.
 let configPostReply = { ok: true };
+// The status the config POST answers with. A rejected save is a 400 whose body
+// carries {"error":"<token>","reason":"<field detail>"}; the stub used to be
+// able to answer 200 only, so the reason-passthrough path was unreachable.
+let configPostStatus = 200;
 let applyStatusReply = { attempt_id: 0, completed_id: 0, ok: true, error: '' };
 let applyStatusPolls = 0;
 const deferredPaths = new Set();
@@ -480,7 +484,7 @@ async function fetchStub(path, opts) {
     // completed_id catches up. The stub used to answer {} for every config
     // POST, so `saved.note` was never 'applied', the poll never ran, and the
     // "apply failed / apply timed out" branches were dead code under test.
-    return jsonResponse(configPostReply);
+    return jsonResponse(configPostReply, configPostStatus);
   }
   if (method === 'GET' && path === '/api/config/apply-status') {
     applyStatusPolls++;
@@ -4972,6 +4976,43 @@ cases.push(['Enter submits the settings form from any of its numeric fields', as
      'Enter must not be hijacked on a select');
 }]);
 
+// A rejected save must name the field. The server answers 400 with
+// {"error":"invalid configuration rejected","reason":"perf.workers must be a
+// number"}; api() translates the error token and appends the reason, so the
+// operator reads which of the twenty inputs the loader refused instead of one
+// generic sentence. The stub could only answer 200 before, so this path was
+// unreachable from any case.
+cases.push(['a rejected save shows the field the server named', async () => {
+  configPayload = JSON.parse(JSON.stringify(SERVER_CONFIG));
+  resetSettingsForm();
+  await sandbox.loadSettings(true);
+  nodeFor('#set-workers').value = '8';
+  configPostReply = {
+    error: 'invalid configuration rejected',
+    reason: 'perf.workers must be a number',
+  };
+  configPostStatus = 400;
+  vm.runInContext('toasts.length = 0; renderToasts();', context);
+  try {
+    await sandbox.saveSettings();
+  } finally {
+    configPostReply = { ok: true };
+    configPostStatus = 200;
+  }
+  const texts = nodeFor('#toast').children.map(c => c.textContent);
+  const translated = vm.runInContext('t("err.invalid configuration rejected")', context);
+  ok(texts.some(x => x.includes(translated)),
+     'the error token must still be translated, got: ' + JSON.stringify(texts));
+  ok(texts.some(x => x.includes('perf.workers must be a number')),
+     'the reason the server named must reach the operator, got: ' + JSON.stringify(texts));
+  // The token must stay a TOKEN. Folding the reason into the error value would
+  // make t("err." + j.error) miss and paint the raw key text ("err.invalid
+  // configuration rejected: ...") into the toast.
+  ok(!texts.some(x => x.includes('err.invalid configuration rejected')),
+     'the error token must be translated, not shown as a key, got: ' + JSON.stringify(texts));
+  vm.runInContext('toasts.length = 0; renderToasts();', context);
+}]);
+
 for (const [name, fn] of cases) {
   await run(name, fn);
 }
@@ -4984,7 +5025,7 @@ for (const [name, fn] of cases) {
 //
 // The number is a FLOOR, not an equality: adding cases must never require
 // editing it, only removing them.
-const MIN_CASES = 86;
+const MIN_CASES = 87;
 if (cases.length < MIN_CASES) {
   console.error(`FAIL ${NAME}: only ${cases.length} case(s) are registered, but at least ${MIN_CASES} are required.`);
   console.error('  A case was deleted (or never registered). Restore it, or - if the deletion was');

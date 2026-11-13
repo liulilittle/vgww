@@ -3148,7 +3148,13 @@ async function api(path, opt) {
     let msg = text;
     try {
       const j = JSON.parse(text);
-      if (j && j.error) msg = t("err." + j.error);
+      if (j && j.error) {
+        msg = t("err." + j.error);
+        // The server names the field that failed validation in "reason"
+        // (e.g. "perf.workers must be a number"). Without it the operator
+        // reads one generic sentence for a form with twenty inputs.
+        if (j.reason) msg += ": " + j.reason;
+      }
     } catch (e) { /* not json: show raw */ }
     throw new Error(msg);
   }

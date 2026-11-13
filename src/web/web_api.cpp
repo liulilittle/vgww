@@ -4097,21 +4097,34 @@ namespace vgww {
                                   return Response::Error(500,
                                                          "config save failed");
                               }
+                              // The loader's own message names the field that
+                              // failed (config.cpp ReadInteger/Require*), so
+                              // keep it: a 400 that says only "rejected" leaves
+                              // the operator guessing among twenty inputs.
+                              std::string validation_error;
                               const core::AtomicWriteOutcome outcome =
                                   core::WriteFileAtomicDurable(
                                       config_path, body, write_error,
-                                      [](const std::string& temp_path) {
-                                          std::string ignore;
+                                      [&validation_error](
+                                          const std::string& temp_path) {
                                           return core::Config::LoadFromFile(
-                                                     temp_path, ignore)
+                                                     temp_path,
+                                                     validation_error)
                                               .has_value();
                                       });
-                                       if (core::AtomicWriteOutcome::
-                                               kValidationFailed == outcome) {
-                                           audit("config save rejected (invalid configuration)");
-                                           return Response::Error(
-                                               400, "invalid configuration rejected");
-                                       }
+                              if (core::AtomicWriteOutcome::
+                                      kValidationFailed == outcome) {
+                                  audit("config save rejected (invalid configuration)");
+                                  // The "error" token stays byte-for-byte the
+                                  // same (the UI translates it as err.<token>);
+                                  // "reason" carries the field-level detail.
+                                  // Response::Json does not escape, so the
+                                  // free-text reason goes through JsonEscaped.
+                                  return Response::Json(
+                                      "{\"error\":\"invalid configuration rejected\",\"reason\":\"" +
+                                          JsonEscaped(validation_error) + "\"}",
+                                      400);
+                              }
                               if (core::AtomicWriteOutcome::kOk != outcome) {
                                   audit("config save failed (write error)");
                                   return Response::Error(500,
