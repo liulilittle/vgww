@@ -96,6 +96,7 @@ namespace vgww {
                 std::lock_guard<std::mutex> lock(queue_mutex_);
                 data_queue_.clear();
                 state_queue_.clear();
+                last_state_.clear();
             }
             // H4: io_context::stop() latches a terminated state; without
             // restart() every poll()/run_for() after the next Start returns
@@ -126,6 +127,22 @@ namespace vgww {
 
         void PortMapManager::OnStackState(uint64_t conn_id, int state) {
             std::lock_guard<std::mutex> lock(queue_mutex_);
+            // W11 D3: the stack calls the state handler for EVERY routed
+            // packet, not only on a transition. Mirror data_queue_'s hard
+            // bound and drop repeated (conn_id, state) pairs so a busy flow
+            // cannot grow the queue (and the manager's critical section)
+            // without limit. last_state_ is erased on terminal states in
+            // RunLoop and cleared in Stop(), so a fresh relay always sees
+            // its first state of each kind.
+            static constexpr size_t kMaxQueuedStates = 64;
+            if (state_queue_.size() >= kMaxQueuedStates) {
+                return;
+            }
+            const auto it = last_state_.find(conn_id);
+            if (it != last_state_.end() && it->second == state) {
+                return;
+            }
+            last_state_[conn_id] = state;
             state_queue_.emplace_back(conn_id, state);
         }
 
@@ -157,6 +174,9 @@ namespace vgww {
                         while (!state_queue_.empty()) {
                             auto [conn_id, state] = state_queue_.front();
                             state_queue_.pop_front();
+                            if (state == 0 || state == 10) {
+                                last_state_.erase(conn_id);
+                            }
                             const auto it = relays_.find(conn_id);
                             if (relays_.end() == it) continue;
                             // xtcp TcpState: kEstablished = 4; terminal states
@@ -166,26 +186,18 @@ namespace vgww {
                                 PumpOne(conn_id, it->second);
                                 ArmWanRead(conn_id, it->second);
                             } else if (state == 7) {
-                                // kCloseWait: the WAN peer half-closed (its FIN
-                                // reached the stack). Propagate the half-close:
-                                // shut OUR send direction of the WAN socket so
-                                // the peer's server drains then sees EOF; its
-                                // replies still flow back through the receive
-                                // pump. Runs on the manager thread that owns
-                                // `io_` - the same thread that drives the wan
-                                // socket - so asio needs no external
-                                // synchronization.
-                                const bool any =
-                                    nullptr != it->second.wan &&
-                                    it->second.wan->is_open();
-                                if (any) {
-                                    std::error_code ignored;
-                                    it->second.wan->shutdown(
-                                        asio::socket_base::shutdown_send,
-                                        ignored);
-                                }
+                                // kCloseWait: the LAN peer half-closed. Do NOT
+                                // shut the WAN send direction here: data and
+                                // FIN can arrive in different RunLoop passes,
+                                // so a queue that is transiently empty is not
+                                // proof that the stream ended. An early
+                                // shutdown(SD_SEND) makes the next
+                                // async_write fail (WSAESHUTDOWN), truncates
+                                // the tail and forces a RST teardown. The
+                                // half-close is completed by the normal
+                                // ArmWanRead EOF path (CloseRelay graceful).
                             } else if (state == 0 || state == 10) {
-                                CloseRelay(conn_id, it->second);
+                                CloseRelay(conn_id, it->second, false);
                             }
                         }
                         while (!data_queue_.empty()) {
@@ -479,7 +491,7 @@ namespace vgww {
                 return;
             }
             if (!relay.wan || !relay.wan->is_open()) {
-                CloseRelay(conn_id, relay);
+                CloseRelay(conn_id, relay, false);
                 return;
             }
             auto& chunk = relay.pending.front();
@@ -522,7 +534,7 @@ namespace vgww {
                             if (relays_.end() == it) return;
                             it->second.write_in_flight = false;
                             if (err) {
-                                CloseRelay(conn_id, it->second);
+                                CloseRelay(conn_id, it->second, false);
                                 return;
                             }
                             PumpOne(conn_id, it->second);  // drain remaining queue
@@ -532,7 +544,7 @@ namespace vgww {
                         // leaving a write gate that is stuck closed forever.
                         const auto it = relays_.find(conn_id);
                         if (relays_.end() != it) {
-                            CloseRelay(conn_id, it->second);
+                            CloseRelay(conn_id, it->second, false);
                         }
                     }
                 });
@@ -556,9 +568,13 @@ namespace vgww {
                         stats_.handler_errors, [&] {
                             if (err || 0 == n) {
                                 // WAN peer closed: tear the whole relay down.
+                                // A clean EOF must reach the LAN client as a
+                                // graceful FIN, not an abrupt RST; only a real
+                                // error is non-graceful.
                                 const auto it = relays_.find(conn_id);
                                 if (relays_.end() != it) {
-                                    CloseRelay(conn_id, it->second);
+                                    CloseRelay(conn_id, it->second,
+                                               asio::error::eof == err);
                                 }
                                 return;
                             }
@@ -594,7 +610,7 @@ namespace vgww {
                         // receive chain that never re-arms.
                         const auto it = relays_.find(conn_id);
                         if (relays_.end() != it) {
-                            CloseRelay(conn_id, it->second);
+                            CloseRelay(conn_id, it->second, false);
                         }
                     }
                 });
@@ -616,18 +632,20 @@ namespace vgww {
             });
         }
 
-        void PortMapManager::CloseRelay(uint64_t conn_id, Relay& relay) {
+        void PortMapManager::CloseRelay(uint64_t conn_id, Relay& relay,
+                                        bool graceful) {
             relay.closed = true;
             if (relay.wan) {
                 std::error_code ignored;
                 relay.wan->close(ignored);
             }
-            // RST the LAN client side. Must NOT call stack_->Abort here: the
+            // Signal the LAN client side. Must NOT call stack_->Abort here: the
             // manager thread has no TX ring, so the emitted reset would be
             // dropped (kNoRing) and the client would hang forever waiting for
-            // a WAN-side close. Route it through the owning worker instead.
+            // a WAN-side close. Route it through the owning worker instead:
+            // graceful -> FIN (clean EOF), otherwise -> RST (real error).
             if (teardown_) {
-                teardown_(conn_id, false);
+                teardown_(conn_id, graceful);
             }
             relays_.erase(conn_id);
         }

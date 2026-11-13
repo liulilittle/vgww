@@ -167,6 +167,14 @@ namespace vgww {
             /// Tracks connection lifecycle (established/closed/reset).
             void OnStackState(uint64_t conn_id, int state);
 
+            /// Test/telemetry seam: current number of pending state events.
+            /// Read-only observation of the state queue (guarded by the same
+            /// mutex as OnStackState), used to assert dedup and the hard cap.
+            size_t StateQueueDepth() {
+                std::lock_guard<std::mutex> lock(queue_mutex_);
+                return state_queue_.size();
+            }
+
             /// Packets dropped because the send queue hit its hard cap
             /// (monotonic; exposed for diagnostics/tests).
             uint64_t DroppedPackets() const noexcept {
@@ -228,7 +236,7 @@ namespace vgww {
             void ApplyRules();
             void PumpOne(uint64_t conn_id, Relay& relay);
             void ArmWanRead(uint64_t conn_id, Relay& relay);
-            void CloseRelay(uint64_t conn_id, Relay& relay);
+            void CloseRelay(uint64_t conn_id, Relay& relay, bool graceful);
 
             LanSender send_to_lan_;
             RelayTeardown teardown_;
@@ -266,6 +274,11 @@ namespace vgww {
             std::mutex queue_mutex_;
             std::deque<std::pair<uint64_t, core::PoolVector<uint8_t>>> data_queue_;
             std::deque<std::pair<uint64_t, int>> state_queue_;
+            /// W11 D3: last enqueued state per conn_id. The stack invokes the
+            /// state handler for EVERY routed packet, so without this guard a
+            /// steady stream of identical states would grow state_queue_
+            /// without bound and serialize the workers on queue_mutex_.
+            std::map<uint64_t, int> last_state_;
 
             /// batch312: the RuleStore version the current acceptors were
             /// built from (manager thread only - no atomic needed).

@@ -1090,6 +1090,219 @@ void TestB312ApplyRulesIsChangeDriven() {
     store.Clear();
 }
 
+    void TestW11WanEofIsGraceful() {
+        xtcp::buf::InitPools();
+        NullBackend backend;
+        xtcp::XtcpStack stack(&backend);
+        stack.SetMaxConnections(16);
+
+        vgww::core::Config config;
+        config.gateway.ipv4 = kGatewayIp;
+        config.gateway.mask = (0u) | (0u << 8) | (255u << 16) | (255u << 24);
+        config.gateway.mac = {0x30, 0xFC, 0x68, 0x88, 0xB4, 0xA9};
+
+        const uint16_t wan_port = ProbeFreePort();
+        CHECK(0 != wan_port);
+        vgww::web::RuleStore::Instance().AddPortMap(
+            {"tcp", wan_port, "127.0.0.1", 45678});
+
+        auto& manager = vgww::relay::PortMapManager::Instance();
+        manager.Stop();
+        const auto send_to_lan = [](uint64_t, const uint8_t*, uint32_t) {
+            return true;
+        };
+        std::atomic<int> seen{-1};
+        const auto teardown = [&seen](uint64_t, bool g) {
+            seen.store(g ? 1 : 0);
+        };
+        manager.Start(&stack, config, send_to_lan, teardown);
+        CHECK(WaitFor([&] { return manager.LiveAcceptLoops() >= 1; }, 3000));
+
+        asio::io_context io;
+        asio::ip::tcp::socket client(io);
+        std::error_code ec;
+        client.connect(asio::ip::tcp::endpoint(
+                           asio::ip::make_address("127.0.0.1"), wan_port),
+                       ec);
+        CHECK(!ec);
+        CHECK(WaitFor([&] { return 0 != manager.LastRelayConnId(); }, 5000));
+        const uint64_t conn_id = manager.LastRelayConnId();
+        CHECK(0 != conn_id);
+
+        manager.OnStackState(conn_id, 4);
+        std::this_thread::sleep_for(std::chrono::milliseconds(300));
+
+        // A normal WAN half-close must deliver a graceful FIN to the LAN
+        // side rather than an abrupt reset.
+        client.close(ec);
+        CHECK(!ec);
+        CHECK(WaitFor([&] { return seen.load() >= 0; }, 5000));
+        CHECK(seen.load() == 1);
+
+        manager.Stop();
+        vgww::web::RuleStore::Instance().RemovePortMap(0);
+    }
+
+    void TestW11CloseWaitDrainsBeforeFin() {
+        xtcp::buf::InitPools();
+        NullBackend backend;
+        xtcp::XtcpStack stack(&backend);
+        stack.SetMaxConnections(16);
+
+        vgww::core::Config config;
+        config.gateway.ipv4 = kGatewayIp;
+        config.gateway.mask = (0u) | (0u << 8) | (255u << 16) | (255u << 24);
+        config.gateway.mac = {0x30, 0xFC, 0x68, 0x88, 0xB4, 0xA9};
+
+        const uint16_t wan_port = ProbeFreePort();
+        CHECK(0 != wan_port);
+        vgww::web::RuleStore::Instance().AddPortMap(
+            {"tcp", wan_port, "127.0.0.1", 45678});
+
+        auto& manager = vgww::relay::PortMapManager::Instance();
+        manager.Stop();
+        const auto send_to_lan = [](uint64_t, const uint8_t*, uint32_t) {
+            return true;
+        };
+        std::atomic<int> resets{0};
+        const auto teardown = [&resets](uint64_t, bool graceful) {
+            if (!graceful) resets.fetch_add(1);
+        };
+        manager.Start(&stack, config, send_to_lan, teardown);
+        CHECK(WaitFor([&] { return manager.LiveAcceptLoops() >= 1; }, 3000));
+
+        asio::io_context io;
+        asio::ip::tcp::socket client(io);
+        std::error_code ec;
+        client.connect(asio::ip::tcp::endpoint(
+                           asio::ip::make_address("127.0.0.1"), wan_port),
+                       ec);
+        CHECK(!ec);
+        CHECK(WaitFor([&] { return 0 != manager.LastRelayConnId(); }, 5000));
+        const uint64_t conn_id = manager.LastRelayConnId();
+        CHECK(0 != conn_id);
+
+        manager.OnStackState(conn_id, 4);
+        std::this_thread::sleep_for(std::chrono::milliseconds(300));
+
+        // A LAN half-close must not truncate data already queued for the WAN
+        // peer: every pending byte must arrive before the FIN, and the
+        // teardown must not be an abrupt reset.
+        manager.OnStackState(conn_id, 7);
+        std::vector<uint8_t> payload(512);
+        std::vector<uint8_t> expected;
+        for (int i = 0; i < 4; ++i) {
+            for (size_t j = 0; j < payload.size(); ++j) {
+                payload[j] = static_cast<uint8_t>((i * 31 + j) & 0xFF);
+            }
+            if (manager.OnStackData(
+                    conn_id, payload.data(),
+                    static_cast<uint32_t>(payload.size()))) {
+                expected.insert(expected.end(), payload.begin(),
+                                payload.end());
+            }
+        }
+        CHECK(!expected.empty());
+
+        std::vector<uint8_t> received;
+        client.non_blocking(true, ec);
+        CHECK(!ec);
+        const auto deadline =
+            std::chrono::steady_clock::now() + std::chrono::seconds(10);
+        while (received.size() < expected.size() &&
+               std::chrono::steady_clock::now() < deadline) {
+            std::array<uint8_t, 65536> buf{};
+            std::error_code e;
+            const size_t n = client.read_some(asio::buffer(buf), e);
+            if (!e && n > 0) {
+                received.insert(received.end(), buf.begin(), buf.begin() + n);
+            } else if (e == asio::error::would_block ||
+                       e == asio::error::try_again ||
+                       e == asio::error::eof) {
+                // A clean FIN may arrive before the peer's last segments are
+                // drained from the socket buffer; keep polling until every
+                // queued byte has been observed or the deadline expires.
+                std::this_thread::sleep_for(std::chrono::milliseconds(5));
+            } else {
+                break;
+            }
+        }
+        CHECK(received.size() == expected.size());
+        CHECK(received == expected);
+        CHECK(resets.load() == 0);
+        std::fprintf(stderr,
+                     "[portmap] W11 D2 drain-before-FIN recvd=%llu "
+                     "resets=%d\n",
+                     static_cast<unsigned long long>(received.size()),
+                     resets.load());
+
+        manager.Stop();
+        vgww::web::RuleStore::Instance().RemovePortMap(0);
+    }
+
+    void TestW11StateQueueIsDeduplicatedAndBounded() {
+        xtcp::buf::InitPools();
+        NullBackend backend;
+        xtcp::XtcpStack stack(&backend);
+        stack.SetMaxConnections(16);
+
+        vgww::core::Config config;
+        config.gateway.ipv4 = kGatewayIp;
+        config.gateway.mask = (0u) | (0u << 8) | (255u << 16) | (255u << 24);
+        config.gateway.mac = {0x30, 0xFC, 0x68, 0x88, 0xB4, 0xA9};
+
+        const uint16_t wan_port = ProbeFreePort();
+        CHECK(0 != wan_port);
+        vgww::web::RuleStore::Instance().AddPortMap(
+            {"tcp", wan_port, "127.0.0.1", 45678});
+
+        auto& manager = vgww::relay::PortMapManager::Instance();
+        manager.Stop();
+        const auto send_to_lan = [](uint64_t, const uint8_t*, uint32_t) {
+            return true;
+        };
+        const auto teardown = [](uint64_t, bool) {};
+        manager.Start(&stack, config, send_to_lan, teardown);
+        CHECK(WaitFor([&] { return manager.LiveAcceptLoops() >= 1; }, 3000));
+
+        asio::io_context io;
+        asio::ip::tcp::socket client(io);
+        std::error_code ec;
+        client.connect(asio::ip::tcp::endpoint(
+                           asio::ip::make_address("127.0.0.1"), wan_port),
+                       ec);
+        CHECK(!ec);
+        CHECK(WaitFor([&] { return 0 != manager.LastRelayConnId(); }, 5000));
+        const uint64_t conn_id = manager.LastRelayConnId();
+        CHECK(0 != conn_id);
+
+        manager.OnStackState(conn_id, 4);
+        std::this_thread::sleep_for(std::chrono::milliseconds(300));
+
+        // Repeating the same (conn_id, state) must not accumulate: a peer
+        // that floods identical transitions must not grow the state queue
+        // without bound.
+        for (int i = 0; i < 200; ++i) {
+            manager.OnStackState(conn_id, 7);
+        }
+        CHECK(manager.StateQueueDepth() <= 1);
+
+        // Many DIFFERENT states in one burst are still capped at the hard
+        // limit, so a hostile/buggy caller cannot drive unbounded growth.
+        for (int i = 0; i < 500; ++i) {
+            manager.OnStackState(static_cast<uint64_t>(0x9000 + i),
+                                 1 + (i % 11));
+        }
+        CHECK(manager.StateQueueDepth() <= 64);
+        std::fprintf(stderr,
+                     "[portmap] W11 D3 state-queue depth=%llu\n",
+                     static_cast<unsigned long long>(
+                         manager.StateQueueDepth()));
+
+        manager.Stop();
+        vgww::web::RuleStore::Instance().RemovePortMap(0);
+    }
+
 }  // namespace
 
 int main() {
@@ -1104,6 +1317,9 @@ int main() {
     TestAcceptRearmThrowKeepsTheManagerAlive();
     TestRunLoopThrowKeepsTheManagerAlive();
     TestB86MalformedLanIpIsRefusedNotZeroDialed();
+    TestW11WanEofIsGraceful();
+    TestW11CloseWaitDrainsBeforeFin();
+    TestW11StateQueueIsDeduplicatedAndBounded();
     TestB312ApplyRulesIsChangeDriven();   // last: it fails one bind on purpose
 
     if (0 == g_failures) {
