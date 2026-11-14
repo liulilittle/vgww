@@ -21,6 +21,7 @@
 #include <cstdio>
 #include <filesystem>
 #include <fstream>
+#include <io.h>
 #include <memory>
 #include <string>
 #include <vector>
@@ -1966,6 +1967,101 @@ namespace {
                     const DWORD alive = ::WaitForSingleObject(child, 2000);
                     ::CloseHandle(child);
                     CHECK(WAIT_OBJECT_0 == alive);  // already gone
+                }
+            }
+        }
+
+        // The TerminateProcess failure diagnostic is written to THIS
+        // process's stderr (installer.cpp:598), not into the child pipe, so
+        // `output` can never contain it. Capture the process stderr across a
+        // deadline-terminated child and assert the marker is ABSENT on the
+        // healthy path (TerminateProcess succeeded, so the branch did not
+        // run). The failure branch itself cannot be induced from inside this
+        // test: RunProcessCapture's handle is always valid and this process
+        // always holds PROCESS_TERMINATE, so TerminateProcess cannot be made
+        // to fail here (W5 - the branch is pinned by the SOURCE assertion
+        // below, which reads the production file and kills the mutation).
+        {
+            std::fflush(stderr);
+            const int saved_stderr = ::_dup(::_fileno(stderr));
+            CHECK(saved_stderr >= 0);
+            wchar_t tmp[MAX_PATH] = {0};
+            const DWORD tmp_len = ::GetTempPathW(MAX_PATH, tmp);
+            CHECK(tmp_len > 0 && tmp_len < MAX_PATH);
+            if (saved_stderr >= 0 && tmp_len > 0 && tmp_len < MAX_PATH) {
+                const std::wstring path =
+                    std::wstring(tmp, tmp_len) + L"vgww-stderr-" +
+                    std::to_wstring(::GetCurrentProcessId()) + L".log";
+                FILE* capture = nullptr;
+                if (0 == ::_wfopen_s(&capture, path.c_str(), L"w")) {
+                    ::_dup2(::_fileno(capture), ::_fileno(stderr));
+                    std::string out;
+                    DWORD code = 0;
+                    const bool ok = vgww::driver::RunProcessCapture(
+                        exe, {L"--sleep-pid", L"20000"}, out, code, 1200);
+                    CHECK(!ok);
+                    std::fflush(stderr);
+                    ::_dup2(saved_stderr, ::_fileno(stderr));
+                    ::_close(saved_stderr);
+                    std::fclose(capture);
+
+                    FILE* read = nullptr;
+                    CHECK(0 == ::_wfopen_s(&read, path.c_str(), L"rb"));
+                    if (read) {
+                        std::string text;
+                        char buf[4096];
+                        size_t got_bytes = 0;
+                        while ((got_bytes =
+                                    std::fread(buf, 1, sizeof(buf), read)) > 0) {
+                            text.append(buf, got_bytes);
+                        }
+                        std::fclose(read);
+                        CHECK(text.find("[vgww] TerminateProcess failed:") ==
+                              std::string::npos);
+                    }
+                    ::DeleteFileW(path.c_str());
+                } else if (saved_stderr >= 0) {
+                    ::_close(saved_stderr);
+                }
+            } else if (saved_stderr >= 0) {
+                ::_close(saved_stderr);
+            }
+        }
+
+        // Source anchor (the red/green discriminator): the production
+        // TerminateProcess site must report its failure on stderr. This is
+        // read from src/driver/installer.cpp (the repo root is the parent of
+        // the ctest build directory). It fails before the fix and passes
+        // after, and it kills the mutation (removing the fprintf line).
+        {
+            wchar_t exe_path[MAX_PATH * 2] = {0};
+            const DWORD exe_len =
+                ::GetModuleFileNameW(nullptr, exe_path, MAX_PATH * 2);
+            CHECK(exe_len > 0 && exe_len < MAX_PATH * 2);
+            if (exe_len > 0 && exe_len < MAX_PATH * 2) {
+                namespace fs = std::filesystem;
+                fs::path src =
+                    fs::path(std::wstring(exe_path, exe_len))
+                        .parent_path()   // Release
+                        .parent_path()   // build_s4
+                        .parent_path()   // repo root
+                        / "src" / "driver" / "installer.cpp";
+                std::error_code ec;
+                CHECK(fs::exists(src, ec));
+                std::ifstream in(src, std::ios::binary);
+                CHECK(in.good());
+                std::string text((std::istreambuf_iterator<char>(in)),
+                                 std::istreambuf_iterator<char>());
+                const size_t pos = text.find("TerminateProcess failed:");
+                CHECK(pos != std::string::npos);
+                // The diagnostic must be a fprintf to stderr at the
+                // TerminateProcess call site (not a comment or a string in
+                // some unrelated helper).
+                const size_t tp = text.find("::TerminateProcess(");
+                CHECK(tp != std::string::npos);
+                if (pos != std::string::npos && tp != std::string::npos) {
+                    CHECK(pos > tp);
+                    CHECK(text.find("GetLastError", pos) != std::string::npos);
                 }
             }
         }

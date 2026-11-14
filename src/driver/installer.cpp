@@ -595,7 +595,11 @@ namespace vgww {
             }
             ::CloseHandle(pipe_read);
             if (!exited) {
-                (void)::TerminateProcess(pi.hProcess, 1);
+                if (!::TerminateProcess(pi.hProcess, 1)) {
+                    std::fprintf(stderr,
+                                 "[vgww] TerminateProcess failed: %lu\n",
+                                 ::GetLastError());
+                }
             }
             const DWORD wait = ::WaitForSingleObject(pi.hProcess, 5000);
             exit_code = 1;
