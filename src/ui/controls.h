@@ -1095,8 +1095,15 @@ namespace vgww {
             }
         };
 
-        /// Single-line editor. Only printable ASCII input is accepted (no
-        /// IME; documented S4.2 limitation), the caret is the tail position.
+        /// Single-line editor. IME composition input is accepted end to end:
+        /// WM_IME_* is handled in window.cpp (WM_IME_REQUEST /
+        /// WM_IME_SETCONTEXT / WM_IME_STARTCOMPOSITION / WM_IME_COMPOSITION /
+        /// WM_IME_ENDCOMPOSITION, window.cpp:3871-3967) and the candidate list
+        /// is anchored under the caret by PlaceImeWindows
+        /// (window.cpp:2295-2329); the preedit is drawn inline by
+        /// SetCompositionForTest and committed as any Unicode through
+        /// CommitComposition (controls.h:1204-1207), bypassing the ASCII-only
+        /// WM_CHAR path. The caret is the tail position.
         class TextInputElement : public Element {
         public:
             TextInputElement();

@@ -26,7 +26,11 @@ namespace vgww {
         /// Autostart hook for DataplaneCommandExecutor (T5 seam; the entry
         /// point wires it): writes HKCU Run through the tray and keeps the
         /// tray menu check mark in sync, so a page-issued SetAutostartCmd
-        /// behaves exactly like the tray menu item.
+        /// writes HKCU and syncs the tray check mark through the command
+        /// queue (controller.cpp:728-749 records the audit line on both the
+        /// success and failure paths). The tray menu item is a DIRECT path
+        /// (tray.cpp:364-374 calls SetAutostart + UpdateMenu inline, outside
+        /// the queue) and therefore does NOT produce that audit line.
         CommandResult TrayAutostartHook(const SetAutostartCmd& cmd);
 
         class UiApp final {

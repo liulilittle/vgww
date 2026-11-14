@@ -7014,6 +7014,13 @@ namespace vgww {
                 Color text_color = warm ? WarmFillText()
                                         : ColorFor(ColorToken::Text);
                 text_color.a *= e;
+                // Text ellipsis for comparison: Text::RenderCore
+                // (controls.cpp:6019-6036) single-line path runs
+                // EllipsizeToWidth + DrawTextSingleLine. ToastHost paints
+                // with ctx.DrawText below: no EllipsizeToWidth and no clip,
+                // so an over-long toast label is NOT ellipsized and can paint
+                // past the toast rect. Known current state; aligning the two
+                // paths is deferred (layout change out of scope here).
                 ctx.DrawText(label, toast, FontToken::Body, text_color,
                              Align::Center);
             }
