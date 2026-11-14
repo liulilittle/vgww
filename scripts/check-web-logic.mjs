@@ -5019,12 +5019,21 @@ cases.push(['a rejected save shows the field the server named', async () => {
 // value made the lookup miss and the 461-language fallback painted the raw
 // English (and the bare "err." prefix) into the toast. The value must be a
 // bare token that the language tables carry.
+// P133 W11: the assertion below proves the page translates the token, not
+// that the toast is LOCALIZED. Both halves read t() at the moment of the
+// check, so a page stuck on the default language scored green: the case
+// never called setScriptLang, so currentLang was "en" and t() returned the
+// English value on both sides of the comparison. zh-CN carries this token
+// ("绑定条目过多"), so the case pins the page to zh-CN and then requires
+// the toast to read the zh-CN string. A switch back to en must fail it,
+// which is what makes this a test of localization rather than of t().
 cases.push(['the binding-cap refusal is a translated token', async () => {
   configPayload = JSON.parse(JSON.stringify(SERVER_CONFIG));
   resetSettingsForm();
   await sandbox.loadSettings(true);
   configPostReply = { error: 'too many bindings' };
   configPostStatus = 409;
+  setScriptLang('zh-CN');
   vm.runInContext('toasts.length = 0; renderToasts();', context);
   try {
     await sandbox.saveSettings();
@@ -5034,6 +5043,8 @@ cases.push(['the binding-cap refusal is a translated token', async () => {
   }
   const texts = nodeFor('#toast').children.map(c => c.textContent);
   const translated = vm.runInContext('t("err.too many bindings")', context);
+  ok(translated !== 'too many bindings',
+     'the page must be localized for this assertion to mean anything, t() returned the English: ' + JSON.stringify(translated));
   ok(texts.some(x => x.includes(translated)),
      'the error token must be translated, got: ' + JSON.stringify(texts));
   ok(!texts.some(x => x.includes('err.')),
