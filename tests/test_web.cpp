@@ -65,6 +65,97 @@ namespace {
         return true;
     }
 
+    /// P138: identify a port-map rule by its NON-port fields. A bare
+    /// body.find("<wan_port>") substring is coupled to the listen port: the
+    /// suite binds UniquePort() (ephemeral), so a port such as 48080/18081
+    /// contains "8080"/"8081" and flips the assertion for reasons that have
+    /// nothing to do with the rule data. The JSON field is matched by VALUE,
+    /// so a listen port that happens to contain the digits cannot satisfy it.
+    bool PortMapHasLanIp(const std::string& body, const std::string& lan_ip) {
+        const auto j = nlohmann::json::parse(body, nullptr, false);
+        if (j.is_discarded() || !j.is_array()) return false;
+        for (const auto& e : j) {
+            if (e.is_object() && e.contains("lan_ip") &&
+                e["lan_ip"].is_string() && e["lan_ip"].get<std::string>() == lan_ip) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    /// P138: same, keyed on the wan_port field (a JSON number, compared as a
+    /// number - never as a substring of the payload).
+    bool PortMapHasWanPort(const std::string& body, uint16_t wan_port) {
+        const auto j = nlohmann::json::parse(body, nullptr, false);
+        if (j.is_discarded() || !j.is_array()) return false;
+        for (const auto& e : j) {
+            if (e.is_object() && e.contains("wan_port") &&
+                e["wan_port"].is_number() &&
+                e["wan_port"].get<uint16_t>() == wan_port) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    /// P138: does the /api/config body carry a DHCPv6 static binding whose IP
+    /// is the given compressed IPv6 text? The old `body.find("5000")` matched
+    /// the ephemeral listen port (e.g. 45000) too, so a stale-body check could
+    /// pass or fail on the port alone. Match the JSON field by value.
+    bool Dhcp6BindingHasIp(const std::string& body, const std::string& ip) {
+        const auto j = nlohmann::json::parse(body, nullptr, false);
+        if (j.is_discarded() || !j.is_object()) return false;
+        const auto v6 = j.find("ipv6");
+        if (j.end() == v6 || !v6->is_object()) return false;
+        const auto dhcp = v6->find("dhcpv6");
+        if (v6->end() == dhcp || !dhcp->is_object()) return false;
+        const auto sb = dhcp->find("static_bindings");
+        if (dhcp->end() == sb || !sb->is_array()) return false;
+        for (const auto& e : *sb) {
+            if (e.is_object() && e.contains("ip") && e["ip"].is_string() &&
+                e["ip"].get<std::string>() == ip) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    /// P138: is a rate limit with the given MAC and uplink kbps present? The
+    /// old `body.find("333")` matched a listen port such as 33300 too, so the
+    /// assertion tested the port rather than the rule. Match the JSON fields.
+    bool RateLimitHasUplink(const std::string& body, const std::string& mac,
+                            uint32_t uplink_kbps) {
+        const auto j = nlohmann::json::parse(body, nullptr, false);
+        if (j.is_discarded() || !j.is_array()) return false;
+        for (const auto& e : j) {
+            if (e.is_object() && e.contains("mac") && e["mac"].is_string() &&
+                e["mac"].get<std::string>() == mac && e.contains("uplink_kbps") &&
+                e["uplink_kbps"].is_number() &&
+                e["uplink_kbps"].get<uint32_t>() == uplink_kbps) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    /// P138: does a persisted rules document hold a port-map rule with the given
+    /// wan_port? Used on FILE contents, where no listen port exists, but the
+    /// same substring form is kept so the assertion reads by field value only.
+    bool RuleDocHasWanPort(const std::string& doc, uint16_t wan_port) {
+        const auto j = nlohmann::json::parse(doc, nullptr, false);
+        if (j.is_discarded() || !j.is_object()) return false;
+        const auto pm = j.find("portmaps");
+        if (j.end() == pm || !pm->is_array()) return false;
+        for (const auto& e : *pm) {
+            if (e.is_object() && e.contains("wan_port") &&
+                e["wan_port"].is_number() &&
+                e["wan_port"].get<uint16_t>() == wan_port) {
+                return true;
+            }
+        }
+        return false;
+    }
+
     using vgww::web::HttpServer;
     using vgww::web::Request;
     using vgww::web::Response;
@@ -1845,7 +1936,7 @@ static void TestB112WebConfigSaveKeepsRuntimeBindings() {
     std::string body;
     CHECK(HttpGet("/api/config", kPort, body) == 200);
     CHECK(body.find("b4:b0") == std::string::npos);  // genuinely stale
-    CHECK(body.find("5000") == std::string::npos);
+    CHECK(!Dhcp6BindingHasIp(body, "fdaa::5000"));    // runtime binding absent
 
     std::string resp;
     CHECK(HttpPost(kPort, "/api/config", "boot-secret", body, resp) == 200);
@@ -4293,8 +4384,8 @@ static void TestB87BlockedRulesRecoverWithoutRestart() {
         std::ifstream in(path, std::ios::binary);
         const std::string body((std::istreambuf_iterator<char>(in)),
                                std::istreambuf_iterator<char>());
-        CHECK(body.find("9101") != std::string::npos);
-        CHECK(body.find("9102") != std::string::npos);
+        CHECK(RuleDocHasWanPort(body, 9101));
+        CHECK(RuleDocHasWanPort(body, 9102));
     }
     RuleStore::Instance().AttachFile("");
     RuleStore::Instance().Clear();
@@ -4359,8 +4450,8 @@ static void TestB88BlockedRecoveryMergesEveryRuleKind() {
         std::ifstream in(path, std::ios::binary);
         const std::string body((std::istreambuf_iterator<char>(in)),
                                std::istreambuf_iterator<char>());
-        CHECK(body.find("9201") != std::string::npos);   // disk port forward
-        CHECK(body.find("9202") != std::string::npos);   // paused port forward
+        CHECK(RuleDocHasWanPort(body, 9201));   // disk port forward
+        CHECK(RuleDocHasWanPort(body, 9202));   // paused port forward
         CHECK(body.find("10.9.9.9") != std::string::npos);   // disk ban
         CHECK(body.find("10.9.9.10") != std::string::npos);  // paused ban
         CHECK(body.find("AA:BB:CC:00:00:01") != std::string::npos);  // disk cap
@@ -4423,9 +4514,9 @@ static void TestB89RecoveryQuarantinesCorruptFile() {
     {
         std::ifstream fresh(path, std::ios::binary);
         CHECK(fresh.good());
-        CHECK(std::string((std::istreambuf_iterator<char>(fresh)),
-                          std::istreambuf_iterator<char>())
-                  .find("9301") != std::string::npos);
+        const std::string doc((std::istreambuf_iterator<char>(fresh)),
+                              std::istreambuf_iterator<char>());
+        CHECK(RuleDocHasWanPort(doc, 9301));
     }
     RuleStore::Instance().AttachFile("");
     RuleStore::Instance().Clear();
@@ -4517,8 +4608,8 @@ static void TestB90ConcurrentBlockedRecovery() {
         const auto pm = parsed.find("portmaps");
         CHECK(pm != parsed.end() && pm->is_array());
         CHECK(pm != parsed.end() && pm->is_array() && pm->size() == expected);
-        CHECK(body.find("9400") != std::string::npos);  // disk rule merged
-        CHECK(body.find("9500") != std::string::npos);  // live rule written
+        CHECK(RuleDocHasWanPort(body, 9400));  // disk rule merged
+        CHECK(RuleDocHasWanPort(body, 9500));  // live rule written
     }
     // No temp leftovers from the racing writers.
     size_t leftovers = 0;
@@ -6766,8 +6857,8 @@ static void TestB108DeleteIndexMustBeAllDigits() {
         CHECK(400 == status);
         CHECK(portmap_count() == 2);
         const std::string listed = portmaps();
-        CHECK(listed.find("9101") != std::string::npos);
-        CHECK(listed.find("9102") != std::string::npos);
+        CHECK(PortMapHasWanPort(listed, 9101));
+        CHECK(PortMapHasWanPort(listed, 9102));
     }
 
     // Positive control: a clean index still deletes exactly that rule.
@@ -6776,8 +6867,8 @@ static void TestB108DeleteIndexMustBeAllDigits() {
     CHECK(portmap_count() == 1);
     {
         const std::string listed = portmaps();
-        CHECK(listed.find("9101") == std::string::npos);
-        CHECK(listed.find("9102") != std::string::npos);
+        CHECK(!PortMapHasWanPort(listed, 9101));
+        CHECK(PortMapHasWanPort(listed, 9102));
     }
 
     // /api/bans carried its own copy of the parse; prove it was migrated too.
@@ -8948,13 +9039,14 @@ int main(int argc, char** argv) {
             "\"lan_ip\":\"192.168.1.51\",\"lan_port\":81}";
         CHECK(HttpPost(kApi2Port, "/api/portmap", "", rule2, body) == 200);
         CHECK(HttpGet("/api/portmap", kApi2Port, body) == 200);
-        CHECK(body.find("8081") != std::string::npos);
+        CHECK(PortMapHasLanIp(body, "192.168.1.50"));
+        CHECK(PortMapHasLanIp(body, "192.168.1.51"));
 
         // WebUI calls DELETE /api/portmap?index=N to drop a rule.
         CHECK(HttpDelete("/api/portmap?index=0", kApi2Port, body) == 200);
         CHECK(HttpGet("/api/portmap", kApi2Port, body) == 200);
-        CHECK(body.find("8080") == std::string::npos);
-        CHECK(body.find("8081") != std::string::npos);
+        CHECK(!PortMapHasLanIp(body, "192.168.1.50"));
+        CHECK(PortMapHasLanIp(body, "192.168.1.51"));
 
         CHECK(HttpDelete("/api/portmap?index=99", kApi2Port, body) == 404);
         CHECK(HttpDelete("/api/portmap", kApi2Port, body) == 400);
@@ -9383,7 +9475,7 @@ int main(int argc, char** argv) {
         CHECK(HttpGet("/api/ratelimit", kApi2Port, body) == 200);
         CHECK(body.find("AA:BB:CC:DD:EE:01") == std::string::npos);
         CHECK(body.find("AA:BB:CC:DD:EE:02") != std::string::npos);
-        CHECK(body.find("333") != std::string::npos);
+        CHECK(RateLimitHasUplink(body, "AA:BB:CC:DD:EE:02", 333));
 
         // (b) A refused replace must change NOTHING: the old rule survives
         // intact. A double-zero cap is refused before any state mutates.
@@ -9394,7 +9486,7 @@ int main(int argc, char** argv) {
                        body) == 400);
         CHECK(HttpGet("/api/ratelimit", kApi2Port, body) == 200);
         CHECK(body.find("AA:BB:CC:DD:EE:02") != std::string::npos);
-        CHECK(body.find("333") != std::string::npos);
+        CHECK(RateLimitHasUplink(body, "AA:BB:CC:DD:EE:02", 333));
         CHECK(body.find("AA:BB:CC:DD:EE:03") == std::string::npos);
 
         // (c) A malformed/alien replace_mac is refused, never a silent no-op
@@ -9506,7 +9598,7 @@ int main(int argc, char** argv) {
             if (in.good()) {
                 std::stringstream ss;
                 ss << in.rdbuf();
-                CHECK(ss.str().find("8081") != std::string::npos);
+                CHECK(RuleDocHasWanPort(ss.str(), 8081));
                 CHECK(ss.str().find("AA:BB:CC:DD:EE:FF") != std::string::npos);
             }
             vgww::web::RuleStore::Instance().AttachFile(
