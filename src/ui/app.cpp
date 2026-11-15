@@ -1109,13 +1109,23 @@ namespace vgww {
             const I18n& i18n = I18n::Instance();
             for (const CommandResult& result : results) {
                 if (!result.ok && router_ != nullptr) {
-                    // batch281: tell the page it is looking at that its command failed.
-                    // The page cannot learn this from a snapshot - a refused start/stop
-                    // leaves the runtime state untouched - so an in-flight "busy"
-                    // indicator would stay armed forever.
-                    if (Page* page = router_->current()) {
-                        page->OnCommandFailed();
-                    }
+                    // batch281: tell the pages a command failed. The page cannot
+                    // learn this from a snapshot - a refused start/stop leaves the
+                    // runtime state untouched - so an in-flight "busy" indicator
+                    // would stay armed forever.
+                    //
+                    // P135 W11: the failure used to be delivered only to
+                    // `current()`, i.e. the page showing WHEN the result landed.
+                    // A click followed by an immediate page switch (the operator
+                    // navigates away before the async command comes back) left
+                    // the page that armed the guard untouched: the About
+                    // autostart checkbox kept its optimistic value and the
+                    // dashboard stayed "Starting..." with a disabled action
+                    // forever. Broadcast to every built page instead; each page
+                    // gates on its own armed flag and unarmed pages no-op.
+                    router_->ForEachBuiltPage([](Page& page) {
+                        page.OnCommandFailed();
+                    });
                 }
                 if (result.save_config) {
                     // A native settings save is toasted by its true outcome - success

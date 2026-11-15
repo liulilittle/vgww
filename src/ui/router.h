@@ -61,6 +61,20 @@ namespace vgww {
             std::size_t built_count() const noexcept;
             bool is_built(std::string_view id) const noexcept;
             Element* host_for(std::string_view id) const noexcept;
+            /// P135 W11: visits every BUILT page in registration order.
+            /// Unbuilt pages are skipped (they have no subtree to update and
+            /// no state to release). `fn` runs on the UI thread; it must not
+            /// navigate or register (the entries vector is not mutated here,
+            /// but re-entering the router would invalidate the iteration
+            /// contract the caller relies on).
+            template <typename Fn>
+            void ForEachBuiltPage(Fn&& fn) const {
+                for (const Entry& entry : entries_) {
+                    if (entry.built && entry.page != nullptr) {
+                        fn(*entry.page);
+                    }
+                }
+            }
 
         private:
             struct Entry {

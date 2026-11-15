@@ -1730,6 +1730,62 @@ public:
     void Update(const vgww::ui::UiSnapshot&, vgww::ui::I18n&) override {}
 };
 
+/// P135 W11: a page that records every OnCommandFailed the router broadcasts
+/// and counts its own build. The router seam test uses it to prove the
+/// enumeration visits every built page exactly once and builds nothing.
+class FailCountingPage final : public vgww::ui::Page {
+public:
+    explicit FailCountingPage(std::string id) : id_(std::move(id)) {}
+
+    const char* id() const override { return id_.c_str(); }
+    vgww::ui::Str title() const override { return vgww::ui::Str::NavDashboard; }
+    void Build(vgww::ui::Element&, vgww::ui::PageContext&) override { ++builds; }
+    void Update(const vgww::ui::UiSnapshot&, vgww::ui::I18n&) override {}
+    void OnCommandFailed() override { ++failures; }
+
+    std::string id_;
+    int builds = 0;
+    int failures = 0;
+};
+
+static void TestRouterForEachBuiltPageSeam() {
+    using namespace vgww::ui;
+    FixTextMetrics();
+
+    StackPanel mount(Orientation::Vertical);
+    Router router(mount);
+    auto a = std::make_unique<FailCountingPage>("fa");
+    auto b = std::make_unique<FailCountingPage>("fb");
+    FailCountingPage* a_raw = a.get();
+    FailCountingPage* b_raw = b.get();
+    CHECK(router.Register(std::move(a)));
+    CHECK(router.Register(std::move(b)));
+
+    // Nothing is built: the enumeration must not visit an unbuilt page.
+    int visits = 0;
+    router.ForEachBuiltPage([&visits](Page&) { ++visits; });
+    CHECK(visits == 0);
+    CHECK(a_raw->failures == 0);
+    CHECK(b_raw->failures == 0);
+
+    router.Navigate("fa");
+    visits = 0;
+    router.ForEachBuiltPage([&visits](Page&) { ++visits; });
+    CHECK(visits == 1);
+
+    router.Navigate("fb");
+    std::vector<std::string> seen;
+    router.ForEachBuiltPage(
+        [&seen](Page& page) { seen.push_back(std::string(page.id())); });
+    CHECK(seen.size() == 2);
+    CHECK(seen[0] == "fa");
+    CHECK(seen[1] == "fb");
+
+    // The seam itself has no side effect: it must not build a page.
+    CHECK(a_raw->builds == 1);
+    CHECK(b_raw->builds == 1);
+}
+
 static void TestRouterRegisterValidation() {
     using namespace vgww::ui;
     FixTextMetrics();
@@ -3710,6 +3766,132 @@ static vgww::ui::UiSnapshot MakeRulesSnapshot(uint64_t seq, uint64_t rules_rev) 
     snapshot.rules_rev = rules_rev;
     snapshot.dataplane_running = true;
     return snapshot;
+}
+
+/// P135 W11: the command-failure broadcast. A command is posted from a page
+/// and the operator switches away before the result lands; the old
+/// DrainCommandResults told only router_->current() (the NEW page), so the
+/// page that actually armed the in-flight guard never learned the command
+/// failed. Both armed pages below must be released by the drain.
+static void TestW11CommandFailureBroadcastsToEveryBuiltPage() {
+    using namespace vgww::ui;
+    FixTextMetrics();
+    I18n::Instance().SetLang(Lang::ZhCN);
+
+    // Both commands fail; the tray setter is injected so the About checkbox
+    // rollback has a deterministic truth to roll back to.
+    class W11BroadcastExecutor final : public vgww::ui::CommandExecutor {
+    public:
+        vgww::ui::CommandResult Execute(const vgww::ui::Command& cmd) override {
+            if (const auto* c =
+                    std::get_if<vgww::ui::SetAutostartCmd>(&cmd)) {
+                autostart_requests.push_back(c->enabled);
+                std::string error;
+                const bool ok = vgww::ui::tray::SetAutostart(c->enabled, error);
+                return vgww::ui::CommandResult{ok, Widen(error), false};
+            }
+            if (std::get_if<vgww::ui::StartServiceCmd>(&cmd) != nullptr) {
+                start_requests.fetch_add(1, std::memory_order_release);
+                return vgww::ui::CommandResult{false, L"driver missing", false};
+            }
+            return vgww::ui::CommandResult{true, L"ok", false};
+        }
+        std::atomic<int> start_requests{0};
+        std::vector<bool> autostart_requests;
+    };
+
+    ShellFakeSource source;
+    W11BroadcastExecutor executor;
+    UiController controller(source, executor);
+    std::string error;
+    CHECK(controller.Start(error));
+
+    UiSnapshot snap = MakeRulesSnapshot(1, 1);
+    snap.dataplane_running = false;
+    snap.config.adapter = "NIC 1";
+    snap.adapter_binding.bound = true;
+    snap.adapter_binding.friendly_name = "NIC 1";
+    snap.adapter_binding.is_up = true;
+    snap.adapter_binding.media_connected = true;
+    snap.adapter_binding.gateway_in_subnet = true;
+    snap.adapter_binding.ipv4.push_back({0x0101A8C0u, 24});
+
+    // The OS setter refuses, so the About checkbox must roll back.
+    tray::SetAutostartHookForTest(
+        [](bool, std::string& err) -> bool {
+            err = "cannot update HKCU Run value (code 5)";
+            return false;
+        });
+    const bool real = tray::IsAutostartEnabled();
+
+    UiApp app;
+    app.Compose(controller, snap);
+    app.root().Arrange({0.0f, 0.0f, 1280.0f, 800.0f});
+
+    // ---- About: arm the autostart guard, then switch away immediately. ----
+    app.router().Navigate("about");
+    app.Update(snap);
+    app.root().Arrange({0.0f, 0.0f, 1280.0f, 800.0f});
+    auto* autostart = dynamic_cast<Checkbox*>(
+        FindById(app.root(), "about.autostart"));
+    auto* dash_action = dynamic_cast<Button*>(
+        FindById(app.root(), "dash.action"));
+    CHECK(autostart != nullptr);
+    CHECK(dash_action != nullptr);
+    if (autostart == nullptr || dash_action == nullptr) {
+        tray::SetAutostartHookForTest(nullptr);
+        controller.Stop();
+        return;
+    }
+    const bool requested = !real;
+    autostart->checked = requested;
+    autostart->on_changed(requested);
+    CHECK(autostart->checked == requested);
+
+    // ---- Dashboard: arm the busy guard, then switch away immediately. ----
+    app.router().Navigate("dashboard");
+    app.Update(snap);
+    app.root().Arrange({0.0f, 0.0f, 1280.0f, 800.0f});
+    CHECK(dash_action->enabled);
+    dash_action->on_click();
+    CHECK(!dash_action->enabled);
+    CHECK(dash_action->label() == I18n::Instance().T(Str::DashStarting));
+    CHECK(std::string(app.router().current()->id()) == "dashboard");
+
+    // The failure reaches the UI thread while the dashboard is no longer
+    // current: drain with About current. The broadcast must not depend on
+    // which page is showing when the result lands.
+    app.router().Navigate("about");
+    bool drained = false;
+    const auto deadline =
+        std::chrono::steady_clock::now() + std::chrono::seconds(3);
+    while (std::chrono::steady_clock::now() < deadline) {
+        app.DrainCommandResultsForTest();
+        if (executor.autostart_requests.size() >= 1 &&
+            executor.start_requests.load(std::memory_order_acquire) >= 1) {
+            drained = true;
+            break;
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(5));
+    }
+    CHECK(drained);
+
+    // (a) The About checkbox rolled back to the registry truth even though
+    //     About was not the page that posted... it posted it, then left.
+    CHECK(autostart->checked == real);
+    CHECK(autostart->checked != requested);
+    // (b) The dashboard busy guard was released even though the dashboard was
+    //     NOT the current page when the result landed. The label is rewritten
+    //     by the page's own Update (the same contract the B281 test relies
+    //     on), so deliver the next snapshot before reading it.
+    CHECK(dash_action->enabled);
+    app.router().Navigate("dashboard");
+    app.Update(snap);
+    app.root().Arrange({0.0f, 0.0f, 1280.0f, 800.0f});
+    CHECK(dash_action->label() == I18n::Instance().T(Str::DashStart));
+
+    tray::SetAutostartHookForTest(nullptr);
+    controller.Stop();
 }
 
 static void TestPortmapPage() {
@@ -36967,6 +37149,8 @@ int main() {
     TestDialogModal(); TestSelectAndIndicators();
     TestResizeInvalidation(); TestDisabledSubtreeInert(); TestHitTestVisibleSubtree();
     TestToLogical();
+    TestRouterForEachBuiltPageSeam();
+    TestW11CommandFailureBroadcastsToEveryBuiltPage();
     TestRouterRegisterValidation();
     TestRouterLazyBuildThenUpdate();
     TestRouterPageSwitchHidesAndShowsHosts();
