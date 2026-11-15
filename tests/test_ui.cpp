@@ -73,6 +73,33 @@ namespace {
         return (std::filesystem::temp_directory_path() / "vgww-tests" / leaf)
             .string();
     }
+
+    // W11 P136: parallel test_ui instances must not share a scratch file. Each
+    // process gets its own leaf (pid + thread), so a fixed CWD-relative name can
+    // never collide across instances.
+    std::string UniqueLeaf(const char* name) {
+        const auto tid = std::hash<std::thread::id>{}(std::this_thread::get_id());
+        return std::string(name) + "-" + std::to_string(::GetCurrentProcessId()) +
+               "-" + std::to_string(tid);
+    }
+
+    std::string TempDirNarrowUnique(const char* name) {
+        return TempDirNarrow(UniqueLeaf(name).c_str());
+    }
+
+    std::wstring TempDirUnique(const char* name) {
+        const std::string leaf = UniqueLeaf(name);
+        return TempDir(std::wstring(leaf.begin(), leaf.end()).c_str());
+    }
+
+    std::wstring TempFileUnique(const char* name) {
+        const std::filesystem::path path =
+            std::filesystem::temp_directory_path() / "vgww-tests" /
+            UniqueLeaf(name);
+        std::error_code ec;
+        std::filesystem::create_directories(path.parent_path(), ec);
+        return path.wstring();
+    }
 }  // namespace
 
 // ---------------------------------------------------------------------------
@@ -4697,7 +4724,7 @@ static void TestA8TokenEdit() {
 
     // An on-disk config that already carries a token.
     const std::filesystem::path temp_config =
-        std::filesystem::temp_directory_path() / "vgww_a8_token_test.json";
+        std::filesystem::path(TempDirNarrowUnique("vgww_a8_token_test.json"));
     {
         const char* json =
             "{\n"
@@ -5378,7 +5405,7 @@ static void TestSettingsPage() {
     // Saving never drops sections the snapshot does not expose: the page seeds
     // the Config from the on-disk file (perf details, static bindings).
     const std::filesystem::path temp_config =
-        std::filesystem::temp_directory_path() / "vgww_t10_settings_test.json";
+        std::filesystem::path(TempDirNarrowUnique("vgww_t10_settings_test.json"));
     {
         const char* json =
             "{\n"
@@ -5664,7 +5691,7 @@ static void TestB269TokenClearFlagResetsAfterSave() {
     // LoadFromFile validates the whole document): the token must be
     // observable, so "kept" is distinguishable from "wiped".
     const std::filesystem::path cfg =
-        std::filesystem::temp_directory_path() / "vgww_b269_token.json";
+        std::filesystem::path(TempDirNarrowUnique("vgww_b269_token.json"));
     {
         vgww::core::Config seed;
         bool ok = false;
@@ -9441,8 +9468,35 @@ static void TestDebugServerRoute() {
     UiDebugServer srv;
     srv.BindController(&c);
     std::string err;
-    const uint16_t port = 18097;
-    CHECK(srv.Start(port, err));
+    // W11 P136: the port must not be a fixed constant - parallel instances
+    // collide on 18097 and the loopback request lands on whichever server won
+    // the bind. Let the OS assign a free loopback port per instance: a probe
+    // acceptor binds port 0, the kernel picks an ephemeral port, and the server
+    // re-binds that exact port (with a retry window for the TIME_WAIT/rebind
+    // race). The port actually bound is read back from the server.
+    uint16_t port = 0;
+    for (int attempt = 0; attempt < 32 && port == 0; ++attempt) {
+        asio::io_context probe;
+        asio::ip::tcp::acceptor acceptor(probe);
+        std::error_code perr;
+        acceptor.open(asio::ip::tcp::v4(), perr);
+        if (perr) {
+            break;
+        }
+        acceptor.set_option(asio::socket_base::reuse_address(true), perr);
+        acceptor.bind(asio::ip::tcp::endpoint(asio::ip::tcp::v4(), 0), perr);
+        if (perr) {
+            break;
+        }
+        const uint16_t candidate = acceptor.local_endpoint().port();
+        acceptor.close();
+        if (srv.Start(candidate, err)) {
+            port = srv.Port();
+            break;
+        }
+        srv.Stop();
+    }
+    CHECK(port != 0);
     if (!err.empty()) {
         std::printf("srv start error: %s\n", err.c_str());
     }
@@ -14172,7 +14226,7 @@ static void TestP96UiConfigSaveFailureIsAudited() {
     using namespace vgww::ui;
     FixTextMetrics();
     console_log::ClearForTest();
-    const std::string cfg_path = "test_ui_p96_config.json";
+    const std::string cfg_path = TempDirNarrowUnique("p96_config.json");
     std::remove(cfg_path.c_str());
     vgww::core::Config cfg;
     cfg.adapter = "Ethernet";
@@ -19333,7 +19387,7 @@ static void TestB20BannerReasonClamp() {
 // top of the old bytes.
 static void TestB120LogRolloverCountsPreexistingBytes() {
     using namespace vgww::ui;
-    const std::wstring dir = TempDir(L"b120-log-test");
+    const std::wstring dir = TempDirUnique("b120-log-test");
     console_log::CloseLogFileForTest();
     console_log::SetLogDirForTest(dir);
     console_log::SetLogRolloverBytesForTest(64);
@@ -19399,7 +19453,7 @@ static void TestB20ConsoleDiskLog() {
     using namespace vgww::ui;
     FixTextMetrics();
     const std::wstring dir =
-        TempDir(L"b20-console-log-test");
+        TempDirUnique("b20-console-log-test");
     console_log::CloseLogFileForTest();
     console_log::SetLogDirForTest(dir);
     console_log::SetLogRolloverBytesForTest(64);  // force a roll quickly
@@ -19414,13 +19468,14 @@ static void TestB20ConsoleDiskLog() {
     }
     CHECK(console_log::OpenLogFileForTest());
     const std::wstring path =
-        TempDir(L"b20-console-log-test") + L"\\vgww.log";
+        TempDirUnique("b20-console-log-test") + L"\\vgww.log";
     CHECK(console_log::LogFilePath() == path);
 
     console_log::AppendForTest("alpha-line-1");
     console_log::AppendForTest("beta-line-2");
     {
-        std::ifstream in(TempDirNarrow("b20-console-log-test") + "\\vgww.log",
+        std::ifstream in(TempDirNarrowUnique("b20-console-log-test") +
+                             "\\vgww.log",
                          std::ios::binary);
         CHECK(in.good());
         std::stringstream buffer;
@@ -19435,7 +19490,7 @@ static void TestB20ConsoleDiskLog() {
             "rollover-padding-line-that-is-long-enough-to-pass-64-bytes");
     }
     CHECK(std::filesystem::exists(
-        TempDirNarrow("b20-console-log-test") + "\\vgww.log.1"));
+        TempDirNarrowUnique("b20-console-log-test") + "\\vgww.log.1"));
     console_log::CloseLogFileForTest();
     console_log::SetLogDirForTest(L"");
     console_log::SetLogRolloverBytesForTest(5u * 1024u * 1024u);
@@ -23092,8 +23147,8 @@ static void TestB24AdapterBindingSnapshot() {
 
 static void TestB97UiBindingCommandsPersist() {
     using namespace vgww::ui;
-    const std::string cfg_path = "test_ui_b97_bindings.json";
-    const std::string lease_path = "test_ui_b97_leases.json";
+    const std::string cfg_path = TempDirNarrowUnique("b97_bindings.json");
+    const std::string lease_path = TempDirNarrowUnique("b97_leases.json");
     std::remove(cfg_path.c_str());
     std::remove(lease_path.c_str());
     vgww::core::Config cfg;
@@ -23238,8 +23293,8 @@ static void TestP100UiBindingPersistFailureIsAudited() {
     using namespace vgww::ui;
     FixTextMetrics();
     console_log::ClearForTest();
-    const std::string cfg_path = "test_ui_p100_bindings.json";
-    const std::string lease_path = "test_ui_p100_leases.json";
+    const std::string cfg_path = TempDirNarrowUnique("p100_bindings.json");
+    const std::string lease_path = TempDirNarrowUnique("p100_leases.json");
     std::remove(cfg_path.c_str());
     std::remove(lease_path.c_str());
     vgww::core::Config cfg;
@@ -23351,7 +23406,7 @@ static void TestP105UiRuleDeleteFailureIsAudited() {
     FixTextMetrics();
     console_log::ClearForTest();
     vgww::web::RuleStore& store = vgww::web::RuleStore::Instance();
-    const std::string path = "test_ui_p105_rules.json";
+    const std::string path = TempDirNarrowUnique("p105_rules.json");
     const std::string rules = path + ".rules.json";
     std::remove(path.c_str());
     std::error_code ec;
@@ -23451,7 +23506,7 @@ static void TestB98UiRuleCommandsReportPersistFailure() {
     i18n.SetLang(Lang::En);
     vgww::web::RuleStore& store = vgww::web::RuleStore::Instance();
     store.Clear();
-    const std::string path = "test_ui_b98_rules.json";
+    const std::string path = TempDirNarrowUnique("b98_rules.json");
     const std::string rules = path + ".rules.json";
     std::remove(path.c_str());
     std::error_code ec;
@@ -23511,7 +23566,7 @@ static void TestP91AuditLineCarriesPersistFailure() {
     console_log::ClearForTest();
 
     vgww::web::RuleStore& store = vgww::web::RuleStore::Instance();
-    const std::string path = "test_ui_p91_rules.json";
+    const std::string path = TempDirNarrowUnique("p91_rules.json");
     const std::string rules = path + ".rules.json";
     std::remove(path.c_str());
     std::error_code ec;
@@ -27430,7 +27485,7 @@ static void TestB28WindowGeometryMemory() {
     CHECK(restored.h * 1.0f <= static_cast<float>(primary.h) + 0.5f);
 
     // JSON round-trip through a temp path.
-    const std::wstring dir = TempDir(L"b28-ui-state");
+    const std::wstring dir = TempDirUnique("b28-ui-state");
     std::filesystem::create_directories(dir);
     const std::wstring path = dir + L"\\ui_state.json";
     ui_state::SetStatePathForTest(path);
@@ -29376,7 +29431,7 @@ static void TestB30NoRawDuration() {
 // Item 4.2 red anchor: ui_state.json carries a version and refuses a future one.
 static void TestB30UiStateVersion() {
     using namespace vgww::ui;
-    const std::wstring dir = TempDir(L"b30-ui-state");
+    const std::wstring dir = TempDirUnique("b30-ui-state");
     std::filesystem::create_directories(dir);
     const std::wstring path = dir + L"\\ui_state_version.json";
     ui_state::SetStatePathForTest(path);
@@ -29461,7 +29516,7 @@ static void TestB30WindowMaximizedMemory() {
     CHECK(restored.maximized);
     CHECK(restored.x == 120 && restored.y == 80);
 
-    const std::wstring dir = TempDir(L"b30-ui-state");
+    const std::wstring dir = TempDirUnique("b30-ui-state");
     std::filesystem::create_directories(dir);
     const std::wstring path = dir + L"\\ui_state_maximized.json";
     ui_state::SetStatePathForTest(path);
@@ -33305,7 +33360,7 @@ static void TestB127LanguageSwitchIsAudited() {
     FixTextMetrics();
     console_log::ClearForTest();
 
-    const std::string cfg_path = "test_ui_b127_cfg.json";
+    const std::string cfg_path = TempDirNarrowUnique("b127_cfg.json");
     std::remove(cfg_path.c_str());
     vgww::core::Config cfg;
     cfg.adapter = "Ethernet";
@@ -33381,7 +33436,7 @@ static void TestP109LanguageFailureIsAudited() {
     CHECK(saw(L"language set en failed (no config path)"));
 
     // A directory at the config path makes LoadFromFile fail.
-    const std::string cfg_path = "test_ui_p109_lang.json";
+    const std::string cfg_path = TempDirNarrowUnique("p109_lang.json");
     std::error_code ec;
     std::filesystem::remove(cfg_path, ec);
     CHECK(std::filesystem::create_directory(cfg_path, ec));
@@ -33420,7 +33475,7 @@ static void TestB124NativeUiCommandsAreAudited() {
     FixTextMetrics();
     console_log::ClearForTest();
 
-    const std::string cfg_path = "test_ui_b124_cfg.json";
+    const std::string cfg_path = TempDirNarrowUnique("b124_cfg.json");
     std::remove(cfg_path.c_str());
     vgww::core::Config cfg;
     cfg.adapter = "Ethernet";
@@ -33560,7 +33615,7 @@ static void TestB120CorruptLeasesSurface() {
     FixTextMetrics();
     I18n::Instance().SetLang(Lang::ZhCN);
 
-    const std::string lease_path = "test_ui_b120_leases.json";
+    const std::string lease_path = TempDirNarrowUnique("b120_leases.json");
     std::remove(lease_path.c_str());
     {
         std::ofstream out(lease_path);
@@ -33634,7 +33689,7 @@ static void TestB119DroppedLeasesSurface() {
     FixTextMetrics();
     I18n::Instance().SetLang(Lang::ZhCN);
 
-    const std::string lease_path = "test_ui_b119_leases.json";
+    const std::string lease_path = TempDirNarrowUnique("b119_leases.json");
     std::remove(lease_path.c_str());
     {
         std::ofstream out(lease_path);
@@ -33711,7 +33766,7 @@ static void TestB118RulesDiscardedSurface() {
     FixTextMetrics();
     I18n::Instance().SetLang(Lang::ZhCN);
 
-    const std::string rules = "test_ui_b118_rules.json";
+    const std::string rules = TempDirNarrowUnique("b118_rules.json");
     std::remove(rules.c_str());
     {
         std::ofstream out(rules);
@@ -33784,7 +33839,7 @@ static void TestB115RulesPersistFailureSurface() {
     FixTextMetrics();
     I18n::Instance().SetLang(Lang::ZhCN);
 
-    const std::string dir = "test_ui_b115_rules_dir";
+    const std::string dir = TempDirNarrowUnique("b115_rules_dir");
     std::filesystem::remove_all(dir);
     std::filesystem::create_directory(dir);
     auto& store = vgww::web::RuleStore::Instance();
@@ -33883,7 +33938,7 @@ static void TestP89DirtyStopIsNotReportedClean() {
     cfg.perf.max_conns = 64;
     cfg.perf.dial_timeout_ms = 400;
 
-    const std::string lease_path = "test_ui_p89_leases.json";
+    const std::string lease_path = TempDirNarrowUnique("p89_leases.json");
     std::remove(lease_path.c_str());
     vgww::runtime::Dataplane dataplane(cfg, lease_path);
     dataplane.SetDriverClient(std::make_unique<B24AdapterDriver>());
@@ -33935,7 +33990,7 @@ static void TestP90RecheckSurfacesDirtyStop() {
     cfg.perf.max_conns = 64;
     cfg.perf.dial_timeout_ms = 400;
 
-    const std::string lease_path = "test_ui_p90_leases.json";
+    const std::string lease_path = TempDirNarrowUnique("p90_leases.json");
     std::remove(lease_path.c_str());
     vgww::runtime::Dataplane dataplane(cfg, lease_path);
     dataplane.SetDriverClient(std::make_unique<B24AdapterDriver>());
@@ -33983,7 +34038,7 @@ static void TestB103LeasePersistVerdictSurface() {
         cfg.perf.max_conns = 64;
         cfg.perf.dial_timeout_ms = 400;
 
-        const std::string lease_path = "test_ui_b103_leases.json";
+        const std::string lease_path = TempDirNarrowUnique("b103_leases.json");
         std::remove(lease_path.c_str());
         vgww::runtime::Dataplane dataplane(cfg, lease_path);
         dataplane.SetDriverClient(std::make_unique<B24AdapterDriver>());
@@ -34891,7 +34946,7 @@ static void TestB229DpiFallbackClampsToWorkArea() {
     {
         wchar_t path[MAX_PATH]{};
         CHECK(::GetTempPathW(MAX_PATH, path) != 0);
-        std::wstring state = std::wstring(path) + L"vgww_b229_state.json";
+        std::wstring state = TempFileUnique("b229_state.json");
         {
             std::ofstream out(state.c_str(),
                               std::ios::binary | std::ios::trunc);
@@ -34933,7 +34988,7 @@ static void TestB229DpiFallbackClampsToWorkArea() {
         {
             wchar_t path[MAX_PATH]{};
             CHECK(::GetTempPathW(MAX_PATH, path) != 0);
-            std::wstring state = std::wstring(path) + L"vgww_b229b_state.json";
+        std::wstring state = TempFileUnique("b229b_state.json");
             {
                 std::ofstream out(state.c_str(),
                                   std::ios::binary | std::ios::trunc);
@@ -34969,7 +35024,7 @@ static void TestB229DpiFallbackClampsToWorkArea() {
         {
             wchar_t path[MAX_PATH]{};
             CHECK(::GetTempPathW(MAX_PATH, path) != 0);
-            std::wstring state = std::wstring(path) + L"vgww_b229c_state.json";
+        std::wstring state = TempFileUnique("b229c_state.json");
             {
                 std::ofstream out(state.c_str(),
                                   std::ios::binary | std::ios::trunc);
@@ -35349,7 +35404,7 @@ void TestB262ConsoleLogClipboardSeam() {
 // the documented test seams only (never through Install()).
 void TestB262ConsoleLogFileRolloverAndAccounting() {
     using namespace vgww::ui;
-    const std::wstring dir = TempDir(L"b262-log-test");
+    const std::wstring dir = TempDirUnique("b262-log-test");
     std::error_code ec;
     std::filesystem::remove_all(dir, ec);
     std::filesystem::create_directories(dir, ec);
