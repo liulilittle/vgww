@@ -17549,11 +17549,18 @@ namespace {
         return out;
     }
 
-    // Walk up from the CWD to the repository root (the one holding the T2 data).
+    // W11 P137: locate the repository root from the executable location, not
+    // the CWD, so the test passes no matter where it is launched from (ctest
+    // sets no WORKING_DIRECTORY for ui; a foreign CWD used to fail at :17575).
     std::filesystem::path FindRepoRoot() {
-        std::filesystem::path p = std::filesystem::current_path();
+        wchar_t exe[MAX_PATH * 2] = {};
+        const DWORD len =
+            ::GetModuleFileNameW(nullptr, exe, MAX_PATH * 2);
+        if (0 == len) return {};
+        std::filesystem::path p(exe, exe + len);
         for (int i = 0; i < 8; ++i) {
-            if (std::filesystem::exists(p / "scripts" / "native-i18n-t2" / "ar.json")) {
+            if (std::filesystem::exists(p / "scripts" / "native-i18n-t2" /
+                                        "ar.json")) {
                 return p;
             }
             if (!p.has_parent_path()) break;

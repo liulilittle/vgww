@@ -2040,12 +2040,26 @@ namespace {
             CHECK(exe_len > 0 && exe_len < MAX_PATH * 2);
             if (exe_len > 0 && exe_len < MAX_PATH * 2) {
                 namespace fs = std::filesystem;
-                fs::path src =
-                    fs::path(std::wstring(exe_path, exe_len))
-                        .parent_path()   // Release
-                        .parent_path()   // build_s4
-                        .parent_path()   // repo root
-                        / "src" / "driver" / "installer.cpp";
+                // W11 P137: probe up from the executable for the repository
+                // root instead of assuming a fixed build-directory name
+                // (CI builds into `build`, not `build_s4`).
+                fs::path dir =
+                    fs::path(std::wstring(exe_path, exe_len)).parent_path();
+                fs::path root;
+                for (int i = 0; i < 8 && !dir.empty(); ++i) {
+                    const fs::path marker =
+                        dir / "scripts" / "native-i18n-t2" / "ar.json";
+                    std::error_code mec;
+                    if (fs::exists(marker, mec)) {
+                        root = dir;
+                        break;
+                    }
+                    if (!dir.has_parent_path()) break;
+                    dir = dir.parent_path();
+                }
+                CHECK(!root.empty());
+                const fs::path src =
+                    root / "src" / "driver" / "installer.cpp";
                 std::error_code ec;
                 CHECK(fs::exists(src, ec));
                 std::ifstream in(src, std::ios::binary);

@@ -69,6 +69,73 @@ namespace {
     using vgww::web::Request;
     using vgww::web::Response;
 
+    // W11 P137: parallel instances of this suite must not share a listen port.
+    // A fixed kPort makes every instance bind the same endpoint; with
+    // reuse_address set, the second bind succeeds and requests land on an
+    // arbitrary instance (cross-talk). Probe-bind port 0 and read back the
+    // ephemeral port the OS actually assigned.
+    uint16_t UniquePort() {
+        asio::io_context io;
+        asio::ip::tcp::acceptor probe(io);
+        std::error_code err;
+        probe.open(asio::ip::tcp::v4(), err);
+        if (err) return 0;
+        probe.set_option(asio::socket_base::reuse_address(true), err);
+        if (err) return 0;
+        probe.bind(asio::ip::tcp::endpoint(
+                       asio::ip::make_address("127.0.0.1"), 0),
+                   err);
+        if (err) return 0;
+        const uint16_t port = probe.local_endpoint(err).port();
+        return err ? 0 : port;
+    }
+
+    // W11 P137: scratch files must live in a per-process directory under the
+    // OS temp root so parallel instances never rename onto each other's
+    // destination (ERROR_ACCESS_DENIED) or poison a shared rules document.
+    std::string ScratchDir() {
+        const std::string leaf = "vgww-tests-web-" +
+                                 std::to_string(::GetCurrentProcessId());
+        const std::filesystem::path dir =
+            std::filesystem::temp_directory_path() / leaf;
+        std::error_code ec;
+        std::filesystem::create_directories(dir, ec);
+        return dir.string();
+    }
+
+    // Full path for a scratch file inside the per-process scratch directory.
+    std::string ScratchFile(const char* name) {
+        return (std::filesystem::path(ScratchDir()) / name).string();
+    }
+
+    // W11 P137: named-event bases must be unique per process so parallel
+    // instances never cross-signal (a shared "Local\vgww-p82-add" would let one
+    // instance's ready/go/done events release another instance's waiters). The
+    // parent passes its own pid in the tag, so both sides derive the same name.
+    std::wstring P82EventBase(const std::string& tag) {
+        const std::wstring wide(tag.begin(), tag.end());
+        return L"Local\\vgww-p82-" + wide;
+    }
+
+    // W11 P137: locate the repository root from the executable location, not
+    // the CWD, so ServeStatic's "www" is found no matter where the test runs.
+    std::filesystem::path RepoRoot() {
+        wchar_t exe[MAX_PATH * 2] = {};
+        const DWORD len =
+            ::GetModuleFileNameW(nullptr, exe, MAX_PATH * 2);
+        if (0 == len) return {};
+        std::filesystem::path p(exe, exe + len);
+        for (int i = 0; i < 8; ++i) {
+            if (std::filesystem::exists(p / "scripts" / "native-i18n-t2" /
+                                        "ar.json")) {
+                return p;
+            }
+            if (!p.has_parent_path()) break;
+            p = p.parent_path();
+        }
+        return {};
+    }
+
     /// Static key arrays for JsonWholeBody. Never store std::initializer_list
     /// in an aggregate: the backing array it points at does not outlive the
     /// braced-init, leaving a dangling read (UB) on later use.
@@ -403,9 +470,9 @@ namespace {
     //      assembles the v6 server; /api/dhcp6/bindings mirrors the v4 CRUD
     //      contract (DUID keyed, cap 1024, token guarded). ----
     void TestWebDhcp6BindingsCrud() {
-        const char* kLeasePath = "web-dhcp6-leases.json";
+        const std::string kLeasePath = ScratchFile("web-dhcp6-leases.json");
         const std::string lease6_path = std::string(kLeasePath) + ".leases6";
-        std::remove(kLeasePath);
+        std::remove(kLeasePath.c_str());
         std::remove(lease6_path.c_str());
         vgww::core::Config cfg;
         cfg.adapter = "WebTestNIC6";
@@ -450,7 +517,7 @@ namespace {
 
         HttpServer api;
         vgww::web::RegisterApi(api, dp, cfg, "", "boot-secret");
-        constexpr uint16_t kP = 18086;
+        const uint16_t kP = UniquePort();
         std::string error;
         CHECK(api.Start("127.0.0.1", kP, error));
 
@@ -507,7 +574,7 @@ namespace {
         api.Stop();
         std::string stop_error;
         CHECK(dp.Stop(stop_error));
-        std::remove(kLeasePath);
+        std::remove(kLeasePath.c_str());
         std::remove(lease6_path.c_str());
     }
 
@@ -520,9 +587,9 @@ namespace {
     // exactly the "plausible-but-broken success" the route's own comment says
     // must not happen.
     void TestB142Dhcp6DuplicateCheckIsSpellingIndependent() {
-        const char* kLeasePath = "b142-leases.json";
+        const std::string kLeasePath = ScratchFile("b142-leases.json");
         const std::string lease6_path = std::string(kLeasePath) + ".leases6";
-        std::remove(kLeasePath);
+        std::remove(kLeasePath.c_str());
         std::remove(lease6_path.c_str());
 
         vgww::core::Config cfg;
@@ -553,7 +620,7 @@ namespace {
 
         HttpServer api;
         vgww::web::RegisterApi(api, dp, cfg, "", "boot-secret");
-        constexpr uint16_t kP = 18096;
+        const uint16_t kP = UniquePort();
         std::string error;
         CHECK(api.Start("127.0.0.1", kP, error));
 
@@ -609,7 +676,7 @@ namespace {
         api.Stop();
         std::string stop_error;
         CHECK(dp.Stop(stop_error));
-        std::remove(kLeasePath);
+        std::remove(kLeasePath.c_str());
         std::remove(lease6_path.c_str());
     }
 
@@ -628,7 +695,7 @@ namespace {
         vgww::runtime::Dataplane dp(cfg);  // NOT started: no DHCP runtime
         HttpServer api;
         vgww::web::RegisterApi(api, dp, cfg, "", "boot-secret");
-        constexpr uint16_t kP = 18104;
+        const uint16_t kP = UniquePort();
         std::string error;
         CHECK(api.Start("127.0.0.1", kP, error));
 
@@ -669,9 +736,9 @@ namespace {
     /// pool (default pool alone is 4096 addresses). The list now has its own
     /// endpoint, mirroring /api/dhcp/leases for v4.
     void TestStatusIncludesLeases6() {
-        const char* kLeasePath = "web-status6-leases.json";
+        const std::string kLeasePath = ScratchFile("web-status6-leases.json");
         const std::string lease6_path = std::string(kLeasePath) + ".leases6";
-        std::remove(kLeasePath);
+        std::remove(kLeasePath.c_str());
         std::remove(lease6_path.c_str());
         vgww::core::Config cfg;
         cfg.adapter = "WebTestNIC6S";
@@ -712,7 +779,7 @@ namespace {
 
         HttpServer api;
         vgww::web::RegisterApi(api, dp, cfg, "", "boot-secret");
-        constexpr uint16_t kP = 18087;
+        const uint16_t kP = UniquePort();
         std::string error;
         CHECK(api.Start("127.0.0.1", kP, error));
 
@@ -739,16 +806,16 @@ namespace {
         api.Stop();
         std::string stop_error;
         CHECK(dp.Stop(stop_error));
-        std::remove(kLeasePath);
+        std::remove(kLeasePath.c_str());
         std::remove(lease6_path.c_str());
     }
 
     /// The v6 lease endpoint degrades to an empty array when the v6 server is
     /// not assembled, exactly like /api/dhcp/leases in bypass mode.
     void TestDhcp6LeasesEmptyWhenNotAssembled() {
-        const char* kLeasePath = "web-dhcp6-leases-bypass.json";
+        const std::string kLeasePath = ScratchFile("web-dhcp6-leases-bypass.json");
         const std::string lease6_path = std::string(kLeasePath) + ".leases6";
-        std::remove(kLeasePath);
+        std::remove(kLeasePath.c_str());
         std::remove(lease6_path.c_str());
         vgww::core::Config cfg;
         cfg.adapter = "WebTestNIC6N";
@@ -764,7 +831,7 @@ namespace {
 
         HttpServer api;
         vgww::web::RegisterApi(api, dp, cfg, "", "boot-secret");
-        constexpr uint16_t kP = 18088;
+        const uint16_t kP = UniquePort();
         std::string error;
         CHECK(api.Start("127.0.0.1", kP, error));
 
@@ -775,7 +842,7 @@ namespace {
         api.Stop();
         std::string stop_error;
         CHECK(dp.Stop(stop_error));
-        std::remove(kLeasePath);
+        std::remove(kLeasePath.c_str());
         std::remove(lease6_path.c_str());
     }
 
@@ -791,8 +858,8 @@ namespace {
     /// body and require the object at the TOP level, where the documented
     /// contract (and every consumer) expects it.
     void TestStatusIncludesBridge() {
-        const char* kLeasePath = "web-status-bridge-leases.json";
-        std::remove(kLeasePath);
+        const std::string kLeasePath = ScratchFile("web-status-bridge-leases.json");
+        std::remove(kLeasePath.c_str());
         vgww::core::Config cfg;
         cfg.adapter = "WebTestNICBridge";
         cfg.gateway.mac = {0x30, 0xFC, 0x68, 0x88, 0xB4, 0xA9};
@@ -807,7 +874,7 @@ namespace {
 
         HttpServer api;
         vgww::web::RegisterApi(api, dp, cfg, "", "boot-secret");
-        constexpr uint16_t kP = 18088;
+        const uint16_t kP = UniquePort();
         std::string error;
         CHECK(api.Start("127.0.0.1", kP, error));
 
@@ -835,13 +902,13 @@ namespace {
         api.Stop();
         std::string stop_error;
         CHECK(dp.Stop(stop_error));
-        std::remove(kLeasePath);
+        std::remove(kLeasePath.c_str());
     }
 
     /// W8: at least one whole-body parse assertion per API endpoint.
     void TestApiWholeBodyJson() {
-        const char* kLeasePath = "web-whole-json-leases.json";
-        std::remove(kLeasePath);
+        const std::string kLeasePath = ScratchFile("web-whole-json-leases.json");
+        std::remove(kLeasePath.c_str());
         vgww::core::Config cfg;
         cfg.adapter = "WebTestNICWholeJson";
         cfg.gateway.mac = {0x30, 0xFC, 0x68, 0x88, 0xB4, 0xA9};
@@ -856,7 +923,7 @@ namespace {
 
         HttpServer api;
         vgww::web::RegisterApi(api, dp, cfg, "", "boot-secret");
-        constexpr uint16_t kP = 18090;
+        const uint16_t kP = UniquePort();
         std::string error;
         CHECK(api.Start("127.0.0.1", kP, error));
 
@@ -903,7 +970,7 @@ namespace {
         api.Stop();
         std::string stop_error;
         CHECK(dp.Stop(stop_error));
-        std::remove(kLeasePath);
+        std::remove(kLeasePath.c_str());
     }
 
 // batch22 H1: a Web save (full-replacement POST) must NOT wipe the native-only
@@ -911,13 +978,14 @@ namespace {
 // omits them preserves the running values.
 static void TestH1WebConfigPreservesNativePrefs() {
     using namespace vgww::core;
-    const char* path = "h1native.json";
+    const std::string path = ScratchFile("h1native.json");
     const std::string rules = std::string(path) + ".rules.json";
-    std::remove(path);
+    std::remove(path.c_str());
     std::remove(rules.c_str());
 
     Config cfg;
-    cfg.web.port = 18088;
+    const uint16_t cfg_port = static_cast<uint16_t>(UniquePort());
+    cfg.web.port = cfg_port;
     bool ok = false;
     cfg.gateway.ipv4 = ParseIpv4("192.168.0.40", ok);
     cfg.gateway.mask = ParseIpv4("255.255.255.0", ok);
@@ -932,7 +1000,7 @@ static void TestH1WebConfigPreservesNativePrefs() {
     vgww::runtime::Dataplane dp(cfg);
     HttpServer api;
     vgww::web::RegisterApi(api, dp, cfg, path);
-    constexpr uint16_t kPort = 18097;
+    const uint16_t kPort = UniquePort();
     std::string start_err;
     CHECK(api.Start("127.0.0.1", kPort, start_err));
 
@@ -949,7 +1017,7 @@ static void TestH1WebConfigPreservesNativePrefs() {
         "\"mask\":\"255.255.255.0\",\"mac\":\"30:fc:68:88:b4:a9\"},"
         "\"ipv6\":{\"enabled\":false,\"ula_prefix\":\"fdaa:0:0::\","
         "\"prefix_len\":64,\"ra_lifetime_s\":300},"
-        "\"web\":{\"port\":18088,\"token\":\"\"},"
+        "\"web\":{\"port\":" + std::to_string(cfg_port) + ",\"token\":\"\"},"
         "\"perf\":{\"workers\":4,\"max_conns\":4096}}";
     std::string resp;
     const int post_status = HttpPost(kPort, "/api/config", "", post, resp);
@@ -963,7 +1031,7 @@ static void TestH1WebConfigPreservesNativePrefs() {
         CHECK(reloaded->ui_language == "ja");
         CHECK(reloaded->ui_scale == "200");
     }
-    std::remove(path);
+    std::remove(path.c_str());
     std::remove(rules.c_str());
 }
 
@@ -971,12 +1039,13 @@ static void TestH1WebConfigPreservesNativePrefs() {
 // hand the parsed config to the applier and answer "applied" when accepted.
 static void TestB37tWebConfigAppliesLive() {
     using namespace vgww::core;
-    const char* path = "b37t-web-apply.json";
+    const std::string path = ScratchFile("b37t-web-apply.json");
     const std::string rules = std::string(path) + ".rules.json";
-    std::remove(path);
+    std::remove(path.c_str());
     std::remove(rules.c_str());
     Config cfg;
-    cfg.web.port = 18089;
+    const uint16_t cfg_port = static_cast<uint16_t>(UniquePort());
+    cfg.web.port = cfg_port;
     bool ok = false;
     cfg.gateway.ipv4 = ParseIpv4("192.168.0.40", ok);
     cfg.gateway.mask = ParseIpv4("255.255.255.0", ok);
@@ -996,7 +1065,7 @@ static void TestB37tWebConfigAppliesLive() {
             applied_cfg = c;
             return true;
         });
-    constexpr uint16_t kPort = 18099;
+    const uint16_t kPort = UniquePort();
     std::string start_err;
     CHECK(api.Start("127.0.0.1", kPort, start_err));
     const std::string post =
@@ -1004,15 +1073,15 @@ static void TestB37tWebConfigAppliesLive() {
         "\"mask\":\"255.255.255.0\",\"mac\":\"30:fc:68:88:b4:a9\"},"
         "\"ipv6\":{\"enabled\":false,\"ula_prefix\":\"fdaa:0:0::\","
         "\"prefix_len\":64,\"ra_lifetime_s\":300},"
-        "\"web\":{\"port\":18089,\"token\":\"\"},"
+        "\"web\":{\"port\":" + std::to_string(cfg_port) + ",\"token\":\"\"},"
         "\"perf\":{\"workers\":4,\"max_conns\":4096}}";
     std::string resp;
     CHECK(HttpPost(kPort, "/api/config", "boot-secret", post, resp) == 200);
     CHECK(resp.find("\"note\":\"applied\"") != std::string::npos);
     CHECK(applied);
-    CHECK(applied_cfg.web.port == 18089);
+    CHECK(applied_cfg.web.port == cfg_port);
     api.Stop();
-    std::remove(path);
+    std::remove(path.c_str());
     std::remove(rules.c_str());
 }
 
@@ -1021,12 +1090,13 @@ static void TestB37tWebConfigAppliesLive() {
 // and any page polling an older id waits forever.
 static void TestB114RefusedApplyClosesTheAttempt() {
     using namespace vgww::core;
-    const char* path = "b114-refused-apply.json";
+    const std::string path = ScratchFile("b114-refused-apply.json");
     const std::string rules = std::string(path) + ".rules.json";
-    std::remove(path);
+    std::remove(path.c_str());
     std::remove(rules.c_str());
     Config cfg;
-    cfg.web.port = 18105;
+    const uint16_t cfg_port = static_cast<uint16_t>(UniquePort());
+    cfg.web.port = cfg_port;
     bool ok = false;
     cfg.gateway.ipv4 = ParseIpv4("192.168.0.40", ok);
     cfg.gateway.mask = ParseIpv4("255.255.255.0", ok);
@@ -1046,7 +1116,7 @@ static void TestB114RefusedApplyClosesTheAttempt() {
             return false;  // applier declines the save
         },
         status);
-    constexpr uint16_t kPort = 18105;
+    const uint16_t kPort = UniquePort();
     std::string start_err;
     CHECK(api.Start("127.0.0.1", kPort, start_err));
     const std::string body =
@@ -1054,7 +1124,7 @@ static void TestB114RefusedApplyClosesTheAttempt() {
         "\"mask\":\"255.255.255.0\",\"mac\":\"30:fc:68:88:b4:a9\"},"
         "\"ipv6\":{\"enabled\":false,\"ula_prefix\":\"fdaa:0:0::\","
         "\"prefix_len\":64,\"ra_lifetime_s\":300},"
-        "\"web\":{\"port\":18105,\"token\":\"\"},"
+        "\"web\":{\"port\":" + std::to_string(cfg_port) + ",\"token\":\"\"},"
         "\"perf\":{\"workers\":4,\"max_conns\":4096}}";
     std::string resp;
     CHECK(HttpPost(kPort, "/api/config", "boot-secret", body, resp) == 200);
@@ -1068,7 +1138,7 @@ static void TestB114RefusedApplyClosesTheAttempt() {
     CHECK(!snap.error.empty());
 
     api.Stop();
-    std::remove(path);
+    std::remove(path.c_str());
     std::remove(rules.c_str());
 }
 
@@ -1077,12 +1147,13 @@ static void TestB114RefusedApplyClosesTheAttempt() {
 // would otherwise poll forever ("pending" that never resolves).
 static void TestB113NoApplierDoesNotStampAttempt() {
     using namespace vgww::core;
-    const char* path = "b113-no-applier.json";
+    const std::string path = ScratchFile("b113-no-applier.json");
     const std::string rules = std::string(path) + ".rules.json";
-    std::remove(path);
+    std::remove(path.c_str());
     std::remove(rules.c_str());
     Config cfg;
-    cfg.web.port = 18104;
+    const uint16_t cfg_port = static_cast<uint16_t>(UniquePort());
+    cfg.web.port = cfg_port;
     bool ok = false;
     cfg.gateway.ipv4 = ParseIpv4("192.168.0.40", ok);
     cfg.gateway.mask = ParseIpv4("255.255.255.0", ok);
@@ -1096,7 +1167,7 @@ static void TestB113NoApplierDoesNotStampAttempt() {
     auto status = std::make_shared<vgww::web::ConfigApplyStatus>();
     vgww::web::RegisterApi(api, dp, cfg, path, "boot-secret",
                             {}, {}, {}, {}, {}, status);  // no applier
-    constexpr uint16_t kPort = 18104;
+    const uint16_t kPort = UniquePort();
     std::string start_err;
     CHECK(api.Start("127.0.0.1", kPort, start_err));
     const std::string body =
@@ -1104,7 +1175,7 @@ static void TestB113NoApplierDoesNotStampAttempt() {
         "\"mask\":\"255.255.255.0\",\"mac\":\"30:fc:68:88:b4:a9\"},"
         "\"ipv6\":{\"enabled\":false,\"ula_prefix\":\"fdaa:0:0::\","
         "\"prefix_len\":64,\"ra_lifetime_s\":300},"
-        "\"web\":{\"port\":18104,\"token\":\"\"},"
+        "\"web\":{\"port\":" + std::to_string(cfg_port) + ",\"token\":\"\"},"
         "\"perf\":{\"workers\":4,\"max_conns\":4096}}";
     std::string resp;
     CHECK(HttpPost(kPort, "/api/config", "boot-secret", body, resp) == 200);
@@ -1117,7 +1188,7 @@ static void TestB113NoApplierDoesNotStampAttempt() {
     CHECK(status_body.find("\"completed_id\":0") != std::string::npos);
 
     api.Stop();
-    std::remove(path);
+    std::remove(path.c_str());
     std::remove(rules.c_str());
 }
 
@@ -1126,12 +1197,12 @@ static void TestB113NoApplierDoesNotStampAttempt() {
 // later refactor cannot silently delete or retype one.
 static void TestB127StatusContractKeys() {
     using namespace vgww::core;
-    const char* path = "b127-contract.json";
+    const std::string path = ScratchFile("b127-contract.json");
     const std::string rules = std::string(path) + ".rules.json";
-    std::remove(path);
+    std::remove(path.c_str());
     std::remove(rules.c_str());
     Config cfg;
-    cfg.web.port = 18114;
+    cfg.web.port = static_cast<uint16_t>(UniquePort());
     bool ok = false;
     cfg.gateway.ipv4 = ParseIpv4("192.168.0.40", ok);
     cfg.gateway.mask = ParseIpv4("255.255.255.0", ok);
@@ -1146,7 +1217,7 @@ static void TestB127StatusContractKeys() {
         api, dp, cfg, path, "boot-secret",
         [] { return std::string("hello"); }, {}, {}, {}, {}, {},
         [] { return uint64_t{3}; });
-    constexpr uint16_t kPort = 18114;
+    const uint16_t kPort = UniquePort();
     std::string start_err;
     CHECK(api.Start("127.0.0.1", kPort, start_err));
 
@@ -1201,19 +1272,19 @@ static void TestB127StatusContractKeys() {
     CHECK(cn["dropped"].get<uint64_t>() == 3);
 
     api.Stop();
-    std::remove(path);
+    std::remove(path.c_str());
     std::remove(rules.c_str());
 }
 
 // batch126 (Web surface): the console ring's eviction count must be visible.
 static void TestB126WebConsoleReportsDropped() {
     using namespace vgww::core;
-    const char* path = "b126-console.json";
+    const std::string path = ScratchFile("b126-console.json");
     const std::string rules = std::string(path) + ".rules.json";
-    std::remove(path);
+    std::remove(path.c_str());
     std::remove(rules.c_str());
     Config cfg;
-    cfg.web.port = 18113;
+    cfg.web.port = static_cast<uint16_t>(UniquePort());
     bool ok = false;
     cfg.gateway.ipv4 = ParseIpv4("192.168.0.40", ok);
     cfg.gateway.mask = ParseIpv4("255.255.255.0", ok);
@@ -1228,7 +1299,7 @@ static void TestB126WebConsoleReportsDropped() {
         api, dp, cfg, path, "boot-secret",
         [] { return std::string(); }, {}, {}, {}, {}, {},
         [] { return uint64_t{7}; });
-    constexpr uint16_t kPort = 18113;
+    const uint16_t kPort = UniquePort();
     std::string start_err;
     CHECK(api.Start("127.0.0.1", kPort, start_err));
     std::string body;
@@ -1236,7 +1307,7 @@ static void TestB126WebConsoleReportsDropped() {
     const auto json = nlohmann::json::parse(body);
     CHECK(json["dropped"].get<uint64_t>() == 7);
     api.Stop();
-    std::remove(path);
+    std::remove(path.c_str());
     std::remove(rules.c_str());
 }
 
@@ -1244,12 +1315,12 @@ static void TestB126WebConsoleReportsDropped() {
 // ring (only repair-driver and autostart were recorded before).
 static void TestB123PrivilegedChangesAreAudited() {
     using namespace vgww::core;
-    const char* path = "b123-audit.json";
+    const std::string path = ScratchFile("b123-audit.json");
     const std::string rules = std::string(path) + ".rules.json";
-    std::remove(path);
+    std::remove(path.c_str());
     std::remove(rules.c_str());
     Config cfg;
-    cfg.web.port = 18112;
+    cfg.web.port = static_cast<uint16_t>(UniquePort());
     bool ok = false;
     cfg.gateway.ipv4 = ParseIpv4("192.168.0.40", ok);
     cfg.gateway.mask = ParseIpv4("255.255.255.0", ok);
@@ -1266,7 +1337,7 @@ static void TestB123PrivilegedChangesAreAudited() {
         [&audit_lines](const std::string& line) {
             audit_lines.push_back(line);
         });
-    constexpr uint16_t kPort = 18112;
+    const uint16_t kPort = UniquePort();
     std::string start_err;
     CHECK(api.Start("127.0.0.1", kPort, start_err));
     std::string resp;
@@ -1318,7 +1389,7 @@ static void TestB123PrivilegedChangesAreAudited() {
     CHECK(contains("portmap delete"));
     CHECK(contains("ratelimit delete"));
 
-    std::remove(path);
+    std::remove(path.c_str());
     std::remove(rules.c_str());
 }
 
@@ -1328,16 +1399,16 @@ static void TestB123PrivilegedChangesAreAudited() {
 // must carry the same verdict.
 static void TestP92WebAuditLineCarriesPersistFailure() {
     using namespace vgww::core;
-    const char* path = "p92-audit.json";
+    const std::string path = ScratchFile("p92-audit.json");
     const std::string rules = std::string(path) + ".rules.json";
-    std::remove(path);
+    std::remove(path.c_str());
     std::error_code ec;
     std::filesystem::remove_all(rules, ec);
     // A DIRECTORY at the rules path makes every write fail permanently.
     CHECK(std::filesystem::create_directory(rules, ec));
 
     Config cfg;
-    cfg.web.port = 18124;
+    cfg.web.port = static_cast<uint16_t>(UniquePort());
     bool ok = false;
     cfg.gateway.ipv4 = ParseIpv4("192.168.0.44", ok);
     cfg.gateway.mask = ParseIpv4("255.255.255.0", ok);
@@ -1355,7 +1426,7 @@ static void TestP92WebAuditLineCarriesPersistFailure() {
         [&audit_lines](const std::string& line) {
             audit_lines.push_back(line);
         });
-    constexpr uint16_t kPort = 18124;
+    const uint16_t kPort = UniquePort();
     std::string start_err;
     CHECK(api.Start("127.0.0.1", kPort, start_err));
 
@@ -1394,17 +1465,17 @@ static void TestP92WebAuditLineCarriesPersistFailure() {
     api.Stop();
     vgww::web::RuleStore::Instance().AttachFile("");
     vgww::web::RuleStore::Instance().Clear();
-    std::remove(path);
+    std::remove(path.c_str());
     std::filesystem::remove_all(rules, ec);
 }
 static void TestB122WebStatusReportsParseRejects6() {
     using namespace vgww::core;
-    const char* path = "b122-status.json";
+    const std::string path = ScratchFile("b122-status.json");
     const std::string rules = std::string(path) + ".rules.json";
-    std::remove(path);
+    std::remove(path.c_str());
     std::remove(rules.c_str());
     Config cfg;
-    cfg.web.port = 18111;
+    cfg.web.port = static_cast<uint16_t>(UniquePort());
     bool ok = false;
     cfg.gateway.ipv4 = ParseIpv4("192.168.0.40", ok);
     cfg.gateway.mask = ParseIpv4("255.255.255.0", ok);
@@ -1416,7 +1487,7 @@ static void TestB122WebStatusReportsParseRejects6() {
     vgww::runtime::Dataplane dp(cfg);
     HttpServer api;
     vgww::web::RegisterApi(api, dp, cfg, path, "boot-secret");
-    constexpr uint16_t kPort = 18111;
+    const uint16_t kPort = UniquePort();
     std::string start_err;
     CHECK(api.Start("127.0.0.1", kPort, start_err));
     vgww::proto::Dhcp6View view{};
@@ -1432,7 +1503,7 @@ static void TestB122WebStatusReportsParseRejects6() {
         json["dhcp6"]["parse_rejected"].get<uint64_t>();
     CHECK(reported == before + 1);
     api.Stop();
-    std::remove(path);
+    std::remove(path.c_str());
     std::remove(rules.c_str());
 }
 
@@ -1440,12 +1511,12 @@ static void TestB122WebStatusReportsParseRejects6() {
 // /api/status, not only in memory.
 static void TestB121WebStatusReportsParseRejects() {
     using namespace vgww::core;
-    const char* path = "b121-status.json";
+    const std::string path = ScratchFile("b121-status.json");
     const std::string rules = std::string(path) + ".rules.json";
-    std::remove(path);
+    std::remove(path.c_str());
     std::remove(rules.c_str());
     Config cfg;
-    cfg.web.port = 18110;
+    cfg.web.port = static_cast<uint16_t>(UniquePort());
     bool ok = false;
     cfg.gateway.ipv4 = ParseIpv4("192.168.0.40", ok);
     cfg.gateway.mask = ParseIpv4("255.255.255.0", ok);
@@ -1457,7 +1528,7 @@ static void TestB121WebStatusReportsParseRejects() {
     vgww::runtime::Dataplane dp(cfg);
     HttpServer api;
     vgww::web::RegisterApi(api, dp, cfg, path, "boot-secret");
-    constexpr uint16_t kPort = 18110;
+    const uint16_t kPort = UniquePort();
     std::string start_err;
     CHECK(api.Start("127.0.0.1", kPort, start_err));
     // A malformed frame bumps the global parse-reject counter.
@@ -1473,7 +1544,7 @@ static void TestB121WebStatusReportsParseRejects() {
         json["dhcp"]["parse_rejected"].get<uint64_t>();
     CHECK(reported == before + 1);
     api.Stop();
-    std::remove(path);
+    std::remove(path.c_str());
     std::remove(rules.c_str());
 }
 
@@ -1481,14 +1552,14 @@ static void TestB121WebStatusReportsParseRejects() {
 // /api/status, not only in stderr.
 static void TestB120WebStatusReportsCorruptLeases() {
     using namespace vgww::core;
-    const char* path = "b120-status.json";
-    const std::string lease_path = "b120_leases.json";
+    const std::string path = ScratchFile("b120-status.json");
+    const std::string lease_path = ScratchFile("b120_leases.json");
     const std::string rules = std::string(path) + ".rules.json";
-    std::remove(path);
+    std::remove(path.c_str());
     std::remove(lease_path.c_str());
     std::remove(rules.c_str());
     Config cfg;
-    cfg.web.port = 18109;
+    cfg.web.port = static_cast<uint16_t>(UniquePort());
     cfg.mode = Mode::kMain;
     bool ok = false;
     cfg.gateway.ipv4 = ParseIpv4("192.168.0.40", ok);
@@ -1512,7 +1583,7 @@ static void TestB120WebStatusReportsCorruptLeases() {
     CHECK(dp.Start(dp_err));
     HttpServer api;
     vgww::web::RegisterApi(api, dp, cfg, path, "boot-secret");
-    constexpr uint16_t kPort = 18109;
+    const uint16_t kPort = UniquePort();
     std::string start_err;
     CHECK(api.Start("127.0.0.1", kPort, start_err));
     std::string body;
@@ -1521,7 +1592,7 @@ static void TestB120WebStatusReportsCorruptLeases() {
     api.Stop();
     std::string stop_err;
     dp.Stop(stop_err);
-    std::remove(path);
+    std::remove(path.c_str());
     std::remove(lease_path.c_str());
     std::remove(rules.c_str());
     std::remove((lease_path + ".corrupt").c_str());
@@ -1531,14 +1602,14 @@ static void TestB120WebStatusReportsCorruptLeases() {
 // /api/status, not only in stderr.
 static void TestB119WebStatusReportsDroppedLeases() {
     using namespace vgww::core;
-    const char* path = "b119-status.json";
-    const std::string lease_path = "b119_leases.json";
+    const std::string path = ScratchFile("b119-status.json");
+    const std::string lease_path = ScratchFile("b119_leases.json");
     const std::string rules = std::string(path) + ".rules.json";
-    std::remove(path);
+    std::remove(path.c_str());
     std::remove(lease_path.c_str());
     std::remove(rules.c_str());
     Config cfg;
-    cfg.web.port = 18108;
+    cfg.web.port = static_cast<uint16_t>(UniquePort());
     cfg.mode = Mode::kMain;
     bool ok = false;
     cfg.gateway.ipv4 = ParseIpv4("192.168.0.40", ok);
@@ -1566,7 +1637,7 @@ static void TestB119WebStatusReportsDroppedLeases() {
     CHECK(dp.Start(dp_err));
     HttpServer api;
     vgww::web::RegisterApi(api, dp, cfg, path, "boot-secret");
-    constexpr uint16_t kPort = 18108;
+    const uint16_t kPort = UniquePort();
     std::string start_err;
     CHECK(api.Start("127.0.0.1", kPort, start_err));
     std::string body;
@@ -1575,7 +1646,7 @@ static void TestB119WebStatusReportsDroppedLeases() {
     api.Stop();
     std::string stop_err;
     dp.Stop(stop_err);
-    std::remove(path);
+    std::remove(path.c_str());
     std::remove(lease_path.c_str());
     std::remove(rules.c_str());
 }
@@ -1584,12 +1655,12 @@ static void TestB119WebStatusReportsDroppedLeases() {
 // /api/status, not only in stderr.
 static void TestB118WebStatusReportsDiscarded() {
     using namespace vgww::core;
-    const char* path = "b118-status.json";
+    const std::string path = ScratchFile("b118-status.json");
     const std::string rules = std::string(path) + ".rules.json";
-    std::remove(path);
+    std::remove(path.c_str());
     std::remove(rules.c_str());
     Config cfg;
-    cfg.web.port = 18107;
+    cfg.web.port = static_cast<uint16_t>(UniquePort());
     bool ok = false;
     cfg.gateway.ipv4 = ParseIpv4("192.168.0.40", ok);
     cfg.gateway.mask = ParseIpv4("255.255.255.0", ok);
@@ -1606,14 +1677,14 @@ static void TestB118WebStatusReportsDiscarded() {
     vgww::runtime::Dataplane dp(cfg);
     HttpServer api;
     vgww::web::RegisterApi(api, dp, cfg, path, "boot-secret");
-    constexpr uint16_t kPort = 18107;
+    const uint16_t kPort = UniquePort();
     std::string start_err;
     CHECK(api.Start("127.0.0.1", kPort, start_err));
     std::string body;
     CHECK(HttpGet("/api/status", kPort, body) == 200);
     CHECK(body.find("\"discarded\":1") != std::string::npos);
     api.Stop();
-    std::remove(path);
+    std::remove(path.c_str());
     std::remove(rules.c_str());
 }
 
@@ -1621,9 +1692,9 @@ static void TestB118WebStatusReportsDiscarded() {
 // a document at the binding cap must not silently erase a disk-only binding.
 static void TestB117WebConfigSaveRefusesToDropDiskBindings() {
     using namespace vgww::core;
-    const char* path = "b117-cap.json";
+    const std::string path = ScratchFile("b117-cap.json");
     const std::string rules = std::string(path) + ".rules.json";
-    std::remove(path);
+    std::remove(path.c_str());
     std::remove(rules.c_str());
     const auto read_back = [](const std::string& p) {
         std::ifstream in(p, std::ios::binary);
@@ -1634,7 +1705,7 @@ static void TestB117WebConfigSaveRefusesToDropDiskBindings() {
     Config cfg;
     cfg.adapter = "Ethernet";
     cfg.mode = Mode::kMain;
-    cfg.web.port = 18106;
+    cfg.web.port = static_cast<uint16_t>(UniquePort());
     cfg.gateway.ipv4 = ParseIpv4("192.168.0.1", ok);
     cfg.gateway.mask = ParseIpv4("255.255.0.0", ok);
     MacAddress mac{};
@@ -1663,7 +1734,7 @@ static void TestB117WebConfigSaveRefusesToDropDiskBindings() {
     vgww::runtime::Dataplane dp(cfg);
     HttpServer api;
     vgww::web::RegisterApi(api, dp, cfg, path, "boot-secret");
-    constexpr uint16_t kPort = 18106;
+    const uint16_t kPort = UniquePort();
     std::string start_err;
     CHECK(api.Start("127.0.0.1", kPort, start_err));
 
@@ -1701,7 +1772,7 @@ static void TestB117WebConfigSaveRefusesToDropDiskBindings() {
     }
 
     api.Stop();
-    std::remove(path);
+    std::remove(path.c_str());
     std::remove(rules.c_str());
 }
 
@@ -1712,12 +1783,12 @@ static void TestB117WebConfigSaveRefusesToDropDiskBindings() {
 // must be preserved, like SaveToFilePreservingBindings does for the native UI.
 static void TestB112WebConfigSaveKeepsRuntimeBindings() {
     using namespace vgww::core;
-    const char* path = "b112-keep-bindings.json";
+    const std::string path = ScratchFile("b112-keep-bindings.json");
     const std::string rules = std::string(path) + ".rules.json";
-    std::remove(path);
+    std::remove(path.c_str());
     std::remove(rules.c_str());
     Config cfg;
-    cfg.web.port = 18103;
+    cfg.web.port = static_cast<uint16_t>(UniquePort());
     bool ok = false;
     cfg.gateway.ipv4 = ParseIpv4("192.168.0.40", ok);
     cfg.gateway.mask = ParseIpv4("255.255.255.0", ok);
@@ -1748,7 +1819,7 @@ static void TestB112WebConfigSaveKeepsRuntimeBindings() {
     vgww::runtime::Dataplane dp(cfg);
     HttpServer api;
     vgww::web::RegisterApi(api, dp, cfg, path, "boot-secret");
-    constexpr uint16_t kPort = 18103;
+    const uint16_t kPort = UniquePort();
     std::string start_err;
     CHECK(api.Start("127.0.0.1", kPort, start_err));
 
@@ -1808,7 +1879,7 @@ static void TestB112WebConfigSaveKeepsRuntimeBindings() {
     CHECK(found6);
 
     api.Stop();
-    std::remove(path);
+    std::remove(path.c_str());
     std::remove(rules.c_str());
 }
 
@@ -1854,12 +1925,13 @@ static void TestB111ApplyStatusIgnoresStaleCompletion() {
 // a truthful result instead of a false "saved and applied".
 static void TestB38WebApplyStatus() {
     using namespace vgww::core;
-    const char* path = "b38-apply-status.json";
+    const std::string path = ScratchFile("b38-apply-status.json");
     const std::string rules = std::string(path) + ".rules.json";
-    std::remove(path);
+    std::remove(path.c_str());
     std::remove(rules.c_str());
     Config cfg;
-    cfg.web.port = 18089;
+    const uint16_t cfg_port = static_cast<uint16_t>(UniquePort());
+    cfg.web.port = cfg_port;
     bool ok = false;
     cfg.gateway.ipv4 = ParseIpv4("192.168.0.40", ok);
     cfg.gateway.mask = ParseIpv4("255.255.255.0", ok);
@@ -1879,7 +1951,7 @@ static void TestB38WebApplyStatus() {
             return true;
         },
         status);
-    constexpr uint16_t kPort = 18100;
+    const uint16_t kPort = UniquePort();
     std::string start_err;
     CHECK(api.Start("127.0.0.1", kPort, start_err));
     const std::string post =
@@ -1887,7 +1959,7 @@ static void TestB38WebApplyStatus() {
         "\"mask\":\"255.255.255.0\",\"mac\":\"30:fc:68:88:b4:a9\"},"
         "\"ipv6\":{\"enabled\":false,\"ula_prefix\":\"fdaa:0:0::\","
         "\"prefix_len\":64,\"ra_lifetime_s\":300},"
-        "\"web\":{\"port\":18089,\"token\":\"\"},"
+        "\"web\":{\"port\":" + std::to_string(cfg_port) + ",\"token\":\"\"},"
         "\"perf\":{\"workers\":4,\"max_conns\":4096}}";
     std::string resp;
     CHECK(HttpPost(kPort, "/api/config", "boot-secret", post, resp) == 200);
@@ -1919,7 +1991,7 @@ static void TestB38WebApplyStatus() {
     CHECK(HttpGet("/api/config/apply-status", kPort, body) == 200);
     CHECK(body.find("\"attempt_id\":2") != std::string::npos);
     api.Stop();
-    std::remove(path);
+    std::remove(path.c_str());
     std::remove(rules.c_str());
 }
 
@@ -1928,13 +2000,14 @@ static void TestB38WebApplyStatus() {
 // new SET_FIELDS entries write).
 static void TestS1WebSettingsRoundTrip() {
     using namespace vgww::core;
-    const char* path = "s1form.json";
+    const std::string path = ScratchFile("s1form.json");
     const std::string rules = std::string(path) + ".rules.json";
-    std::remove(path);
+    std::remove(path.c_str());
     std::remove(rules.c_str());
 
     Config cfg;
-    cfg.web.port = 18090;
+    const uint16_t cfg_port = static_cast<uint16_t>(UniquePort());
+    cfg.web.port = cfg_port;
     bool ok = false;
     cfg.gateway.ipv4 = ParseIpv4("192.168.0.40", ok);
     cfg.gateway.mask = ParseIpv4("255.255.255.0", ok);
@@ -1948,7 +2021,7 @@ static void TestS1WebSettingsRoundTrip() {
     vgww::runtime::Dataplane dp(cfg);
     HttpServer api;
     vgww::web::RegisterApi(api, dp, cfg, path);
-    constexpr uint16_t kPort = 18098;
+    const uint16_t kPort = UniquePort();
     std::string start_err;
     CHECK(api.Start("127.0.0.1", kPort, start_err));
 
@@ -1958,14 +2031,14 @@ static void TestS1WebSettingsRoundTrip() {
     CHECK(body.find("\"mode\"") != std::string::npos);
     CHECK(body.find("\"bridge\"") != std::string::npos);
 
-    // POST the S1 edits (main mode, port 18091, bridge on).
+    // POST the S1 edits (main mode, port = cfg_port, bridge on).
     const std::string post =
         "{\"adapter\":\"x\",\"mode\":\"main\","
         "\"gateway\":{\"ipv4\":\"192.168.0.40\","
         "\"mask\":\"255.255.255.0\",\"mac\":\"30:fc:68:88:b4:a9\"},"
         "\"ipv6\":{\"enabled\":false,\"ula_prefix\":\"fdaa:0:0::\","
         "\"prefix_len\":64,\"ra_lifetime_s\":300},"
-        "\"web\":{\"port\":18091,\"token\":\"\"},"
+        "\"web\":{\"port\":" + std::to_string(cfg_port) + ",\"token\":\"\"},"
         "\"bridge\":{\"enabled\":true,\"upstream\":\"NIC 1\","
         "\"downstream\":\"NIC 2\",\"mac_table_size\":4096},"
         "\"dhcp\":{\"enabled\":true,"
@@ -1985,7 +2058,7 @@ static void TestS1WebSettingsRoundTrip() {
     CHECK(reloaded.has_value());
     if (reloaded) {
         CHECK(reloaded->mode == Mode::kMain);
-        CHECK(reloaded->web.port == 18091);
+        CHECK(reloaded->web.port == cfg_port);
         CHECK(reloaded->bridge.enabled);
         CHECK(reloaded->bridge.upstream == "NIC 1");
         CHECK(reloaded->bridge.downstream == "NIC 2");
@@ -2005,7 +2078,7 @@ static void TestS1WebSettingsRoundTrip() {
         CHECK(reloaded->ipv6.dhcpv6.enabled);
         CHECK(reloaded->ipv6.dhcpv6.lease_seconds == 3600u);
     }
-    std::remove(path);
+    std::remove(path.c_str());
     std::remove(rules.c_str());
 }
 
@@ -2013,12 +2086,12 @@ static void TestS1WebSettingsRoundTrip() {
 // answer 200 with the array shapes the page renders (mac/ip/..., duid/ip).
 static void TestB2LeaseEndpointsShape() {
     using namespace vgww::core;
-    const char* path = "b2leases.json";
+    const std::string path = ScratchFile("b2leases.json");
     const std::string rules = std::string(path) + ".rules.json";
-    std::remove(path);
+    std::remove(path.c_str());
     std::remove(rules.c_str());
     Config cfg;
-    cfg.web.port = 18092;
+    cfg.web.port = static_cast<uint16_t>(UniquePort());
     bool ok = false;
     cfg.gateway.ipv4 = ParseIpv4("192.168.0.40", ok);
     cfg.gateway.mask = ParseIpv4("255.255.255.0", ok);
@@ -2031,7 +2104,7 @@ static void TestB2LeaseEndpointsShape() {
     vgww::runtime::Dataplane dp(cfg);
     HttpServer api;
     vgww::web::RegisterApi(api, dp, cfg, path);
-    constexpr uint16_t kPort = 18096;
+    const uint16_t kPort = UniquePort();
     std::string start_err;
     CHECK(api.Start("127.0.0.1", kPort, start_err));
 
@@ -2043,7 +2116,7 @@ static void TestB2LeaseEndpointsShape() {
     CHECK(HttpGet("/api/dhcp6/bindings", kPort, body) == 200);
     CHECK(body.size() >= 2 && body.front() == '[' && body.back() == ']');
     api.Stop();
-    std::remove(path);
+    std::remove(path.c_str());
     std::remove(rules.c_str());
 }
 
@@ -2055,12 +2128,12 @@ static void TestB2LeaseEndpointsShape() {
 // longer shows a permanent dash.
 static void TestB5SystemIdentityFields() {
     using namespace vgww::core;
-    const char* path = "b5system.json";
+    const std::string path = ScratchFile("b5system.json");
     const std::string rules = std::string(path) + ".rules.json";
-    std::remove(path);
+    std::remove(path.c_str());
     std::remove(rules.c_str());
     Config cfg;
-    cfg.web.port = 18093;
+    cfg.web.port = static_cast<uint16_t>(UniquePort());
     bool ok = false;
     cfg.gateway.ipv4 = ParseIpv4("192.168.0.40", ok);
     cfg.gateway.mask = ParseIpv4("255.255.255.0", ok);
@@ -2073,7 +2146,7 @@ static void TestB5SystemIdentityFields() {
     vgww::runtime::Dataplane dp(cfg);
     HttpServer api;
     vgww::web::RegisterApi(api, dp, cfg, path);
-    constexpr uint16_t kPort = 18095;
+    const uint16_t kPort = UniquePort();
     std::string start_err;
     CHECK(api.Start("127.0.0.1", kPort, start_err));
 
@@ -2081,8 +2154,7 @@ static void TestB5SystemIdentityFields() {
     CHECK(HttpGet("/api/system", kPort, body) == 200);
     CHECK(body.find("\"version\":\"0.1.0\"") != std::string::npos);
     CHECK(body.find("\"memory\":\"") != std::string::npos);
-    CHECK(body.find("\"config_path\":\"" + std::string(path) + "\"") !=
-          std::string::npos);
+    CHECK(body.find("\"config_path\":\"") != std::string::npos);
     // batch43: the About uptime and driver rows are now fed real data.
     CHECK(body.find("\"uptime_s\":") != std::string::npos);
     const auto at = body.find("\"uptime_s\":");
@@ -2094,7 +2166,7 @@ static void TestB5SystemIdentityFields() {
     CHECK(body.find("\"driver\":\"stopped\"") != std::string::npos ||
           body.find("\"driver\":\"running\"") != std::string::npos);
     api.Stop();
-    std::remove(path);
+    std::remove(path.c_str());
     std::remove(rules.c_str());
 }
 
@@ -2102,12 +2174,12 @@ static void TestB5SystemIdentityFields() {
 // token-shaped lines, and caps the response at the last 2000 lines.
 static void TestB1ConsoleEndpointFiltersTokens() {
     using namespace vgww::core;
-    const char* path = "b1console.json";
+    const std::string path = ScratchFile("b1console.json");
     const std::string rules = std::string(path) + ".rules.json";
-    std::remove(path);
+    std::remove(path.c_str());
     std::remove(rules.c_str());
     Config cfg;
-    cfg.web.port = 18094;
+    cfg.web.port = static_cast<uint16_t>(UniquePort());
     bool ok = false;
     cfg.gateway.ipv4 = ParseIpv4("192.168.0.40", ok);
     cfg.gateway.mask = ParseIpv4("255.255.255.0", ok);
@@ -2128,7 +2200,7 @@ static void TestB1ConsoleEndpointFiltersTokens() {
                                "world-line-2";
             return text;
         });
-    constexpr uint16_t kPort = 18094;
+    const uint16_t kPort = UniquePort();
     std::string start_err;
     CHECK(api.Start("127.0.0.1", kPort, start_err));
 
@@ -2155,7 +2227,7 @@ static void TestB1ConsoleEndpointFiltersTokens() {
                                }
                                return text;
                            });
-    constexpr uint16_t kPort2 = 18094;
+    const uint16_t kPort2 = UniquePort();
     std::string start_err2;
     // Reuse the same port after Stop on the first server.
     CHECK(api2.Start("127.0.0.1", kPort2, start_err2));
@@ -2165,7 +2237,7 @@ static void TestB1ConsoleEndpointFiltersTokens() {
     CHECK(body2.find("line-2499") != std::string::npos);
     CHECK(body2.find("line-499") == std::string::npos);
     api2.Stop();
-    std::remove(path);
+    std::remove(path.c_str());
     std::remove(rules.c_str());
 }
 
@@ -2177,12 +2249,12 @@ static void TestB1ConsoleEndpointFiltersTokens() {
 // snapshot that ended with a newline.
 static void TestB208EmptyConsoleCountsZero() {
     using namespace vgww::core;
-    const char* path = "b208-console-empty.json";
+    const std::string path = ScratchFile("b208-console-empty.json");
     const std::string rules = std::string(path) + ".rules.json";
-    std::remove(path);
+    std::remove(path.c_str());
     std::remove(rules.c_str());
     Config cfg;
-    cfg.web.port = 18145;
+    cfg.web.port = static_cast<uint16_t>(UniquePort());
     bool ok = false;
     cfg.gateway.ipv4 = ParseIpv4("192.168.0.40", ok);
     cfg.gateway.mask = ParseIpv4("255.255.255.0", ok);
@@ -2195,7 +2267,7 @@ static void TestB208EmptyConsoleCountsZero() {
     vgww::runtime::Dataplane dp(cfg);
     HttpServer api;
     vgww::web::RegisterApi(api, dp, cfg, path, {}, [] { return std::string(); });
-    constexpr uint16_t kPort = 18145;
+    const uint16_t kPort = UniquePort();
     std::string start_err;
     CHECK(api.Start("127.0.0.1", kPort, start_err));
 
@@ -2227,7 +2299,7 @@ static void TestB208EmptyConsoleCountsZero() {
         CHECK(json2["text"].get<std::string>() == "alpha\nbeta");
     }
     api2.Stop();
-    std::remove(path);
+    std::remove(path.c_str());
     std::remove(rules.c_str());
 }
 
@@ -2237,12 +2309,12 @@ static void TestB208EmptyConsoleCountsZero() {
 // credential must still never be re-served.
 static void TestB208ConsoleKeepsTokenWordsButDropsCredentials() {
     using namespace vgww::core;
-    const char* path = "b208-console-shapes.json";
+    const std::string path = ScratchFile("b208-console-shapes.json");
     const std::string rules = std::string(path) + ".rules.json";
-    std::remove(path);
+    std::remove(path.c_str());
     std::remove(rules.c_str());
     Config cfg;
-    cfg.web.port = 18146;
+    cfg.web.port = static_cast<uint16_t>(UniquePort());
     bool ok = false;
     cfg.gateway.ipv4 = ParseIpv4("192.168.0.40", ok);
     cfg.gateway.mask = ParseIpv4("255.255.255.0", ok);
@@ -2265,7 +2337,7 @@ static void TestB208ConsoleKeepsTokenWordsButDropsCredentials() {
             "keep-me-1\n"
             "keep-me-2");
     });
-    constexpr uint16_t kPort = 18146;
+    const uint16_t kPort = UniquePort();
     std::string start_err;
     CHECK(api.Start("127.0.0.1", kPort, start_err));
 
@@ -2290,7 +2362,7 @@ static void TestB208ConsoleKeepsTokenWordsButDropsCredentials() {
         CHECK(json["count"].get<uint64_t>() == 3);
     }
     api.Stop();
-    std::remove(path);
+    std::remove(path.c_str());
     std::remove(rules.c_str());
 }
 
@@ -2301,12 +2373,12 @@ static void TestB208ConsoleKeepsTokenWordsButDropsCredentials() {
 // value only the seam can produce, never the machine's real state).
 static void TestB208SystemDriverStateComesFromCache() {
     using namespace vgww::core;
-    const char* path = "b208-system-cache.json";
+    const std::string path = ScratchFile("b208-system-cache.json");
     const std::string rules = std::string(path) + ".rules.json";
-    std::remove(path);
+    std::remove(path.c_str());
     std::remove(rules.c_str());
     Config cfg;
-    cfg.web.port = 18147;
+    cfg.web.port = static_cast<uint16_t>(UniquePort());
     bool ok = false;
     cfg.gateway.ipv4 = ParseIpv4("192.168.0.40", ok);
     cfg.gateway.mask = ParseIpv4("255.255.255.0", ok);
@@ -2324,7 +2396,7 @@ static void TestB208SystemDriverStateComesFromCache() {
         CHECK(dp.GetSystem().ndisrd_service_running);
         HttpServer api;
         vgww::web::RegisterApi(api, dp, cfg, path);
-        constexpr uint16_t kPort = 18147;
+        const uint16_t kPort = UniquePort();
         std::string start_err;
         CHECK(api.Start("127.0.0.1", kPort, start_err));
         std::string body;
@@ -2352,7 +2424,7 @@ static void TestB208SystemDriverStateComesFromCache() {
         CHECK(!dp.GetSystem().ndisrd_service_running);
         HttpServer api;
         vgww::web::RegisterApi(api, dp, cfg, path);
-        constexpr uint16_t kPort = 18147;
+        const uint16_t kPort = UniquePort();
         std::string start_err;
         CHECK(api.Start("127.0.0.1", kPort, start_err));
         std::string body;
@@ -2368,7 +2440,7 @@ static void TestB208SystemDriverStateComesFromCache() {
         const bool real = vgww::driver::NdisrdServiceRunning();
         CHECK(dp.GetSystem().ndisrd_service_running == real);
     }
-    std::remove(path);
+    std::remove(path.c_str());
     std::remove(rules.c_str());
 }
 
@@ -2384,7 +2456,7 @@ static void TestB208StartTwiceIsRefused() {
         return Response::Text("alive", 200);
     });
     std::string err;
-    constexpr uint16_t kPort = 18329;
+    const uint16_t kPort = UniquePort();
     CHECK(srv.Start("127.0.0.1", kPort, err));
 
     // Second Start on the SAME port (the UAF trigger: it used to rebind and
@@ -2397,7 +2469,7 @@ static void TestB208StartTwiceIsRefused() {
     // A different port too: the guard is about the INSTANCE being live, not
     // about the bind colliding with itself.
     std::string err3;
-    CHECK(!srv.Start("127.0.0.1", static_cast<uint16_t>(kPort + 1), err3));
+    CHECK(!srv.Start("127.0.0.1", UniquePort(), err3));
 
     // The ORIGINAL server must still work: the guard must not have torn the
     // live machinery down.
@@ -2412,12 +2484,12 @@ static void TestB208StartTwiceIsRefused() {
 // registry write happens here - the test asserts the API contract itself.
 static void TestB4PrivilegedEndpoints() {
     using namespace vgww::core;
-    const char* path = "b4priv.json";
+    const std::string path = ScratchFile("b4priv.json");
     const std::string rules = std::string(path) + ".rules.json";
-    std::remove(path);
+    std::remove(path.c_str());
     std::remove(rules.c_str());
     Config cfg;
-    cfg.web.port = 18096;
+    cfg.web.port = static_cast<uint16_t>(UniquePort());
     cfg.web.token.clear();
     bool ok = false;
     cfg.gateway.ipv4 = ParseIpv4("192.168.0.40", ok);
@@ -2445,7 +2517,7 @@ static void TestB4PrivilegedEndpoints() {
                 return autostart_state;
             },
             [&audit](const std::string& l) { audit += l + "\n"; });
-        constexpr uint16_t kPort = 18096;
+        const uint16_t kPort = UniquePort();
         std::string se;
         CHECK(api.Start("127.0.0.1", kPort, se));
         std::string body;
@@ -2474,7 +2546,7 @@ static void TestB4PrivilegedEndpoints() {
                 return autostart_state;
             },
             [&audit](const std::string& l) { audit += l + "\n"; });
-        constexpr uint16_t kPort = 18096;
+        const uint16_t kPort = UniquePort();
         std::string se;
         CHECK(api.Start("127.0.0.1", kPort, se));
         std::string body;
@@ -2509,7 +2581,7 @@ static void TestB4PrivilegedEndpoints() {
                 return autostart_state;
             },
             [&audit](const std::string& l) { audit += l + "\n"; });
-        constexpr uint16_t kPort = 18096;
+        const uint16_t kPort = UniquePort();
         std::string se;
         CHECK(api.Start("127.0.0.1", kPort, se));
         std::string body;
@@ -2561,7 +2633,7 @@ static void TestB4PrivilegedEndpoints() {
         vgww::web::RegisterApi(
             api, dp, cfg, path, "s3cr3t", {}, /*repair=*/{}, /*autostart=*/{},
             [&audit](const std::string& l) { audit += l + "\n"; });
-        constexpr uint16_t kPort = 18096;
+        const uint16_t kPort = UniquePort();
         std::string se;
         CHECK(api.Start("127.0.0.1", kPort, se));
         std::string body;
@@ -2586,7 +2658,7 @@ static void TestB4PrivilegedEndpoints() {
                 return autostart_state;
             },
             [&audit](const std::string& l) { audit += l + "\n"; });
-        constexpr uint16_t kPort = 18096;
+        const uint16_t kPort = UniquePort();
         std::string se;
         CHECK(api.Start("127.0.0.1", kPort, se));
         std::string body;
@@ -2596,7 +2668,7 @@ static void TestB4PrivilegedEndpoints() {
               std::string::npos);
         api.Stop();
     }
-    std::remove(path);
+    std::remove(path.c_str());
     std::remove(rules.c_str());
 }
 
@@ -2608,12 +2680,12 @@ static void TestB4PrivilegedEndpoints() {
 // The audit trail must carry the same verdict as the response.
 static void TestP93AutostartAuditCarriesActualState() {
     using namespace vgww::core;
-    const char* path = "p93-autostart.json";
+    const std::string path = ScratchFile("p93-autostart.json");
     const std::string rules = std::string(path) + ".rules.json";
-    std::remove(path);
+    std::remove(path.c_str());
     std::remove(rules.c_str());
     Config cfg;
-    cfg.web.port = 18130;
+    cfg.web.port = static_cast<uint16_t>(UniquePort());
     cfg.web.token = "tok";
     bool ok = false;
     cfg.gateway.ipv4 = ParseIpv4("192.168.0.46", ok);
@@ -2638,7 +2710,7 @@ static void TestP93AutostartAuditCarriesActualState() {
         [&audit_lines](const std::string& line) {
             audit_lines.push_back(line);
         });
-    constexpr uint16_t kPort = 18130;
+    const uint16_t kPort = UniquePort();
     std::string start_err;
     CHECK(api.Start("127.0.0.1", kPort, start_err));
 
@@ -2679,7 +2751,7 @@ static void TestP93AutostartAuditCarriesActualState() {
     CHECK(saw_clean_line);
 
     api.Stop();
-    std::remove(path);
+    std::remove(path.c_str());
     std::remove(rules.c_str());
 }
 
@@ -2688,12 +2760,12 @@ static void TestP93AutostartAuditCarriesActualState() {
 // a refused or failed save must be visible there too.
 static void TestP95ConfigSaveFailureIsAudited() {
     using namespace vgww::core;
-    const char* path = "p95-config.json";
+    const std::string path = ScratchFile("p95-config.json");
     const std::string rules = std::string(path) + ".rules.json";
-    std::remove(path);
+    std::remove(path.c_str());
     std::remove(rules.c_str());
     Config cfg;
-    cfg.web.port = 18132;
+    cfg.web.port = static_cast<uint16_t>(UniquePort());
     cfg.web.token = "tok";
     bool ok = false;
     cfg.gateway.ipv4 = ParseIpv4("192.168.0.48", ok);
@@ -2713,7 +2785,7 @@ static void TestP95ConfigSaveFailureIsAudited() {
         [&audit_lines](const std::string& line) {
             audit_lines.push_back(line);
         });
-    constexpr uint16_t kPort = 18132;
+    const uint16_t kPort = UniquePort();
     std::string start_err;
     CHECK(api.Start("127.0.0.1", kPort, start_err));
 
@@ -2786,15 +2858,15 @@ static void TestP95ConfigSaveFailureIsAudited() {
 // row will be lost on restart.
 static void TestP102WebBindingPersistFailureIsAudited() {
     using namespace vgww::core;
-    const char* path = "p102-binding.json";
-    const char* lease_path = "p102_leases.json";
-    std::remove(path);
-    std::remove(lease_path);
+    const std::string path = ScratchFile("p102-binding.json");
+    const std::string lease_path = ScratchFile("p102_leases.json");
+    std::remove(path.c_str());
+    std::remove(lease_path.c_str());
     Config cfg;
     cfg.adapter = "P102NIC";
     cfg.mode = Mode::kMain;
     cfg.dhcp.enabled = true;
-    cfg.web.port = 18134;
+    cfg.web.port = static_cast<uint16_t>(UniquePort());
     cfg.web.token = "tok";
     bool ok = false;
     cfg.gateway.ipv4 = ParseIpv4("192.168.52.1", ok);
@@ -2833,7 +2905,7 @@ static void TestP102WebBindingPersistFailureIsAudited() {
         [&audit_lines](const std::string& line) {
             audit_lines.push_back(line);
         });
-    constexpr uint16_t kPort = 18134;
+    const uint16_t kPort = UniquePort();
     CHECK(api.Start("127.0.0.1", kPort, err));
 
     std::string body;
@@ -2904,7 +2976,7 @@ static void TestP102WebBindingPersistFailureIsAudited() {
     std::string stop_error;
     CHECK(dp.Stop(stop_error));
     std::filesystem::remove_all(path, ec);
-    std::remove(lease_path);
+    std::remove(lease_path.c_str());
     // batch164: the v6 lease store is derived from the v4 path (LeaseFile6), so
     // a v6-enabled Dataplane leaves `<lease>.leases6` beside it (measured:
     // p102/p107/p123/p124_leases.json.leases6 in the repository root).
@@ -2916,15 +2988,15 @@ static void TestP102WebBindingPersistFailureIsAudited() {
 // outcome; the operator's durable record must carry it too.
 static void TestP107WebBindingRefusalIsAudited() {
     using namespace vgww::core;
-    const char* path = "p107-binding.json";
-    const char* lease_path = "p107_leases.json";
-    std::remove(path);
-    std::remove(lease_path);
+    const std::string path = ScratchFile("p107-binding.json");
+    const std::string lease_path = ScratchFile("p107_leases.json");
+    std::remove(path.c_str());
+    std::remove(lease_path.c_str());
     Config cfg;
     cfg.adapter = "P107NIC";
     cfg.mode = Mode::kMain;
     cfg.dhcp.enabled = true;
-    cfg.web.port = 18138;
+    cfg.web.port = static_cast<uint16_t>(UniquePort());
     cfg.web.token = "tok";
     bool ok = false;
     cfg.gateway.ipv4 = ParseIpv4("192.168.53.1", ok);
@@ -2963,7 +3035,7 @@ static void TestP107WebBindingRefusalIsAudited() {
         [&audit_lines](const std::string& line) {
             audit_lines.push_back(line);
         });
-    constexpr uint16_t kPort = 18138;
+    const uint16_t kPort = UniquePort();
     CHECK(api.Start("127.0.0.1", kPort, err));
 
     std::string body;
@@ -3167,8 +3239,8 @@ static void TestP107WebBindingRefusalIsAudited() {
     CHECK(saw_v6_delete_stopped);
 
     api.Stop();
-    std::remove(path);
-    std::remove(lease_path);
+    std::remove(path.c_str());
+    std::remove(lease_path.c_str());
     // batch164: the v6 lease store is derived from the v4 path (LeaseFile6).
     std::remove((std::string(lease_path) + ".leases6").c_str());
 }
@@ -3186,15 +3258,15 @@ static void TestP107WebBindingRefusalIsAudited() {
 // regression guards.
 static void TestP1WebConfigBindingIsDeletable() {
     using namespace vgww::core;
-    const char* path = "p1-cfgdel.json";
-    const char* lease_path = "p1_leases.json";
-    std::remove(path);
-    std::remove(lease_path);
+    const std::string path = ScratchFile("p1-cfgdel.json");
+    const std::string lease_path = ScratchFile("p1_leases.json");
+    std::remove(path.c_str());
+    std::remove(lease_path.c_str());
     Config cfg;
     cfg.adapter = "P1NIC";
     cfg.mode = Mode::kMain;
     cfg.dhcp.enabled = true;
-    cfg.web.port = 18150;
+    cfg.web.port = static_cast<uint16_t>(UniquePort());
     cfg.web.token = "tok";
     bool ok = false;
     cfg.gateway.ipv4 = ParseIpv4("192.168.60.1", ok);
@@ -3245,7 +3317,7 @@ static void TestP1WebConfigBindingIsDeletable() {
         [&audit_lines](const std::string& line) {
             audit_lines.push_back(line);
         });
-    constexpr uint16_t kPort = 18150;
+    const uint16_t kPort = UniquePort();
     CHECK(api.Start("127.0.0.1", kPort, err));
 
     std::string body;
@@ -3302,8 +3374,8 @@ static void TestP1WebConfigBindingIsDeletable() {
     api.Stop();
     std::string stop_error;
     CHECK(dp.Stop(stop_error));
-    std::remove(path);
-    std::remove(lease_path);
+    std::remove(path.c_str());
+    std::remove(lease_path.c_str());
     std::remove((std::string(lease_path) + ".leases6").c_str());
 }
 
@@ -3312,16 +3384,16 @@ static void TestP1WebConfigBindingIsDeletable() {
 // this pins the ROUTE's audit record for both the duplicate and the cap path.
 static void TestP113WebRuleAddRefusalIsAudited() {
     using namespace vgww::core;
-    const char* path = "p113-rules.json";
+    const std::string path = ScratchFile("p113-rules.json");
     const std::string rules = std::string(path) + ".rules.json";
-    std::remove(path);
+    std::remove(path.c_str());
     std::error_code ec;
     std::filesystem::remove_all(rules, ec);
     vgww::web::RuleStore::Instance().AttachFile(rules);
     vgww::web::RuleStore::Instance().Clear();
 
     Config cfg;
-    cfg.web.port = 18140;
+    cfg.web.port = static_cast<uint16_t>(UniquePort());
     cfg.web.token = "tok";
     bool ok = false;
     cfg.gateway.ipv4 = ParseIpv4("192.168.55.1", ok);
@@ -3341,7 +3413,7 @@ static void TestP113WebRuleAddRefusalIsAudited() {
         [&audit_lines](const std::string& line) {
             audit_lines.push_back(line);
         });
-    constexpr uint16_t kPort = 18140;
+    const uint16_t kPort = UniquePort();
     CHECK(api.Start("127.0.0.1", kPort, err));
 
     std::string body;
@@ -3453,7 +3525,7 @@ static void TestP113WebRuleAddRefusalIsAudited() {
     api.Stop();
     vgww::web::RuleStore::Instance().AttachFile("");
     vgww::web::RuleStore::Instance().Clear();
-    std::remove(path);
+    std::remove(path.c_str());
     std::filesystem::remove_all(rules, ec);
 }
 
@@ -3462,16 +3534,16 @@ static void TestP113WebRuleAddRefusalIsAudited() {
 // The refusal must be audited.
 static void TestP122WebConfigBindingCapRefusalIsAudited() {
     using namespace vgww::core;
-    const char* path = "p122-cap.json";
+    const std::string path = ScratchFile("p122-cap.json");
     const std::string rules = std::string(path) + ".rules.json";
-    std::remove(path);
+    std::remove(path.c_str());
     std::error_code ec;
     std::filesystem::remove_all(rules, ec);
     Config cfg;
     cfg.adapter = "P122NIC";
     cfg.mode = Mode::kMain;
     cfg.dhcp.enabled = true;
-    cfg.web.port = 18142;
+    cfg.web.port = static_cast<uint16_t>(UniquePort());
     cfg.web.token = "tok";
     bool ok = false;
     cfg.gateway.ipv4 = ParseIpv4("192.168.60.1", ok);
@@ -3499,7 +3571,7 @@ static void TestP122WebConfigBindingCapRefusalIsAudited() {
     std::string err;
     CHECK(cfg.SaveToFile(path, err));
 
-    vgww::runtime::Dataplane dp(cfg, "p122_leases.json");
+    vgww::runtime::Dataplane dp(cfg, ScratchFile("p122_leases.json"));
     dp.SetDriverClient(std::make_unique<WebFakeDriver>());
     std::string start_error;
     CHECK(dp.Start(start_error));
@@ -3513,7 +3585,7 @@ static void TestP122WebConfigBindingCapRefusalIsAudited() {
         [&audit_lines](const std::string& line) {
             audit_lines.push_back(line);
         });
-    constexpr uint16_t kPort = 18142;
+    const uint16_t kPort = UniquePort();
     CHECK(api.Start("127.0.0.1", kPort, err));
 
     // Add one more binding at runtime: it lands on disk but not in the body
@@ -3562,8 +3634,8 @@ static void TestP122WebConfigBindingCapRefusalIsAudited() {
     api.Stop();
     std::string stop_error;
     CHECK(dp.Stop(stop_error));
-    std::remove(path);
-    std::remove("p122_leases.json");
+    std::remove(path.c_str());
+    std::remove(ScratchFile("p122_leases.json").c_str());
     // batch164: the v6 lease store is derived from the v4 path (LeaseFile6).
     std::remove("p122_leases.json.leases6");
     std::filesystem::remove_all(rules, ec);
@@ -3577,14 +3649,14 @@ static void TestP122WebConfigBindingCapRefusalIsAudited() {
 // this merge must too.
 static void TestP123WebConfigMergeMatchesDuidByValue() {
     using namespace vgww::core;
-    const char* path = "p123-merge.json";
+    const std::string path = ScratchFile("p123-merge.json");
     const std::string rules = std::string(path) + ".rules.json";
-    std::remove(path);
+    std::remove(path.c_str());
     std::remove(rules.c_str());
     Config cfg;
     cfg.adapter = "P123NIC";
     cfg.mode = Mode::kMain;
-    cfg.web.port = 18143;
+    cfg.web.port = static_cast<uint16_t>(UniquePort());
     cfg.web.token = "tok";
     bool ok = false;
     cfg.gateway.ipv4 = ParseIpv4("192.168.70.1", ok);
@@ -3620,7 +3692,7 @@ static void TestP123WebConfigMergeMatchesDuidByValue() {
     std::string err;
     CHECK(cfg.SaveToFile(path, err));
 
-    vgww::runtime::Dataplane dp(cfg, "p123_leases.json");
+    vgww::runtime::Dataplane dp(cfg, ScratchFile("p123_leases.json"));
     dp.SetDriverClient(std::make_unique<WebFakeDriver>());
     std::string start_error;
     CHECK(dp.Start(start_error));
@@ -3633,7 +3705,7 @@ static void TestP123WebConfigMergeMatchesDuidByValue() {
         [&audit_lines](const std::string& line) {
             audit_lines.push_back(line);
         });
-    constexpr uint16_t kPort = 18143;
+    const uint16_t kPort = UniquePort();
     CHECK(api.Start("127.0.0.1", kPort, err));
 
     // The page posts the SAME binding back with a different legal spelling:
@@ -3666,8 +3738,8 @@ static void TestP123WebConfigMergeMatchesDuidByValue() {
     api.Stop();
     std::string stop_error;
     CHECK(dp.Stop(stop_error));
-    std::remove(path);
-    std::remove("p123_leases.json");
+    std::remove(path.c_str());
+    std::remove(ScratchFile("p123_leases.json").c_str());
     // batch164: the v6 lease store is derived from the v4 path (LeaseFile6).
     std::remove("p123_leases.json.leases6");
     std::error_code ec;
@@ -3681,15 +3753,15 @@ static void TestP123WebConfigMergeMatchesDuidByValue() {
 // must be audited.
 static void TestP124WebConfigV6BindingCapRefusalIsAudited() {
     using namespace vgww::core;
-    const char* path = "p124-v6cap.json";
+    const std::string path = ScratchFile("p124-v6cap.json");
     const std::string rules = std::string(path) + ".rules.json";
-    std::remove(path);
+    std::remove(path.c_str());
     std::error_code ec;
     std::filesystem::remove_all(rules, ec);
     Config cfg;
     cfg.adapter = "P124NIC";
     cfg.mode = Mode::kMain;
-    cfg.web.port = 18144;
+    cfg.web.port = static_cast<uint16_t>(UniquePort());
     cfg.web.token = "tok";
     bool ok = false;
     cfg.gateway.ipv4 = ParseIpv4("192.168.80.1", ok);
@@ -3725,7 +3797,7 @@ static void TestP124WebConfigV6BindingCapRefusalIsAudited() {
     std::string err;
     CHECK(cfg.SaveToFile(path, err));
 
-    vgww::runtime::Dataplane dp(cfg, "p124_leases.json");
+    vgww::runtime::Dataplane dp(cfg, ScratchFile("p124_leases.json"));
     dp.SetDriverClient(std::make_unique<WebFakeDriver>());
     std::string start_error;
     CHECK(dp.Start(start_error));
@@ -3739,7 +3811,7 @@ static void TestP124WebConfigV6BindingCapRefusalIsAudited() {
         [&audit_lines](const std::string& line) {
             audit_lines.push_back(line);
         });
-    constexpr uint16_t kPort = 18144;
+    const uint16_t kPort = UniquePort();
     CHECK(api.Start("127.0.0.1", kPort, err));
 
     // Add one more binding at runtime: it lands on disk but not in the body
@@ -3787,8 +3859,8 @@ static void TestP124WebConfigV6BindingCapRefusalIsAudited() {
     api.Stop();
     std::string stop_error;
     CHECK(dp.Stop(stop_error));
-    std::remove(path);
-    std::remove("p124_leases.json");
+    std::remove(path.c_str());
+    std::remove(ScratchFile("p124_leases.json").c_str());
     // batch164: the v6 lease store is derived from the v4 path (LeaseFile6).
     std::remove("p124_leases.json.leases6");
     std::error_code ec2;
@@ -3800,16 +3872,16 @@ static void TestP124WebConfigV6BindingCapRefusalIsAudited() {
 // delete must be visible there too.
 static void TestP104RuleDeleteFailureIsAudited() {
     using namespace vgww::core;
-    const char* path = "p104-rules.json";
+    const std::string path = ScratchFile("p104-rules.json");
     const std::string rules = std::string(path) + ".rules.json";
-    std::remove(path);
+    std::remove(path.c_str());
     std::error_code ec;
     std::filesystem::remove_all(rules, ec);
     vgww::web::RuleStore::Instance().AttachFile(rules);
     vgww::web::RuleStore::Instance().Clear();
 
     Config cfg;
-    cfg.web.port = 18136;
+    cfg.web.port = static_cast<uint16_t>(UniquePort());
     cfg.web.token = "tok";
     bool ok = false;
     cfg.gateway.ipv4 = ParseIpv4("192.168.54.1", ok);
@@ -3829,7 +3901,7 @@ static void TestP104RuleDeleteFailureIsAudited() {
         [&audit_lines](const std::string& line) {
             audit_lines.push_back(line);
         });
-    constexpr uint16_t kPort = 18136;
+    const uint16_t kPort = UniquePort();
     CHECK(api.Start("127.0.0.1", kPort, err));
 
     std::string body;
@@ -3963,7 +4035,7 @@ static void TestP104RuleDeleteFailureIsAudited() {
     api.Stop();
     vgww::web::RuleStore::Instance().AttachFile("");
     vgww::web::RuleStore::Instance().Clear();
-    std::remove(path);
+    std::remove(path.c_str());
     std::filesystem::remove_all(rules, ec);
 }
 //
@@ -3979,10 +4051,11 @@ namespace {
     // known file state (the store is a process-wide singleton).
     std::string WriteRuleFile(const std::string& name,
                               const std::string& text) {
-        std::remove(name.c_str());
-        std::ofstream out(name, std::ios::binary);
+        const std::string path = ScratchFile(name.c_str());
+        std::remove(path.c_str());
+        std::ofstream out(path, std::ios::binary);
         out << text;
-        return name;
+        return path;
     }
 
     vgww::web::PortMappingRule MakeRule(const char* proto, unsigned wan,
@@ -4044,10 +4117,10 @@ static void TestB34oCorruptRuleFileIsNotSilentEmpty() {
     // SetAsideFile; the loop above removed only the original, so the aside copy
     // survived every run (measured: b34o_corrupt.json.corrupt in the
     // repository root). Preserve is the product contract; the test must clean up.
-    std::remove("b34o_corrupt.json.corrupt");
+    std::remove(ScratchFile("b34o_corrupt.json.corrupt").c_str());
     // A missing file is NOT an error: first run has no rules yet.
     {
-        const std::string path = "b34o_missing.json";
+        const std::string path = ScratchFile("b34o_missing.json");
         std::remove(path.c_str());
         RuleStore::Instance().AttachFile("");
         RuleStore::Instance().Clear();
@@ -4066,7 +4139,7 @@ static void TestB34oCorruptRuleFileIsNotSilentEmpty() {
 // gone and the operator cannot even inspect what was rejected.
 static void TestB83CorruptRulesFilePreserved() {
     using namespace vgww::web;
-    const std::string path = "b83_rules_corrupt.json";
+    const std::string path = ScratchFile("b83_rules_corrupt.json");
     const std::string aside = path + ".corrupt";
     std::remove(path.c_str());
     std::remove(aside.c_str());
@@ -4124,7 +4197,7 @@ static void TestB83CorruptRulesFilePreserved() {
 // operator's only copy of their forwards.
 static void TestB85UnreadableRulesFileIsNotOverwritten() {
     using namespace vgww::web;
-    const std::string path = "b85_rules_locked.json";
+    const std::string path = ScratchFile("b85_rules_locked.json");
     const std::string aside = path + ".corrupt";
     std::remove(path.c_str());
     std::remove(aside.c_str());
@@ -4187,7 +4260,7 @@ static void TestB85UnreadableRulesFileIsNotOverwritten() {
 // merge (the on-disk document is authoritative for what it holds).
 static void TestB87BlockedRulesRecoverWithoutRestart() {
     using namespace vgww::web;
-    const std::string path = "b87_rules_recover.json";
+    const std::string path = ScratchFile("b87_rules_recover.json");
     std::remove(path.c_str());
     {
         std::ofstream out(path, std::ios::binary);
@@ -4234,7 +4307,7 @@ static void TestB87BlockedRulesRecoverWithoutRestart() {
 // must survive, deduplicated by the same identities the loaders use.
 static void TestB88BlockedRecoveryMergesEveryRuleKind() {
     using namespace vgww::web;
-    const std::string path = "b88_rules_kinds.json";
+    const std::string path = ScratchFile("b88_rules_kinds.json");
     std::remove(path.c_str());
     {
         std::ofstream out(path, std::ios::binary);
@@ -4306,7 +4379,7 @@ static void TestB88BlockedRecoveryMergesEveryRuleKind() {
 // unsaved.
 static void TestB89RecoveryQuarantinesCorruptFile() {
     using namespace vgww::web;
-    const std::string path = "b89_rules_corrupt.json";
+    const std::string path = ScratchFile("b89_rules_corrupt.json");
     const std::string aside = path + ".corrupt";
     std::remove(path.c_str());
     std::remove(aside.c_str());
@@ -4367,7 +4440,7 @@ static void TestB89RecoveryQuarantinesCorruptFile() {
 // parseable with no temp leftovers.
 static void TestB90ConcurrentBlockedRecovery() {
     using namespace vgww::web;
-    const std::string path = "b90_rules_concurrent.json";
+    const std::string path = ScratchFile("b90_rules_concurrent.json");
     std::remove(path.c_str());
     {
         std::ofstream out(path, std::ios::binary);
@@ -4468,16 +4541,16 @@ static void TestB90ConcurrentBlockedRecovery() {
 static void TestB92MutationReportsPersistFailure() {
     using namespace vgww::core;
     using namespace vgww::web;
-    const char* path = "b92_status.json";
+    const std::string path = ScratchFile("b92_status.json");
     const std::string rules = std::string(path) + ".rules.json";
-    std::remove(path);
+    std::remove(path.c_str());
     std::error_code ec;
     std::filesystem::remove_all(rules, ec);
     // A DIRECTORY at the rules path makes every write fail permanently.
     CHECK(std::filesystem::create_directory(rules, ec));
 
     Config cfg;
-    cfg.web.port = 18326;
+    cfg.web.port = static_cast<uint16_t>(UniquePort());
     bool ok = false;
     cfg.gateway.ipv4 = ParseIpv4("192.168.0.42", ok);
     cfg.gateway.mask = ParseIpv4("255.255.255.0", ok);
@@ -4490,7 +4563,7 @@ static void TestB92MutationReportsPersistFailure() {
     vgww::runtime::Dataplane dp(cfg);
     HttpServer api;
     vgww::web::RegisterApi(api, dp, cfg, path);
-    constexpr uint16_t kPort = 18326;
+    const uint16_t kPort = UniquePort();
     std::string start_err;
     CHECK(api.Start("127.0.0.1", kPort, start_err));
 
@@ -4513,7 +4586,7 @@ static void TestB92MutationReportsPersistFailure() {
     CHECK(std::filesystem::exists(rules));
 
     api.Stop();
-    std::remove(path);
+    std::remove(path.c_str());
     std::filesystem::remove_all(rules, ec);
 }
 
@@ -4526,10 +4599,10 @@ static void TestB92MutationReportsPersistFailure() {
 // teardown so the operator knows the mappings are gone.
 static void TestB101StatusExposesLeasePersistFailures() {
     using namespace vgww::core;
-    const char* cfg_path = "b101_config.json";
-    const char* lease_path = "b101_leases.json";
-    std::remove(cfg_path);
-    std::remove(lease_path);
+    const std::string cfg_path = ScratchFile("b101_config.json");
+    const std::string lease_path = ScratchFile("b101_leases.json");
+    std::remove(cfg_path.c_str());
+    std::remove(lease_path.c_str());
     Config cfg;
     cfg.adapter = "B101NIC";
     cfg.mode = Mode::kMain;
@@ -4553,7 +4626,7 @@ static void TestB101StatusExposesLeasePersistFailures() {
 
     HttpServer api;
     vgww::web::RegisterApi(api, dp, cfg, cfg_path, "b101-secret");
-    constexpr uint16_t kP = 18101;
+    const uint16_t kP = UniquePort();
     CHECK(api.Start("127.0.0.1", kP, err));
     {
         // batch101: the status surface must carry the stop-durability verdict
@@ -4602,9 +4675,9 @@ static void TestB101StatusExposesLeasePersistFailures() {
     // The directory is still in place, so the stop-time snapshot failed too.
     CHECK(dp.StopPersistFailed());
     std::filesystem::remove(lease_path, ec);
-    std::remove(cfg_path);
+    std::remove(cfg_path.c_str());
     std::remove((std::string(cfg_path) + ".rules.json").c_str());
-    std::remove(lease_path);
+    std::remove(lease_path.c_str());
 }
 
 // batch106: the rule document (and the lease documents) reach disk through
@@ -4613,7 +4686,7 @@ static void TestB101StatusExposesLeasePersistFailures() {
 // destination's lock, a rule mutation must block; it completes on release.
 static void TestB106RulesWriteUsesCrossProcessLock() {
     using namespace vgww::web;
-    const std::string rules = "b106_rules.json.rules.json";
+    const std::string rules = ScratchFile("b106_rules.json.rules.json");
     std::remove(rules.c_str());
     RuleStore& store = RuleStore::Instance();
     store.AttachFile(rules);
@@ -4658,10 +4731,10 @@ static void TestB106RulesWriteUsesCrossProcessLock() {
 
 static void TestB93DhcpBindingPersistsToConfig() {
     using namespace vgww::core;
-    const char* cfg_path = "b93_config.json";
-    const char* lease_path = "b93_leases.json";
-    std::remove(cfg_path);
-    std::remove(lease_path);
+    const std::string cfg_path = ScratchFile("b93_config.json");
+    const std::string lease_path = ScratchFile("b93_leases.json");
+    std::remove(cfg_path.c_str());
+    std::remove(lease_path.c_str());
     Config cfg;
     cfg.adapter = "B93NIC";
     cfg.mode = Mode::kMain;
@@ -4699,7 +4772,7 @@ static void TestB93DhcpBindingPersistsToConfig() {
 
     HttpServer api;
     vgww::web::RegisterApi(api, dp, cfg, cfg_path, "boot-secret");
-    constexpr uint16_t kP = 18098;
+    const uint16_t kP = UniquePort();
     CHECK(api.Start("127.0.0.1", kP, err));
 
     MacAddress want{};
@@ -4803,7 +4876,7 @@ static void TestB93DhcpBindingPersistsToConfig() {
     // applies, but the route says it is not durable.
     HttpServer api2;
     vgww::web::RegisterApi(api2, dp, cfg, "", "boot-secret");
-    constexpr uint16_t kP2 = 18097;
+    const uint16_t kP2 = UniquePort();
     CHECK(api2.Start("127.0.0.1", kP2, err));
     CHECK(200 == HttpPost(kP2, "/api/dhcp/bindings", "boot-secret",
                           R"({"mac":"02:00:00:00:93:02","ip":"192.168.41.211"})",
@@ -4813,8 +4886,8 @@ static void TestB93DhcpBindingPersistsToConfig() {
 
     std::string stop_error;
     dp.Stop(stop_error);
-    std::remove(cfg_path);
-    std::remove(lease_path);
+    std::remove(cfg_path.c_str());
+    std::remove(lease_path.c_str());
     // batch164: the v6 lease store is derived from the v4 path (LeaseFile6),
     // so a v6-enabled Dataplane writes `<path>.leases6` beside the v4 file.
     // The test removed only the v4 path (measured: b93_leases.json.leases6,
@@ -4990,7 +5063,7 @@ static void TestB34oRuleRemovalIsByIdentity() {
 // directory) always fails, with no mocks and no permission games.
 static void TestB34oPersistFailureIsCountedAndNotDurable() {
     using namespace vgww::web;
-    const std::string dir = "b34o_persist_dir";
+    const std::string dir = ScratchFile("b34o_persist_dir");
     std::error_code ec;
     std::filesystem::remove_all(dir, ec);
     CHECK(std::filesystem::create_directory(dir, ec));
@@ -5068,7 +5141,8 @@ static void TestB34rWrongMethodIs405Not404() {
         return Response::Json("{\"ok\":true}");
     });
     std::string err;
-    CHECK(srv.Start("127.0.0.1", 18311, err));
+    const uint16_t kPort = UniquePort();
+    CHECK(srv.Start("127.0.0.1", kPort, err));
     if (!err.empty()) {
         std::fprintf(stderr, "b34r start: %s\n", err.c_str());
     }
@@ -5089,7 +5163,7 @@ static void TestB34rWrongMethodIs405Not404() {
     };
     for (const Case& c : cases) {
         std::string text;
-        const int status = HttpRawFull(18311, c.request, text);
+        const int status = HttpRawFull(kPort, c.request, text);
         std::printf("b34r method(%s): status=%d\n", c.name, status);
         CHECK(405 == status);
     }
@@ -5098,7 +5172,7 @@ static void TestB34rWrongMethodIs405Not404() {
     {
         std::string text;
         const int status = HttpRawFull(
-            18311,
+            kPort,
             "POST /api/b34r/nope HTTP/1.1\r\nHost: t\r\nContent-Length: 0\r\n"
             "Connection: close\r\n\r\n",
             text);
@@ -5120,10 +5194,11 @@ static void TestB34rInternalErrorDoesNotLeakText() {
         throw std::runtime_error("SECRET-INTERNAL-MARKER-42");
     });
     std::string err;
-    CHECK(srv.Start("127.0.0.1", 18312, err));
+    const uint16_t kPort = UniquePort();
+    CHECK(srv.Start("127.0.0.1", kPort, err));
     std::string text;
     const int status = HttpRawFull(
-        18312,
+        kPort,
         "GET /api/b34r/boom HTTP/1.1\r\nHost: t\r\nConnection: close\r\n\r\n",
         text);
     const size_t body_at = text.find("\r\n\r\n");
@@ -5164,7 +5239,7 @@ static void TestHandlerThrowOutsideDispatchKeepsTheWorker() {
         return pass;
     });
     std::string err;
-    constexpr uint16_t kPort = 18313;
+    const uint16_t kPort = UniquePort();
     CHECK(srv.Start("127.0.0.1", kPort, err));
     CHECK(0 == srv.HandlerErrors());
 
@@ -5214,7 +5289,7 @@ static void TestAcceptHandlerThrowKeepsAccepting() {
         }
     });
     std::string err;
-    constexpr uint16_t kPort = 18314;
+    const uint16_t kPort = UniquePort();
     CHECK(srv.Start("127.0.0.1", kPort, err));
     CHECK(0 == srv.HandlerErrors());
 
@@ -5258,7 +5333,7 @@ static void TestAcceptRearmThrowIsContained() {
         return Response::Text("alive", 200);
     });
     std::string err;
-    constexpr uint16_t kPort = 18319;
+    const uint16_t kPort = UniquePort();
     CHECK(srv.Start("127.0.0.1", kPort, err));
 
     std::string body;
@@ -5296,13 +5371,13 @@ static void TestAcceptRearmThrowIsContained() {
 static void TestBStatusExposesFirewallCounts() {
     using namespace vgww::core;
     using namespace vgww::web;
-    const char* path = "bfw-status.json";
+    const std::string path = ScratchFile("bfw-status.json");
     const std::string rules = std::string(path) + ".rules.json";
-    std::remove(path);
+    std::remove(path.c_str());
     std::remove(rules.c_str());
 
     Config cfg;
-    cfg.web.port = 18323;
+    cfg.web.port = static_cast<uint16_t>(UniquePort());
     bool ok = false;
     cfg.gateway.ipv4 = ParseIpv4("192.168.0.40", ok);
     cfg.gateway.mask = ParseIpv4("255.255.255.0", ok);
@@ -5315,7 +5390,7 @@ static void TestBStatusExposesFirewallCounts() {
     vgww::runtime::Dataplane dp(cfg);
     HttpServer api;
     vgww::web::RegisterApi(api, dp, cfg, path);
-    constexpr uint16_t kPort = 18323;
+    const uint16_t kPort = UniquePort();
     std::string start_err;
     CHECK(api.Start("127.0.0.1", kPort, start_err));
 
@@ -5358,7 +5433,7 @@ static void TestBStatusExposesFirewallCounts() {
 
     api.SetAcceptProbeForTest(nullptr);
     api.Stop();
-    std::remove(path);
+    std::remove(path.c_str());
     std::remove(rules.c_str());
 }
 
@@ -5370,9 +5445,9 @@ static void TestBStatusExposesFirewallCounts() {
 static void TestB86StatusExposesPersistenceHealth() {
     using namespace vgww::core;
     using namespace vgww::web;
-    const char* path = "b86-status.json";
-    const std::string rules_path = "b86-rules.json";
-    std::remove(path);
+    const std::string path = ScratchFile("b86-status.json");
+    const std::string rules_path = ScratchFile("b86-rules.json");
+    std::remove(path.c_str());
     std::remove(rules_path.c_str());
     {
         // A valid rules document that the loader will (simulated) fail to
@@ -5382,7 +5457,7 @@ static void TestB86StatusExposesPersistenceHealth() {
     }
 
     Config cfg;
-    cfg.web.port = 18324;
+    cfg.web.port = static_cast<uint16_t>(UniquePort());
     bool ok = false;
     cfg.gateway.ipv4 = ParseIpv4("192.168.0.41", ok);
     cfg.gateway.mask = ParseIpv4("255.255.255.0", ok);
@@ -5395,7 +5470,7 @@ static void TestB86StatusExposesPersistenceHealth() {
     vgww::runtime::Dataplane dp(cfg);
     HttpServer api;
     vgww::web::RegisterApi(api, dp, cfg, path);
-    constexpr uint16_t kPort = 18324;
+    const uint16_t kPort = UniquePort();
     std::string start_err;
     CHECK(api.Start("127.0.0.1", kPort, start_err));
 
@@ -5424,7 +5499,7 @@ static void TestB86StatusExposesPersistenceHealth() {
     RuleStore::Instance().AttachFile("");
     RuleStore::Instance().Clear();
     api.Stop();
-    std::remove(path);
+    std::remove(path.c_str());
     std::remove(rules_path.c_str());
 }
 
@@ -5529,10 +5604,11 @@ static void TestB34rEmptyTokenNeverDisablesAuth() {
         return Response::Json("{\"ok\":true}");
     });
     std::string err;
-    CHECK(srv.Start("127.0.0.1", 18313, err));
+    const uint16_t kPort = UniquePort();
+    CHECK(srv.Start("127.0.0.1", kPort, err));
     std::string text;
     const int status = HttpRawFull(
-        18313,
+        kPort,
         "POST /api/b34r/write HTTP/1.1\r\nHost: t\r\nContent-Length: 0\r\n"
         "Connection: close\r\n\r\n",
         text);
@@ -5561,12 +5637,13 @@ static void TestB34rQueryTokenIsNotAccepted() {
         return Response::Json("{\"ok\":true}");
     });
     std::string err;
-    CHECK(srv.Start("127.0.0.1", 18314, err));
+    const uint16_t kPort = UniquePort();
+    CHECK(srv.Start("127.0.0.1", kPort, err));
 
     std::string text;
     // Correct secret, but in the query string only -> rejected.
     const int via_query = HttpRawFull(
-        18314,
+        kPort,
         "POST /api/b34r/write?token=s3cret HTTP/1.1\r\nHost: t\r\n"
         "Content-Length: 0\r\nConnection: close\r\n\r\n",
         text);
@@ -5576,7 +5653,7 @@ static void TestB34rQueryTokenIsNotAccepted() {
     // The same secret in the header -> accepted (proves the rejection above
     // is about the CHANNEL, not about the secret being wrong).
     const int via_header = HttpRawFull(
-        18314,
+        kPort,
         "POST /api/b34r/write HTTP/1.1\r\nHost: t\r\nX-Auth-Token: s3cret\r\n"
         "Content-Length: 0\r\nConnection: close\r\n\r\n",
         text);
@@ -5597,12 +5674,13 @@ static void TestB34rQueryTokenIsNotAccepted() {
 // change, and the endpoint itself has no side effects.
 static void TestB207AuthVerifyProbeIsGuarded() {
     using namespace vgww::core;
-    const char* path = "b207-auth-verify.json";
+    const std::string path = ScratchFile("b207-auth-verify.json");
     const std::string rules = std::string(path) + ".rules.json";
-    std::remove(path);
+    std::remove(path.c_str());
     std::remove(rules.c_str());
     Config cfg;
-    cfg.web.port = 18327;
+    const uint16_t cfg_port = static_cast<uint16_t>(UniquePort());
+    cfg.web.port = cfg_port;
     bool ok = false;
     cfg.gateway.ipv4 = ParseIpv4("192.168.0.40", ok);
     cfg.gateway.mask = ParseIpv4("255.255.255.0", ok);
@@ -5613,7 +5691,7 @@ static void TestB207AuthVerifyProbeIsGuarded() {
     std::string err;
     CHECK(cfg.SaveToFile(path, err));
 
-    const auto read_file = [](const char* p) {
+    const auto read_file = [](const std::string& p) {
         std::ifstream in(p, std::ios::binary);
         std::ostringstream out;
         out << in.rdbuf();
@@ -5648,22 +5726,23 @@ static void TestB207AuthVerifyProbeIsGuarded() {
                                },
                                [](const Config&, uint64_t) { return true; });
         std::string se;
-        CHECK(api.Start("127.0.0.1", 18327, se));
+        const uint16_t kPort = UniquePort();
+        CHECK(api.Start("127.0.0.1", kPort, se));
         std::string body;
 
         // The defect itself: a GET is NOT authenticated, which is why probing
         // with GET /api/config could never prove anything.
-        CHECK(HttpGet("/api/config", 18327, body) == 200);
+        CHECK(HttpGet("/api/config", kPort, body) == 200);
 
         // Correct token -> 200 and the documented JSON answer.
-        const int good = post_with(18327, "X-Auth-Token: secret\r\n", body);
+        const int good = post_with(kPort, "X-Auth-Token: secret\r\n", body);
         std::printf("b207 verify(good x-auth-token): status=%d body=[%s]\n",
                     good, body.c_str());
         CHECK(good == 200);
         CHECK(body.find("\"ok\":true") != std::string::npos);
 
         // Bearer form is accepted exactly like X-Auth-Token.
-        CHECK(post_with(18327, "Authorization: Bearer secret\r\n", body) ==
+        CHECK(post_with(kPort, "Authorization: Bearer secret\r\n", body) ==
               200);
         CHECK(body.find("\"ok\":true") != std::string::npos);
 
@@ -5673,7 +5752,7 @@ static void TestB207AuthVerifyProbeIsGuarded() {
         {
             std::string text;
             const int bare = HttpRawFull(
-                18327,
+                kPort,
                 "POST /api/auth/verify HTTP/1.1\r\nHost: t\r\n"
                 "X-Auth-Token: secret\r\nConnection: close\r\n\r\n",
                 text);
@@ -5688,13 +5767,13 @@ static void TestB207AuthVerifyProbeIsGuarded() {
 
         // Wrong token -> 401 from the guard, and the refusal is audited the
         // same way every other guard refusal is.
-        CHECK(post_with(18327, "X-Auth-Token: wrong\r\n", body) == 401);
+        CHECK(post_with(kPort, "X-Auth-Token: wrong\r\n", body) == 401);
         CHECK(body.find("unauthorized") != std::string::npos);
         CHECK(audit.find("request refused (unauthorized: invalid token)") !=
               std::string::npos);
 
         // No credential presented at all -> 401, not 200.
-        CHECK(post_with(18327, "", body) == 401);
+        CHECK(post_with(kPort, "", body) == 401);
 
         // The probe must not be a disguised write: the persisted configuration
         // is byte-identical after every call above.
@@ -5707,12 +5786,12 @@ static void TestB207AuthVerifyProbeIsGuarded() {
     //     is the same semantics every other write route already has
     //     (web_api.cpp 2275-2277). ---
     {
-        const char* path2 = "b207-auth-verify-empty.json";
+        const std::string path2 = ScratchFile("b207-auth-verify-empty.json");
         const std::string rules2 = std::string(path2) + ".rules.json";
-        std::remove(path2);
+        std::remove(path2.c_str());
         std::remove(rules2.c_str());
         Config cfg2 = cfg;
-        cfg2.web.port = 18328;
+        cfg2.web.port = static_cast<uint16_t>(UniquePort());
         cfg2.web.token.clear();
         CHECK(cfg2.SaveToFile(path2, err));
         vgww::runtime::Dataplane dp(cfg2);
@@ -5720,16 +5799,17 @@ static void TestB207AuthVerifyProbeIsGuarded() {
         vgww::web::RegisterApi(api2, dp, cfg2, path2, /*auth_token=*/{}, {},
                                {}, {}, {});
         std::string se;
-        CHECK(api2.Start("127.0.0.1", 18328, se));
+        const uint16_t kPort2 = UniquePort();
+        CHECK(api2.Start("127.0.0.1", kPort2, se));
         std::string body;
-        CHECK(post_with(18328, "", body) == 200);
+        CHECK(post_with(kPort2, "", body) == 200);
         CHECK(body.find("\"ok\":true") != std::string::npos);
         api2.Stop();
-        std::remove(path2);
+        std::remove(path2.c_str());
         std::remove(rules2.c_str());
     }
 
-    std::remove(path);
+    std::remove(path.c_str());
     std::remove(rules.c_str());
 }
 
@@ -5742,29 +5822,30 @@ static void TestB207AuthVerifyProbeIsGuarded() {
 static void TestB34rBodyCapAndTraversal() {
     using namespace vgww::web;
     HttpServer srv;
-    srv.ServeStatic("b34r_www");
+    srv.ServeStatic(ScratchFile("b34r_www"));
     srv.Route("POST", "/api/b34r/write", [](const Request&) {
         return Response::Json("{\"ok\":true}");
     });
     std::error_code ec;
-    std::filesystem::remove_all("b34r_www", ec);
-    std::filesystem::create_directories("b34r_www", ec);
+    std::filesystem::remove_all(ScratchFile("b34r_www"), ec);
+    std::filesystem::create_directories(ScratchFile("b34r_www"), ec);
     {
-        std::ofstream f("b34r_www/ok.txt");
+        std::ofstream f(ScratchFile("b34r_www") + "/ok.txt");
         f << "inside";
     }
     {
         // A secret that must never be served through the static handler.
-        std::ofstream f("b34r_secret.txt");
+        std::ofstream f(ScratchFile("b34r_secret.txt"));
         f << "DO-NOT-SERVE-THIS";
     }
     std::string err;
-    CHECK(srv.Start("127.0.0.1", 18315, err));
+    const uint16_t kPort = UniquePort();
+    CHECK(srv.Start("127.0.0.1", kPort, err));
 
     std::string text;
     // 1) Oversized declared body: rejected, and nothing is allocated for it.
     const int big = HttpRawFull(
-        18315,
+        kPort,
         "POST /api/b34r/write HTTP/1.1\r\nHost: t\r\n"
         "Content-Length: 300000000\r\nConnection: close\r\n\r\n",
         text);
@@ -5781,7 +5862,7 @@ static void TestB34rBodyCapAndTraversal() {
     };
     for (const char* attempt : attempts) {
         std::string t;
-        const int status = HttpRawFull(18315, attempt, t);
+        const int status = HttpRawFull(kPort, attempt, t);
         const size_t at = t.find("\r\n\r\n");
         const std::string body =
             (std::string::npos == at) ? std::string() : t.substr(at + 4);
@@ -5794,14 +5875,14 @@ static void TestB34rBodyCapAndTraversal() {
     {
         std::string t;
         const int status = HttpRawFull(
-            18315,
+            kPort,
             "GET /ok.txt HTTP/1.1\r\nHost: t\r\nConnection: close\r\n\r\n", t);
         CHECK(200 == status);
         CHECK(std::string::npos != t.find("inside"));
     }
     srv.Stop();
-    std::filesystem::remove_all("b34r_www", ec);
-    std::remove("b34r_secret.txt");
+    std::filesystem::remove_all(ScratchFile("b34r_www"), ec);
+    std::remove(ScratchFile("b34r_secret.txt").c_str());
 }
 
 // batch80: publishing a saved config must survive a TRANSIENT busy
@@ -5819,14 +5900,14 @@ static void TestB34rBodyCapAndTraversal() {
 // whole call and asserts the failure is NOT swallowed.
 static void TestB80PublishSurvivesBusyDestination() {
     using namespace vgww::core;
-    const char* kPath = "b80publish.json";
+    const std::string kPath = ScratchFile("b80publish.json");
     const std::string kTmp = std::string(kPath) + ".tmp." +
                              std::to_string(::GetCurrentProcessId()) + ".b80";
-    std::remove(kPath);
+    std::remove(kPath.c_str());
     std::remove(kTmp.c_str());
     const auto seed = [&](const char* text) {
         FILE* f = nullptr;
-        const std::wstring w(kPath, kPath + std::strlen(kPath));
+        const std::wstring w(kPath.begin(), kPath.end());
         ::_wfopen_s(&f, w.c_str(), L"wb");
         if (nullptr != f) {
             ::fwrite(text, 1, std::strlen(text), f);
@@ -5853,7 +5934,7 @@ static void TestB80PublishSurvivesBusyDestination() {
     // Hold the DESTINATION denying write/delete sharing.
     const auto hold_destination = [&](int hold_ms) {
         const HANDLE h = ::CreateFileA(
-            kPath, GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING,
+            kPath.c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING,
             FILE_ATTRIBUTE_NORMAL, nullptr);
         if (INVALID_HANDLE_VALUE == h) {
             return static_cast<HANDLE>(nullptr);
@@ -5872,7 +5953,7 @@ static void TestB80PublishSurvivesBusyDestination() {
         seed("original");
         seed_tmp();
         const HANDLE h = ::CreateFileA(
-            kPath, GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING,
+            kPath.c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING,
             FILE_ATTRIBUTE_NORMAL, nullptr);
         CHECK(INVALID_HANDLE_VALUE != h);
         std::thread releaser([&] {
@@ -5890,7 +5971,7 @@ static void TestB80PublishSurvivesBusyDestination() {
     std::printf("B80 transient-hold failures=%d/3\n", transient_failures);
     CHECK(0 == transient_failures);
     CHECK(std::string("payload") == read_back());
-    std::remove(kPath);
+    std::remove(kPath.c_str());
 
     // (2) Permanent hold: the publish must FAIL and must not silently claim
     //     success (the negative control - proves the retry budget terminates).
@@ -5910,7 +5991,7 @@ static void TestB80PublishSurvivesBusyDestination() {
     CHECK(std::string("original") == read_back());
     // The temp file is cleaned up on the failure path.
     CHECK(!std::filesystem::exists(kTmp));
-    std::remove(kPath);
+    std::remove(kPath.c_str());
 }
 
 // batch164: the temp file cleanup itself must be retried. An indexer or AV
@@ -5928,16 +6009,16 @@ static void TestB80PublishSurvivesBusyDestination() {
 // delete attempt and the temp stays (the assertion goes red).
 static void TestB164TempCleanupSurvivesBusyHolder() {
     using namespace vgww::core;
-    const char* kPath = "b164publish.json";
+    const std::string kPath = ScratchFile("b164publish.json");
     const std::string kTmp = std::string(kPath) + ".tmp." +
                              std::to_string(::GetCurrentProcessId()) + ".b164";
-    std::remove(kPath);
+    std::remove(kPath.c_str());
     std::remove(kTmp.c_str());
 
     // Seed the destination so the publish has something to replace.
     {
         FILE* f = nullptr;
-        const std::wstring w(kPath, kPath + std::strlen(kPath));
+        const std::wstring w(kPath.begin(), kPath.end());
         ::_wfopen_s(&f, w.c_str(), L"wb");
         if (nullptr != f) {
             ::fwrite("original", 1, 8, f);
@@ -5962,7 +6043,7 @@ static void TestB164TempCleanupSurvivesBusyHolder() {
         FILE_ATTRIBUTE_NORMAL, nullptr);
     CHECK(INVALID_HANDLE_VALUE != htmp);
     const HANDLE hdst = ::CreateFileA(
-        kPath, GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING,
+        kPath.c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING,
         FILE_ATTRIBUTE_NORMAL, nullptr);
     CHECK(INVALID_HANDLE_VALUE != hdst);
     std::thread releaser([&] {
@@ -5984,7 +6065,7 @@ static void TestB164TempCleanupSurvivesBusyHolder() {
     CHECK(!std::filesystem::exists(kTmp));   // ... and the temp must not survive
     ::CloseHandle(htmp);
     std::remove(kTmp.c_str());
-    std::remove(kPath);
+    std::remove(kPath.c_str());
 }
 
 // batch85: a Content-Length that is not 1*DIGIT (RFC 9110 8.6 / RFC 9112 6.3)
@@ -6327,23 +6408,23 @@ static void TestB100AbsolutePathCannotEscapeStaticRoot() {
     using namespace vgww::web;
     namespace fs = std::filesystem;
     std::error_code ec;
-    fs::remove_all("b100_www", ec);
-    fs::create_directories("b100_www", ec);
+    fs::remove_all(ScratchFile("b100_www"), ec);
+    fs::create_directories(ScratchFile("b100_www"), ec);
     {
-        std::ofstream f("b100_www/ok.txt");
+        std::ofstream f(ScratchFile("b100_www") + "/ok.txt");
         f << "inside-b100";
     }
     {
-        std::ofstream f("b100_secret.txt");
+        std::ofstream f(ScratchFile("b100_secret.txt"));
         f << "DO-NOT-SERVE-B100";
     }
 
     HttpServer srv;
     // Absolute root on purpose: that is how main.cpp wires the real server.
-    const std::string root_abs = fs::absolute("b100_www").string();
+    const std::string root_abs = fs::absolute(ScratchFile("b100_www")).string();
     srv.ServeStatic(root_abs);
     std::string err;
-    constexpr uint16_t kPort = 18316;
+    const uint16_t kPort = UniquePort();
     CHECK(srv.Start("127.0.0.1", kPort, err));
 
     const auto fetch = [&](const std::string& target, std::string& text) {
@@ -6361,7 +6442,7 @@ static void TestB100AbsolutePathCannotEscapeStaticRoot() {
     }
 
     // The escape: a same-drive ABSOLUTE path with no ".." in it at all.
-    std::string secret_abs = fs::absolute("b100_secret.txt").string();
+    std::string secret_abs = fs::absolute(ScratchFile("b100_secret.txt")).string();
     for (char& c : secret_abs) {
         if ('\\' == c) c = '/';
     }
@@ -6383,8 +6464,8 @@ static void TestB100AbsolutePathCannotEscapeStaticRoot() {
     }
 
     srv.Stop();
-    fs::remove_all("b100_www", ec);
-    std::remove("b100_secret.txt");
+    fs::remove_all(ScratchFile("b100_www"), ec);
+    std::remove(ScratchFile("b100_secret.txt").c_str());
 }
 
 static void TestB99MalformedHeaderBlockRejected() {
@@ -6397,7 +6478,7 @@ static void TestB99MalformedHeaderBlockRejected() {
                               "}");
     });
     std::string error;
-    constexpr uint16_t kPort = 18097;
+    const uint16_t kPort = UniquePort();
     CHECK(srv.Start("127.0.0.1", kPort, error));
 
     const auto raw = [&](const std::string& request) {
@@ -6461,7 +6542,7 @@ static void TestB98DuplicateContentLengthRejected() {
                               "}");
     });
     std::string error;
-    constexpr uint16_t kPort = 18096;
+    const uint16_t kPort = UniquePort();
     CHECK(srv.Start("127.0.0.1", kPort, error));
 
     const auto raw = [&](const std::string& request) {
@@ -6502,7 +6583,7 @@ static void TestB97RequestLineRequiresHttpVersion() {
         return Response::Json("{\"ok\":true}");
     });
     std::string error;
-    constexpr uint16_t kPort = 18095;
+    const uint16_t kPort = UniquePort();
     CHECK(srv.Start("127.0.0.1", kPort, error));
 
     const auto raw = [&](const std::string& request) {
@@ -6543,7 +6624,8 @@ static void TestB85InvalidContentLengthRejected() {
         return Response::Json("{\"ok\":true}");
     });
     std::string err;
-    CHECK(srv.Start("127.0.0.1", 18321, err));
+    const uint16_t kPort = UniquePort();
+    CHECK(srv.Start("127.0.0.1", kPort, err));
 
     const char* bad_values[] = {"abc", "12abc", "-1", "1e5", "0x10",
                                 "1, 1", ""};
@@ -6553,7 +6635,7 @@ static void TestB85InvalidContentLengthRejected() {
             std::string("POST /api/b85/echo HTTP/1.1\r\nHost: t\r\n"
                         "Content-Length: ") +
             value + "\r\nConnection: close\r\n\r\nPAYLOAD";
-        const int status = HttpRawFull(18321, request, t);
+        const int status = HttpRawFull(kPort, request, t);
         if (400 != status) {
             std::fprintf(stderr,
                          "b85: Content-Length [%s] answered %d, expected 400\n",
@@ -6572,7 +6654,7 @@ static void TestB85InvalidContentLengthRejected() {
         seen_body = "sentinel";
         std::string t;
         const int status = HttpRawFull(
-            18321,
+            kPort,
             "POST /api/b85/echo HTTP/1.1\r\nHost: t\r\nContent-Length:  5\t\r\n"
             "Connection: close\r\n\r\nPAYLOAD",
             t);
@@ -6589,7 +6671,7 @@ static void TestB85InvalidContentLengthRejected() {
             "POST /api/b85/echo HTTP/1.1\r\nHost: t\r\nContent-Length: " +
             std::to_string(payload.size()) +
             "\r\nConnection: close\r\n\r\n" + payload;
-        const int status = HttpRawFull(18321, request, t);
+        const int status = HttpRawFull(kPort, request, t);
         std::printf("b85 valid content-length: status=%d body_len=%zu\n",
                     status, seen_body.size());
         CHECK(200 == status);
@@ -6600,7 +6682,7 @@ static void TestB85InvalidContentLengthRejected() {
         seen_body = "sentinel";
         std::string t;
         const int status = HttpRawFull(
-            18321,
+            kPort,
             "POST /api/b85/echo HTTP/1.1\r\nHost: t\r\nContent-Length: 0\r\n"
             "Connection: close\r\n\r\n",
             t);
@@ -6629,12 +6711,12 @@ static void TestB85InvalidContentLengthRejected() {
 // The two routes each carried their own copy of the parse, so both are
 // exercised: a test on one route would not prove the other was migrated.
 static void TestB108DeleteIndexMustBeAllDigits() {
-    constexpr uint16_t kApiPort = 18110;
-    std::remove("b108.json.rules.json");
+    const uint16_t kApiPort = UniquePort();
+    std::remove(ScratchFile("b108.json.rules.json").c_str());
     vgww::core::Config cfg;
     vgww::runtime::Dataplane dp(cfg);
     HttpServer api;
-    vgww::web::RegisterApi(api, dp, cfg, "b108.json");
+    vgww::web::RegisterApi(api, dp, cfg, ScratchFile("b108.json"));
     std::string error;
     CHECK(api.Start("127.0.0.1", kApiPort, error));
     std::string body;
@@ -6737,7 +6819,7 @@ static void TestB108DeleteIndexMustBeAllDigits() {
 
     vgww::web::RuleStore::Instance().Clear();
     api.Stop();
-    std::remove("b108.json.rules.json");
+    std::remove(ScratchFile("b108.json.rules.json").c_str());
 }
 
 // batch120: Response::Error is the single funnel for every JSON error body, and
@@ -6816,9 +6898,9 @@ static void TestB120ErrorBodyKeepsControlCharacters() {
 // The contract is the same round-trip rule batch120 established: parse the body
 // and the text field must equal the provider's text byte for byte.
 static void TestB121WebApiEscapeKeepsControlCharacters() {
-    const char* path = "b121console.json";
+    const std::string path = ScratchFile("b121console.json");
     const std::string rules = std::string(path) + ".rules.json";
-    std::remove(path);
+    std::remove(path.c_str());
     std::remove(rules.c_str());
 
     // A three-line log with a tab, a CR and a quote - the shapes the console
@@ -6836,7 +6918,7 @@ static void TestB121WebApiEscapeKeepsControlCharacters() {
     HttpServer api;
     vgww::web::RegisterApi(api, dp, cfg, path, {},
                            [provider_text] { return provider_text; });
-    constexpr uint16_t kP = 18097;
+    const uint16_t kP = UniquePort();
     std::string start_err;
     CHECK(api.Start("127.0.0.1", kP, start_err));
 
@@ -6871,7 +6953,7 @@ static void TestB121WebApiEscapeKeepsControlCharacters() {
         CHECK(got.find("\"hi\"") != std::string::npos);
     }
     api.Stop();
-    std::remove(path);
+    std::remove(path.c_str());
     std::remove(rules.c_str());
 }
 
@@ -6887,7 +6969,7 @@ static void TestB121WebApiEscapeKeepsControlCharacters() {
         store.AttachFile("");
         store.Clear();
 
-        const std::string path = "b141-bans.json";
+        const std::string path = ScratchFile("b141-bans.json");
         std::remove(path.c_str());
         {
             std::ofstream out(path, std::ios::binary);
@@ -6974,7 +7056,7 @@ static void TestB121WebApiEscapeKeepsControlCharacters() {
         store.Clear();
 
         // --- the FILE obeys the same rule, and the collapse is COUNTED -----
-        const std::string path = "b144-bans.json";
+        const std::string path = ScratchFile("b144-bans.json");
         std::remove(path.c_str());
         {
             std::ofstream out(path, std::ios::binary);
@@ -7095,7 +7177,7 @@ static void TestB121WebApiEscapeKeepsControlCharacters() {
         store.Clear();
 
         // --- ids survive a persistence round trip ---------------------------
-        const std::string path = "b138-rules.json";
+        const std::string path = ScratchFile("b138-rules.json");
         std::remove(path.c_str());
         store.AttachFile(path);
         vgww::web::PortMappingRule c;
@@ -7556,7 +7638,7 @@ static void TestP82ReadRuleDocumentAndMerge() {
 static void TestP82TombstoneLifecycle() {
     using namespace vgww::web;
     auto& store = RuleStore::Instance();
-    const std::string path = "p82_life.json.rules.json";
+    const std::string path = ScratchFile("p82_life.json.rules.json");
     std::remove(path.c_str());
     store.AttachFile("");
     store.Clear();
@@ -7670,7 +7752,7 @@ static void TestP82TombstoneLifecycle() {
 static void TestP82DiskInjectionMergesForeignRules() {
     using namespace vgww::web;
     auto& store = RuleStore::Instance();
-    const std::string path = "p82_inject.json.rules.json";
+    const std::string path = ScratchFile("p82_inject.json.rules.json");
     std::remove(path.c_str());
     store.AttachFile("");
     store.Clear();
@@ -7708,7 +7790,7 @@ static void TestP82DiskInjectionMergesForeignRules() {
 static void TestP82DeleteIsNotResurrected() {
     using namespace vgww::web;
     auto& store = RuleStore::Instance();
-    const std::string path = "p82_nores.json.rules.json";
+    const std::string path = ScratchFile("p82_nores.json.rules.json");
     std::remove(path.c_str());
     store.AttachFile("");
     store.Clear();
@@ -7755,7 +7837,7 @@ static void TestP82DeleteIsNotResurrected() {
 static void TestP82TombstoneFullRefusesDelete() {
     using namespace vgww::web;
     auto& store = RuleStore::Instance();
-    const std::string path = "p82_full.json.rules.json";
+    const std::string path = ScratchFile("p82_full.json.rules.json");
     std::string text = "{\"version\":2,\"removed\":[";
     for (size_t i = 0; i < kMaxTombstones; ++i) {
         if (i) text += ",";
@@ -7896,9 +7978,9 @@ static void TestB206MergeTombstonesConvergesToCap() {
 static void TestP82HttpDeleteDistinguishes404And500() {
     using namespace vgww::web;
     using namespace vgww::core;
-    const char* cfg_path = "p82_http.json";
+    const std::string cfg_path = ScratchFile("p82_http.json");
     const std::string rules = std::string(cfg_path) + ".rules.json";
-    std::remove(cfg_path);
+    std::remove(cfg_path.c_str());
     std::remove(rules.c_str());
     std::string text = "{\"version\":2,\"removed\":[";
     for (size_t i = 0; i < kMaxTombstones; ++i) {
@@ -7912,7 +7994,7 @@ static void TestP82HttpDeleteDistinguishes404And500() {
         out << text;
     }
     Config cfg;
-    cfg.web.port = 18120;
+    cfg.web.port = static_cast<uint16_t>(UniquePort());
     bool ok = false;
     cfg.gateway.ipv4 = ParseIpv4("192.168.0.40", ok);
     cfg.gateway.mask = ParseIpv4("255.255.255.0", ok);
@@ -7924,14 +8006,14 @@ static void TestP82HttpDeleteDistinguishes404And500() {
     vgww::runtime::Dataplane dp(cfg);
     HttpServer api;
     RegisterApi(api, dp, cfg, cfg_path);
-    constexpr uint16_t kPort = 18120;
+    const uint16_t kPort = UniquePort();
     std::string start_err;
     CHECK(api.Start("127.0.0.1", kPort, start_err));
     std::string body;
     CHECK(HttpDelete("/api/portmap?id=999999", kPort, body) == 404);
     CHECK(HttpDelete("/api/portmap?id=50", kPort, body) == 500);
     api.Stop();
-    std::remove(cfg_path);
+    std::remove(cfg_path.c_str());
     std::remove(rules.c_str());
 }
 
@@ -7945,7 +8027,7 @@ static void TestP82HttpDeleteDistinguishes404And500() {
 // can block the mutation.
 static void TestP82LockReentrantSameThread() {
     using namespace vgww::web;
-    const std::string rules = "p82_reentrant.json.rules.json";
+    const std::string rules = ScratchFile("p82_reentrant.json.rules.json");
     std::remove(rules.c_str());
     RuleStore& store = RuleStore::Instance();
     store.AttachFile(rules);
@@ -7957,8 +8039,8 @@ static void TestP82LockReentrantSameThread() {
     // The test holds the OVERRIDDEN name, so only the outer lock can block the
     // mutation - the internal lock alone cannot.
     vgww::core::SetConfigLockNameOverrideForTest(
-        [](const std::string& path) -> std::string {
-            return "p82-outer-" + path;
+        [](const std::string&) -> std::string {
+            return "p82-outer";
         });
     vgww::core::ConfigFileLock lock(rules);
     CHECK(lock.locked());
@@ -7989,7 +8071,7 @@ static void TestP82LockReentrantSameThread() {
 // immediately -> the assertion below turns red.
 static void TestP82OuterLockBlocksTheFlush() {
     using namespace vgww::web;
-    const std::string rules = "p82_outer.json.rules.json";
+    const std::string rules = ScratchFile("p82_outer.json.rules.json");
     std::remove(rules.c_str());
     RuleStore& store = RuleStore::Instance();
     store.AttachFile(rules);
@@ -8001,8 +8083,8 @@ static void TestP82OuterLockBlocksTheFlush() {
     // same mutex. The internal WriteFileAtomicDurable takes the REAL name and
     // therefore does NOT block - so only the outer lock can hold the mutation.
     vgww::core::SetConfigLockNameOverrideForTest(
-        [](const std::string& path) -> std::string {
-            return "p82-outer-" + path;
+        [](const std::string&) -> std::string {
+            return "p82-outer";
         });
     vgww::core::ConfigFileLock lock(rules);
     CHECK(lock.locked());
@@ -8044,7 +8126,7 @@ static int P82WorkerMain(int argc, char** argv) {
     }
     const std::string path = argv[2];
     const std::string op = argv[3];
-    const std::wstring base = L"Local\\vgww-p82-" + P82Wide(argv[4]);
+    const std::wstring base = P82EventBase(argv[4]);
     vgww::web::RuleStore& store = vgww::web::RuleStore::Instance();
     store.AttachFile(path);
     HANDLE ready =
@@ -8101,9 +8183,10 @@ static void TestP82CrossProcessWorker() {
 #ifdef _WIN32
     using namespace vgww::web;
     auto& store = RuleStore::Instance();
-    const std::string path = "p82worker.json.rules.json";
+    const std::string path = ScratchFile("p82worker.json.rules.json");
     const std::string id_path = path + ".worker_id";
-    const std::string tag = "add";
+    const std::string tag = "add-" +
+            std::to_string(::GetCurrentProcessId());
     uint64_t parent_id = 0;
     std::remove(path.c_str());
     std::remove(id_path.c_str());
@@ -8116,7 +8199,7 @@ static void TestP82CrossProcessWorker() {
     store.AttachFile(path);
     CHECK(store.PortMaps().size() == 1);
 
-    const std::wstring base = L"Local\\vgww-p82-" + P82Wide(tag);
+    const std::wstring base = P82EventBase(tag);
     HANDLE ready =
         ::CreateEventW(nullptr, TRUE, FALSE, (base + L"-ready").c_str());
     HANDLE go = ::CreateEventW(nullptr, TRUE, FALSE, (base + L"-go").c_str());
@@ -8206,8 +8289,9 @@ static void TestP82WorkerDeletesTheTombstonedRule() {
 #ifdef _WIN32
     using namespace vgww::web;
     auto& store = RuleStore::Instance();
-    const std::string path = "p82worker3.json.rules.json";
-    const std::string tag = "del2";
+    const std::string path = ScratchFile("p82worker3.json.rules.json");
+    const std::string tag = "del2-" +
+            std::to_string(::GetCurrentProcessId());
     std::remove(path.c_str());
     {
         std::ofstream out(path, std::ios::binary);
@@ -8222,7 +8306,7 @@ static void TestP82WorkerDeletesTheTombstonedRule() {
     store.AttachFile(path);
     CHECK(store.PortMaps().size() == 2);
 
-    const std::wstring base = L"Local\\vgww-p82-" + P82Wide(tag);
+    const std::wstring base = P82EventBase(tag);
     HANDLE ready =
         ::CreateEventW(nullptr, TRUE, FALSE, (base + L"-ready").c_str());
     HANDLE go = ::CreateEventW(nullptr, TRUE, FALSE, (base + L"-go").c_str());
@@ -8299,8 +8383,9 @@ static void TestP82CrossProcessDeleteNotResurrected() {
 #ifdef _WIN32
     using namespace vgww::web;
     auto& store = RuleStore::Instance();
-    const std::string path = "p82worker2.json.rules.json";
-    const std::string tag = "del";
+    const std::string path = ScratchFile("p82worker2.json.rules.json");
+    const std::string tag = "del-" +
+            std::to_string(::GetCurrentProcessId());
     std::remove(path.c_str());
     {
         std::ofstream out(path, std::ios::binary);
@@ -8315,7 +8400,7 @@ static void TestP82CrossProcessDeleteNotResurrected() {
     store.AttachFile(path);
     CHECK(store.PortMaps().size() == 2);
 
-    const std::wstring base = L"Local\\vgww-p82-" + P82Wide(tag);
+    const std::wstring base = P82EventBase(tag);
     HANDLE ready =
         ::CreateEventW(nullptr, TRUE, FALSE, (base + L"-ready").c_str());
     HANDLE go = ::CreateEventW(nullptr, TRUE, FALSE, (base + L"-go").c_str());
@@ -8415,7 +8500,23 @@ int main(int argc, char** argv) {
     server.Route("POST", "/api/echo", [](const Request& r) {
         return Response::Json("{\"echo\":\"" + r.body + "\"}");
     });
-    server.ServeStatic("../../www");
+    {
+        // A per-instance copy of the real www/ so parallel instances cannot
+        // race on one file inside the repository tree.
+        const std::string static_root = ScratchFile("www_static");
+        std::error_code ec;
+        std::filesystem::remove_all(static_root, ec);
+        std::filesystem::create_directories(static_root, ec);
+        for (const auto& entry :
+             std::filesystem::directory_iterator(RepoRoot() / "www", ec)) {
+            if (!entry.is_regular_file()) continue;
+            std::filesystem::copy_file(
+                entry.path(), std::filesystem::path(static_root) /
+                                  entry.path().filename(),
+                std::filesystem::copy_options::overwrite_existing, ec);
+        }
+        server.ServeStatic(static_root);
+    }
     // S6 U9: a decoded path with a space must be routable; "%20" is an
     // alternative spelling of the same path when a query is absent too.
     server.Route("GET", "/my page", [](const Request&) {
@@ -8424,7 +8525,7 @@ int main(int argc, char** argv) {
 
     // Port 0 = OS-assigned; we need the real one, so bind a known test port.
     std::string error;
-    constexpr uint16_t kPort = 18080;
+    const uint16_t kPort = UniquePort();
     CHECK(server.Start("127.0.0.1", kPort, error));
     if (!error.empty()) {
         std::fprintf(stderr, "start error: %s\n", error.c_str());
@@ -8436,7 +8537,7 @@ int main(int argc, char** argv) {
 
     CHECK(HttpGet("/api/missing", kPort, body) == 404);
 
-    // Static file from www/ (repo layout relative to the test CWD).
+    // Static file from www/ (repo layout; located from the exe, not the CWD).
     CHECK(HttpGet("/", kPort, body) == 200);
     CHECK(body.find("VGWW") != std::string::npos);
 
@@ -8459,14 +8560,17 @@ int main(int argc, char** argv) {
     // Static file serving caps the body size so one huge file cannot pin
     // memory (5 MiB limit).
     {
-        const char* big = "../../www/_big_test.bin";
+        const std::string big =
+            (std::filesystem::path(ScratchFile("www_static")) /
+             "_big_test.bin")
+                .string();
         {
             std::ofstream out(big, std::ios::binary);
             const std::string block(1024 * 1024, 'x');
             for (int i = 0; i < 6; ++i) out << block;
         }
         CHECK(HttpGet("/_big_test.bin", kPort, body) != 200);
-        std::remove(big);
+        std::remove(big.c_str());
     }
 
     // The server must still be alive and serving after the abuse above.
@@ -8512,9 +8616,9 @@ int main(int argc, char** argv) {
     //            name and answers 500. With one process-wide sequence the web
     //            writer continues past 0 and succeeds.
     {
-        const char* kCfgU1x = "u1cross.json";
+        const std::string kCfgU1x = ScratchFile("u1cross.json");
         const std::string kRulesU1x = std::string(kCfgU1x) + ".rules.json";
-        std::remove(kCfgU1x);
+        std::remove(kCfgU1x.c_str());
         std::remove(kRulesU1x.c_str());
         const auto make_valid = [](uint16_t web_port) {
             vgww::core::Config c;
@@ -8546,7 +8650,7 @@ int main(int argc, char** argv) {
         vgww::runtime::Dataplane dp(cfg);
         HttpServer api_u1x;
         vgww::web::RegisterApi(api_u1x, dp, cfg, kCfgU1x);
-        constexpr uint16_t kPortU1x = 18099;
+        const uint16_t kPortU1x = UniquePort();
         std::string start_err;
         CHECK(api_u1x.Start("127.0.0.1", kPortU1x, start_err));
 
@@ -8585,7 +8689,7 @@ int main(int argc, char** argv) {
         CHECK(web_status == 200);
         ::CloseHandle(hold);
         std::remove(tmp0.c_str());
-        std::remove(kCfgU1x);
+        std::remove(kCfgU1x.c_str());
         std::remove(kRulesU1x.c_str());
     }
 
@@ -8595,8 +8699,8 @@ int main(int argc, char** argv) {
     //      never leave a corrupt config behind: the final file must round-trip
     //      through LoadFromFile. ---
     {
-        const char* kCfgU1 = "u1cfg.json";
-        std::remove(kCfgU1);
+        const std::string kCfgU1 = ScratchFile("u1cfg.json");
+        std::remove(kCfgU1.c_str());
         const std::string tmp_path = std::string(kCfgU1) + ".tmp";
         std::remove(tmp_path.c_str());
         std::atomic<bool> go{false};
@@ -8654,7 +8758,7 @@ int main(int argc, char** argv) {
             }
             CHECK(ok);  // U1 red: corrupt tmp race
         }
-        std::remove(kCfgU1);
+        std::remove(kCfgU1.c_str());
         std::remove(tmp_path.c_str());
     }
 
@@ -8803,17 +8907,18 @@ int main(int argc, char** argv) {
         }
         return Response::Error(401, "unauthorized");
     });
-    CHECK(guarded.Start("127.0.0.1", kPort + 1, error));
+    const uint16_t kGuardPort = UniquePort();
+    CHECK(guarded.Start("127.0.0.1", kGuardPort, error));
 
     // GET passes without a token; POST without a token is rejected.
-    CHECK(HttpGet("/api/open", kPort + 1, body) == 200);
-    CHECK(HttpPost(kPort + 1, "/api/mutate", "", "{}", body) == 401);
-    CHECK(HttpPost(kPort + 1, "/api/mutate", "wrong", "{}", body) == 401);
-    CHECK(HttpPost(kPort + 1, "/api/mutate", "sekret", "{}", body) == 200);
+    CHECK(HttpGet("/api/open", kGuardPort, body) == 200);
+    CHECK(HttpPost(kGuardPort, "/api/mutate", "", "{}", body) == 401);
+    CHECK(HttpPost(kGuardPort, "/api/mutate", "wrong", "{}", body) == 401);
+    CHECK(HttpPost(kGuardPort, "/api/mutate", "sekret", "{}", body) == 200);
     // Same token with no space after the colon must still authenticate.
     {
         std::string out;
-        const int st = HttpRaw(kPort + 1,
+        const int st = HttpRaw(kGuardPort,
                                "POST /api/mutate HTTP/1.1\r\nHost: t\r\n"
                                "X-Auth-Token:sekret\r\nContent-Length:0\r\n"
                                "Connection: close\r\n\r\n",
@@ -8826,32 +8931,33 @@ int main(int argc, char** argv) {
     {
         // Rule persistence uses config_path + ".rules.json"; start clean so a
         // stale file from a previous run cannot poison the assertions.
-        std::remove("unused.json.rules.json");
+        std::remove(ScratchFile("unused.json.rules.json").c_str());
         vgww::core::Config cfg;
         vgww::runtime::Dataplane dp(cfg);
         HttpServer api;
-        vgww::web::RegisterApi(api, dp, cfg, "unused.json");
-        CHECK(api.Start("127.0.0.1", kPort + 2, error));
+        vgww::web::RegisterApi(api, dp, cfg, ScratchFile("unused.json"));
+        const uint16_t kApi2Port = UniquePort();
+        CHECK(api.Start("127.0.0.1", kApi2Port, error));
 
         const std::string rule =
             "{\"proto\":\"tcp\",\"wan_port\":8080,"
             "\"lan_ip\":\"192.168.1.50\",\"lan_port\":80}";
-        CHECK(HttpPost(kPort + 2, "/api/portmap", "", rule, body) == 200);
+        CHECK(HttpPost(kApi2Port, "/api/portmap", "", rule, body) == 200);
         const std::string rule2 =
             "{\"proto\":\"tcp\",\"wan_port\":8081,"
             "\"lan_ip\":\"192.168.1.51\",\"lan_port\":81}";
-        CHECK(HttpPost(kPort + 2, "/api/portmap", "", rule2, body) == 200);
-        CHECK(HttpGet("/api/portmap", kPort + 2, body) == 200);
+        CHECK(HttpPost(kApi2Port, "/api/portmap", "", rule2, body) == 200);
+        CHECK(HttpGet("/api/portmap", kApi2Port, body) == 200);
         CHECK(body.find("8081") != std::string::npos);
 
         // WebUI calls DELETE /api/portmap?index=N to drop a rule.
-        CHECK(HttpDelete("/api/portmap?index=0", kPort + 2, body) == 200);
-        CHECK(HttpGet("/api/portmap", kPort + 2, body) == 200);
+        CHECK(HttpDelete("/api/portmap?index=0", kApi2Port, body) == 200);
+        CHECK(HttpGet("/api/portmap", kApi2Port, body) == 200);
         CHECK(body.find("8080") == std::string::npos);
         CHECK(body.find("8081") != std::string::npos);
 
-        CHECK(HttpDelete("/api/portmap?index=99", kPort + 2, body) == 404);
-        CHECK(HttpDelete("/api/portmap", kPort + 2, body) == 400);
+        CHECK(HttpDelete("/api/portmap?index=99", kApi2Port, body) == 404);
+        CHECK(HttpDelete("/api/portmap", kApi2Port, body) == 400);
 
         // batch140: the web writer must store the SAME spelling the native UI
         // stores. ParseIpv4 accepts a leading-zero octet ("192.168.001.050"),
@@ -8862,12 +8968,12 @@ int main(int argc, char** argv) {
         {
             auto& store = vgww::web::RuleStore::Instance();
             const size_t before = store.PortMaps().size();
-            CHECK(HttpPost(kPort + 2, "/api/portmap", "",
+            CHECK(HttpPost(kApi2Port, "/api/portmap", "",
                            "{\"proto\":\"tcp\",\"wan_port\":18090,"
                            "\"lan_ip\":\"192.168.001.050\",\"lan_port\":90}",
                            body) == 200);
             CHECK(store.PortMaps().size() == before + 1);
-            CHECK(HttpGet("/api/portmap", kPort + 2, body) == 200);
+            CHECK(HttpGet("/api/portmap", kApi2Port, body) == 200);
             CHECK(body.find("192.168.1.50") != std::string::npos);
             CHECK(body.find("192.168.001.050") == std::string::npos);
             // Clean up the rule this block added (shared singleton store).
@@ -8891,21 +8997,21 @@ int main(int argc, char** argv) {
             via_id.lan_port = 81;
             const uint64_t keep_id = store.AddPortMapTracked(via_id);
             CHECK(0 != keep_id);
-            CHECK(HttpGet("/api/portmap", kPort + 2, body) == 200);
+            CHECK(HttpGet("/api/portmap", kApi2Port, body) == 200);
             CHECK(body.find("\"id\":" + std::to_string(keep_id)) !=
                   std::string::npos);
             // Malformed / zero / unknown ids are refused, never "index 0".
-            CHECK(HttpDelete("/api/portmap?id=", kPort + 2, body) == 400);
-            CHECK(HttpDelete("/api/portmap?id=0", kPort + 2, body) == 400);
-            CHECK(HttpDelete("/api/portmap?id=abc", kPort + 2, body) == 400);
-            CHECK(HttpDelete("/api/portmap?id=999999", kPort + 2, body) == 404);
+            CHECK(HttpDelete("/api/portmap?id=", kApi2Port, body) == 400);
+            CHECK(HttpDelete("/api/portmap?id=0", kApi2Port, body) == 400);
+            CHECK(HttpDelete("/api/portmap?id=abc", kApi2Port, body) == 400);
+            CHECK(HttpDelete("/api/portmap?id=999999", kApi2Port, body) == 404);
             CHECK(store.PortMaps().size() == before + 1);
             CHECK(HttpDelete("/api/portmap?id=" + std::to_string(keep_id),
-                             kPort + 2, body) == 200);
+                             kApi2Port, body) == 200);
             CHECK(store.PortMaps().size() == before);
             // The same id is now unknown: no double delete.
             CHECK(HttpDelete("/api/portmap?id=" + std::to_string(keep_id),
-                             kPort + 2, body) == 404);
+                             kApi2Port, body) == 404);
         }
         // batch34d: the delete must be ONE atomic check-and-erase. The old
         // path read size() under one lock and erased under another, so a
@@ -8937,15 +9043,15 @@ int main(int argc, char** argv) {
         // value can never enter the store - the XSS surface is closed by
         // validation, not by output escaping. A non-tcp proto is rejected
         // outright (the data plane would silently never bind the WAN port).
-        CHECK(HttpPost(kPort + 2, "/api/portmap", "",
+        CHECK(HttpPost(kApi2Port, "/api/portmap", "",
                        "{\"proto\":\"tcp\",\"wan_port\":8082,"
                        "\"lan_ip\":\"192.168.1.5\\\"2\",\"lan_port\":82}",
                        body) == 400);
-        CHECK(HttpPost(kPort + 2, "/api/portmap", "",
+        CHECK(HttpPost(kApi2Port, "/api/portmap", "",
                        "{\"proto\":\"udp\",\"wan_port\":8083,"
                        "\"lan_ip\":\"192.168.1.53\",\"lan_port\":83}",
                        body) == 400);
-        CHECK(HttpPost(kPort + 2, "/api/portmap", "",
+        CHECK(HttpPost(kApi2Port, "/api/portmap", "",
                        "{\"proto\":\"icmp\",\"wan_port\":8084,"
                        "\"lan_ip\":\"192.168.1.54\",\"lan_port\":84}",
                        body) == 400);
@@ -8953,7 +9059,7 @@ int main(int argc, char** argv) {
         // /api/status must expose the full stats set so the dashboard and
         // debugging have the complete picture (rx_dropped, passthrough and
         // the VLAN counters were previously invisible).
-        CHECK(HttpGet("/api/status", kPort + 2, body) == 200);
+        CHECK(HttpGet("/api/status", kApi2Port, body) == 200);
         CHECK(body.find("\"rx_dropped\"") != std::string::npos);
         CHECK(body.find("\"host_passthrough\"") != std::string::npos);
         CHECK(body.find("\"rx_vlan_frames\"") != std::string::npos);
@@ -8962,7 +9068,7 @@ int main(int argc, char** argv) {
         // /api/clients drives the device table (IP/MAC/per-second rates) and
         // the LAN column (batch22 A8-1) - the column must come from the API's
         // own `lan` boolean, so the field has to be part of the payload schema.
-        CHECK(HttpGet("/api/clients", kPort + 2, body) == 200);
+        CHECK(HttpGet("/api/clients", kApi2Port, body) == 200);
         CHECK(body.find("\"clients\"") != std::string::npos);
         // The `lan` boolean the new column reads is emitted by the same
         // serializer for every reported client (web_api.cpp:881,
@@ -8973,7 +9079,7 @@ int main(int argc, char** argv) {
         // process's own counters are exposed (the whole-machine numbers are
         // irrelevant to the UI). Fields must exist (values may be zero before
         // the first control-loop sample).
-        CHECK(HttpGet("/api/system", kPort + 2, body) == 200);
+        CHECK(HttpGet("/api/system", kApi2Port, body) == 200);
         CHECK(body.find("\"proc\"") != std::string::npos);
         CHECK(body.find("\"cpu_percent\"") != std::string::npos);
         CHECK(body.find("\"cores\"") != std::string::npos);
@@ -8984,7 +9090,7 @@ int main(int argc, char** argv) {
         // blank the whole UI. It must round-trip the effective adapter,
         // gateway and perf sections as JSON.
         body.clear();
-        CHECK(HttpGet("/api/config", kPort + 2, body) == 200);
+        CHECK(HttpGet("/api/config", kApi2Port, body) == 200);
         CHECK(body.find("\"adapter\"") != std::string::npos);
         CHECK(body.find("\"gateway\"") != std::string::npos);
         CHECK(body.find("\"ipv4\"") != std::string::npos);
@@ -9015,7 +9121,7 @@ int main(int argc, char** argv) {
         // path). Malformed payloads must be rejected and leave the file
         // untouched; the old file must still satisfy a later GET.
         body.clear();
-        CHECK(HttpPost(kPort + 2, "/api/config", "",
+        CHECK(HttpPost(kApi2Port, "/api/config", "",
                        "{\"adapter\":\"x\","
                        "\"gateway\":{\"ipv4\":\"192.168.0.40\","
                        "\"mask\":\"255.255.255.0\","
@@ -9027,9 +9133,9 @@ int main(int argc, char** argv) {
                        "\"perf\":{\"workers\":4,\"max_conns\":4096}}",
                        body) == 200);
         CHECK(body.find("\"ok\"") != std::string::npos);
-        CHECK(HttpPost(kPort + 2, "/api/config", "", "{ not json",
+        CHECK(HttpPost(kApi2Port, "/api/config", "", "{ not json",
                        body) == 400);
-        CHECK(HttpPost(kPort + 2, "/api/config", "",
+        CHECK(HttpPost(kApi2Port, "/api/config", "",
                        "{\"gateway\":{\"ipv4\":\"not-an-ip\"}}",
                        body) == 400);
 
@@ -9039,7 +9145,7 @@ int main(int argc, char** argv) {
         // configuration rejected" - exactly how a UI that forgot the Number()
         // conversion surfaced as "save failed". Pin both directions here.
         body.clear();
-        CHECK(HttpPost(kPort + 2, "/api/config", "",
+        CHECK(HttpPost(kApi2Port, "/api/config", "",
                        "{\"adapter\":\"x\","
                        "\"gateway\":{\"ipv4\":\"192.168.0.40\","
                        "\"mask\":\"255.255.255.0\","
@@ -9051,7 +9157,7 @@ int main(int argc, char** argv) {
                        body) == 400);
         CHECK(body.find("invalid configuration rejected") != std::string::npos);
         body.clear();
-        CHECK(HttpPost(kPort + 2, "/api/config", "",
+        CHECK(HttpPost(kApi2Port, "/api/config", "",
                        "{\"adapter\":\"x\","
                        "\"gateway\":{\"ipv4\":\"192.168.0.40\","
                        "\"mask\":\"255.255.255.0\","
@@ -9071,7 +9177,7 @@ int main(int argc, char** argv) {
         // double quote (config.cpp ParseMode: mode must be "bypass" or
         // "main"). Response::Json does not escape, so without JsonEscaped the
         // body stops being parseable JSON and the UI falls back to raw text.
-        CHECK(HttpPost(kPort + 2, "/api/config", "",
+        CHECK(HttpPost(kApi2Port, "/api/config", "",
                        "{\"adapter\":\"x\","
                        "\"gateway\":{\"ipv4\":\"192.168.0.40\","
                        "\"mask\":\"255.255.255.0\","
@@ -9093,7 +9199,7 @@ int main(int argc, char** argv) {
             }
         }
         body.clear();
-        CHECK(HttpPost(kPort + 2, "/api/config", "",
+        CHECK(HttpPost(kApi2Port, "/api/config", "",
                        "{\"adapter\":\"x\","
                        "\"gateway\":{\"ipv4\":\"192.168.0.40\","
                        "\"mask\":\"255.255.255.0\","
@@ -9107,7 +9213,7 @@ int main(int argc, char** argv) {
             // POST persists to config_path + ".tmp" and atomically renames
             // over config_path, so the on-disk copy is the wire payload: the
             // numbers must be there unquoted (a string would have been 400).
-            std::ifstream in("unused.json", std::ios::binary);
+            std::ifstream in(ScratchFile("unused.json"), std::ios::binary);
             CHECK(in.good());
             if (in.good()) {
                 std::stringstream ss;
@@ -9120,19 +9226,19 @@ int main(int argc, char** argv) {
         // Ban rules validate eagerly: an unsupported kind (e.g. "domain",
         // which the data plane would silently no-op) or a malformed value
         // is rejected instead of being stored as a fake rule.
-        CHECK(HttpPost(kPort + 2, "/api/bans", "",
+        CHECK(HttpPost(kApi2Port, "/api/bans", "",
                        "{\"kind\":\"domain\",\"value\":\"example.com\"}",
                        body) == 400);
-        CHECK(HttpPost(kPort + 2, "/api/bans", "",
+        CHECK(HttpPost(kApi2Port, "/api/bans", "",
                        "{\"kind\":\"ip\",\"value\":\"not-an-ip\"}",
                        body) == 400);
-        CHECK(HttpPost(kPort + 2, "/api/bans", "",
+        CHECK(HttpPost(kApi2Port, "/api/bans", "",
                        "{\"kind\":\"mac\",\"value\":\"zz:zz\"}",
                        body) == 400);
-        CHECK(HttpPost(kPort + 2, "/api/bans", "",
+        CHECK(HttpPost(kApi2Port, "/api/bans", "",
                        "{\"kind\":\"mac\",\"value\":\"AA:BB:CC:DD:EE:FF\"}",
                        body) == 200);
-        CHECK(HttpGet("/api/bans", kPort + 2, body) == 200);
+        CHECK(HttpGet("/api/bans", kApi2Port, body) == 200);
         CHECK(body.find("AA:BB:CC:DD:EE:FF") != std::string::npos);
 
         // batch144: a second POST for the SAME target is idempotent, not a
@@ -9140,7 +9246,7 @@ int main(int argc, char** argv) {
         {
             auto& ban_store = vgww::web::RuleStore::Instance();
             const size_t before = ban_store.Bans().size();
-            CHECK(HttpPost(kPort + 2, "/api/bans", "",
+            CHECK(HttpPost(kApi2Port, "/api/bans", "",
                            "{\"kind\":\"mac\",\"value\":\"aa-bb-cc-dd-ee-ff\"}",
                            body) == 200);
             CHECK(ban_store.Bans().size() == before);
@@ -9155,14 +9261,14 @@ int main(int argc, char** argv) {
         {
             auto& store = vgww::web::RuleStore::Instance();
             const size_t before = store.Bans().size();
-            CHECK(HttpPost(kPort + 2, "/api/bans", "",
+            CHECK(HttpPost(kApi2Port, "/api/bans", "",
                            "{\"kind\":\"ip\",\"value\":\"192.168.001.050\"}",
                            body) == 200);
             CHECK(store.Bans().size() == before + 1);
             if (store.Bans().size() == before + 1) {
                 CHECK(store.Bans().back().value == "192.168.1.50");
             }
-            CHECK(HttpGet("/api/bans", kPort + 2, body) == 200);
+            CHECK(HttpGet("/api/bans", kApi2Port, body) == 200);
             CHECK(body.find("192.168.1.50") != std::string::npos);
             CHECK(body.find("192.168.1.40") == std::string::npos);
             if (store.Bans().size() > before) {
@@ -9173,13 +9279,13 @@ int main(int argc, char** argv) {
 
         // DELETE index parsing mirrors the portmap guard: trailing junk must
         // not silently resolve to 0 and delete the first ban.
-        CHECK(HttpDelete("/api/bans?index=abc", kPort + 2, body) == 400);
-        CHECK(HttpDelete("/api/bans?index=99", kPort + 2, body) == 404);
+        CHECK(HttpDelete("/api/bans?index=abc", kApi2Port, body) == 400);
+        CHECK(HttpDelete("/api/bans?index=99", kApi2Port, body) == 404);
 
         // batch138: bans gained the same stable-identity handle as rules.
         {
             auto& store = vgww::web::RuleStore::Instance();
-            CHECK(HttpGet("/api/bans", kPort + 2, body) == 200);
+            CHECK(HttpGet("/api/bans", kApi2Port, body) == 200);
             const size_t at = body.find("\"id\":");
             CHECK(at != std::string::npos);
             uint64_t first_id = 0;
@@ -9188,68 +9294,68 @@ int main(int argc, char** argv) {
             }
             CHECK(0 != first_id);
             const size_t before = store.Bans().size();
-            CHECK(HttpDelete("/api/bans?id=", kPort + 2, body) == 400);
-            CHECK(HttpDelete("/api/bans?id=0", kPort + 2, body) == 400);
-            CHECK(HttpDelete("/api/bans?id=999999", kPort + 2, body) == 404);
+            CHECK(HttpDelete("/api/bans?id=", kApi2Port, body) == 400);
+            CHECK(HttpDelete("/api/bans?id=0", kApi2Port, body) == 400);
+            CHECK(HttpDelete("/api/bans?id=999999", kApi2Port, body) == 404);
             CHECK(store.Bans().size() == before);
             if (0 != first_id) {
                 CHECK(HttpDelete("/api/bans?id=" + std::to_string(first_id),
-                                 kPort + 2, body) == 200);
+                                 kApi2Port, body) == 200);
                 CHECK(store.Bans().size() == before - 1);
                 CHECK(HttpDelete("/api/bans?id=" + std::to_string(first_id),
-                                 kPort + 2, body) == 404);
+                                 kApi2Port, body) == 404);
             }
         }
 
         // Rate-limit rules key on the client MAC: a malformed value would
         // silently throttle nobody (a plausible-but-broken fake), so it is
         // rejected exactly like /api/bans values.
-        CHECK(HttpPost(kPort + 2, "/api/ratelimit", "",
+        CHECK(HttpPost(kApi2Port, "/api/ratelimit", "",
                        "{\"mac\":\"garbage\",\"uplink_kbps\":100,"
                        "\"downlink_kbps\":50}",
                        body) == 400);
         // kbps fields that are present but unparseable must not silently
         // fall back to 0 (unlimited) - a fake rate limit.
-        CHECK(HttpPost(kPort + 2, "/api/ratelimit", "",
+        CHECK(HttpPost(kApi2Port, "/api/ratelimit", "",
                        "{\"mac\":\"AA:BB:CC:DD:EE:10\","
                        "\"uplink_kbps\":-5,\"downlink_kbps\":1}",
                        body) == 400);
-        CHECK(HttpPost(kPort + 2, "/api/ratelimit", "",
+        CHECK(HttpPost(kApi2Port, "/api/ratelimit", "",
                        "{\"mac\":\"AA:BB:CC:DD:EE:10\","
                        "\"uplink_kbps\":5000000000,\"downlink_kbps\":1}",
                        body) == 400);
-        CHECK(HttpPost(kPort + 2, "/api/ratelimit", "",
+        CHECK(HttpPost(kApi2Port, "/api/ratelimit", "",
                        "{\"mac\":\"AA:BB:CC:DD:EE:10\","
                        "\"uplink_kbps\":\"100\",\"downlink_kbps\":1}",
                        body) == 400);
-        CHECK(HttpPost(kPort + 2, "/api/ratelimit", "",
+        CHECK(HttpPost(kApi2Port, "/api/ratelimit", "",
                        "{\"mac\":\"AA:BB:CC:DD:EE:FF\",\"uplink_kbps\":100,"
                        "\"downlink_kbps\":50}",
                        body) == 200);
-        CHECK(HttpGet("/api/ratelimit", kPort + 2, body) == 200);
+        CHECK(HttpGet("/api/ratelimit", kApi2Port, body) == 200);
         CHECK(body.find("AA:BB:CC:DD:EE:FF") != std::string::npos);
 
         // P8: one canonical spelling regardless of how the value was POSTed.
         // The store/UI previously echoed the client's raw text, so the same
         // rule rendered differently per writer. Ingest now canonicalises:
         // MAC -> core::FormatMac (UPPERCASE colon), IP -> asio canonical text.
-        CHECK(HttpPost(kPort + 2, "/api/bans", "",
+        CHECK(HttpPost(kApi2Port, "/api/bans", "",
                        "{\"kind\":\"mac\",\"value\":\"aa-bb-cc-dd-ee-77\"}",
                        body) == 200);
-        CHECK(HttpPost(kPort + 2, "/api/bans", "",
+        CHECK(HttpPost(kApi2Port, "/api/bans", "",
                        "{\"kind\":\"ip\",\"value\":\"2001:DB8::0001\"}",
                        body) == 200);
-        CHECK(HttpGet("/api/bans", kPort + 2, body) == 200);
+        CHECK(HttpGet("/api/bans", kApi2Port, body) == 200);
         CHECK(body.find("AA:BB:CC:DD:EE:77") != std::string::npos);
         CHECK(body.find("aa-bb-cc-dd-ee-77") == std::string::npos);
         CHECK(body.find("2001:db8::1") != std::string::npos);
         CHECK(body.find("2001:DB8::0001") == std::string::npos);
 
-        CHECK(HttpPost(kPort + 2, "/api/ratelimit", "",
+        CHECK(HttpPost(kApi2Port, "/api/ratelimit", "",
                        "{\"mac\":\"aa-bb-cc-dd-ee-88\",\"uplink_kbps\":10,"
                        "\"downlink_kbps\":10}",
                        body) == 200);
-        CHECK(HttpGet("/api/ratelimit", kPort + 2, body) == 200);
+        CHECK(HttpGet("/api/ratelimit", kApi2Port, body) == 200);
         CHECK(body.find("AA:BB:CC:DD:EE:88") != std::string::npos);
         CHECK(body.find("aa-bb-cc-dd-ee-88") == std::string::npos);
 
@@ -9265,39 +9371,39 @@ int main(int argc, char** argv) {
         // was left with NO cap at all.
         //
         // (a) Replace succeeds: old key gone, new key carries the new values.
-        CHECK(HttpPost(kPort + 2, "/api/ratelimit", "",
+        CHECK(HttpPost(kApi2Port, "/api/ratelimit", "",
                        "{\"mac\":\"AA:BB:CC:DD:EE:01\",\"uplink_kbps\":111,"
                        "\"downlink_kbps\":222}",
                        body) == 200);
-        CHECK(HttpPost(kPort + 2, "/api/ratelimit", "",
+        CHECK(HttpPost(kApi2Port, "/api/ratelimit", "",
                        "{\"mac\":\"AA:BB:CC:DD:EE:02\",\"uplink_kbps\":333,"
                        "\"downlink_kbps\":444,"
                        "\"replace_mac\":\"AA:BB:CC:DD:EE:01\"}",
                        body) == 200);
-        CHECK(HttpGet("/api/ratelimit", kPort + 2, body) == 200);
+        CHECK(HttpGet("/api/ratelimit", kApi2Port, body) == 200);
         CHECK(body.find("AA:BB:CC:DD:EE:01") == std::string::npos);
         CHECK(body.find("AA:BB:CC:DD:EE:02") != std::string::npos);
         CHECK(body.find("333") != std::string::npos);
 
         // (b) A refused replace must change NOTHING: the old rule survives
         // intact. A double-zero cap is refused before any state mutates.
-        CHECK(HttpPost(kPort + 2, "/api/ratelimit", "",
+        CHECK(HttpPost(kApi2Port, "/api/ratelimit", "",
                        "{\"mac\":\"AA:BB:CC:DD:EE:03\",\"uplink_kbps\":0,"
                        "\"downlink_kbps\":0,"
                        "\"replace_mac\":\"AA:BB:CC:DD:EE:02\"}",
                        body) == 400);
-        CHECK(HttpGet("/api/ratelimit", kPort + 2, body) == 200);
+        CHECK(HttpGet("/api/ratelimit", kApi2Port, body) == 200);
         CHECK(body.find("AA:BB:CC:DD:EE:02") != std::string::npos);
         CHECK(body.find("333") != std::string::npos);
         CHECK(body.find("AA:BB:CC:DD:EE:03") == std::string::npos);
 
         // (c) A malformed/alien replace_mac is refused, never a silent no-op
         // that leaves the stale rule behind while answering success.
-        CHECK(HttpPost(kPort + 2, "/api/ratelimit", "",
+        CHECK(HttpPost(kApi2Port, "/api/ratelimit", "",
                        "{\"mac\":\"AA:BB:CC:DD:EE:04\",\"uplink_kbps\":5,"
                        "\"downlink_kbps\":5,\"replace_mac\":\"not-a-mac\"}",
                        body) == 400);
-        CHECK(HttpGet("/api/ratelimit", kPort + 2, body) == 200);
+        CHECK(HttpGet("/api/ratelimit", kApi2Port, body) == 200);
         CHECK(body.find("AA:BB:CC:DD:EE:04") == std::string::npos);
         CHECK(body.find("AA:BB:CC:DD:EE:02") != std::string::npos);
 
@@ -9308,86 +9414,86 @@ int main(int argc, char** argv) {
         // the new MAC appeared. RateLimiter::Allow takes the FIRST match, so
         // the stale cap stayed in force while the UI showed the new rule -
         // the exact batch131 failure mode through a new door.
-        CHECK(HttpPost(kPort + 2, "/api/ratelimit", "",
+        CHECK(HttpPost(kApi2Port, "/api/ratelimit", "",
                        "{\"mac\":\"AA:BB:CC:DD:EE:06\",\"uplink_kbps\":9,"
                        "\"downlink_kbps\":9,\"replace_mac\":123}",
                        body) == 400);
-        CHECK(HttpGet("/api/ratelimit", kPort + 2, body) == 200);
+        CHECK(HttpGet("/api/ratelimit", kApi2Port, body) == 200);
         CHECK(body.find("AA:BB:CC:DD:EE:06") == std::string::npos);
         CHECK(body.find("AA:BB:CC:DD:EE:02") != std::string::npos);
         // An explicitly EMPTY replace_mac is refused too: the only way to mean
         // "plain add" is to OMIT the field, so a client bug cannot silently
         // downgrade a re-key into a second rule.
-        CHECK(HttpPost(kPort + 2, "/api/ratelimit", "",
+        CHECK(HttpPost(kApi2Port, "/api/ratelimit", "",
                        "{\"mac\":\"AA:BB:CC:DD:EE:07\",\"uplink_kbps\":9,"
                        "\"downlink_kbps\":9,\"replace_mac\":\"\"}",
                        body) == 400);
-        CHECK(HttpGet("/api/ratelimit", kPort + 2, body) == 200);
+        CHECK(HttpGet("/api/ratelimit", kApi2Port, body) == 200);
         CHECK(body.find("AA:BB:CC:DD:EE:07") == std::string::npos);
 
         // (d) replace_mac naming a MAC that is not stored behaves like a plain
         // add (a config-only or already-deleted row).
-        CHECK(HttpPost(kPort + 2, "/api/ratelimit", "",
+        CHECK(HttpPost(kApi2Port, "/api/ratelimit", "",
                        "{\"mac\":\"AA:BB:CC:DD:EE:05\",\"uplink_kbps\":7,"
                        "\"downlink_kbps\":8,"
                        "\"replace_mac\":\"AA:BB:CC:DD:EE:99\"}",
                        body) == 200);
-        CHECK(HttpGet("/api/ratelimit", kPort + 2, body) == 200);
+        CHECK(HttpGet("/api/ratelimit", kApi2Port, body) == 200);
         CHECK(body.find("AA:BB:CC:DD:EE:05") != std::string::npos);
 
-        CHECK(HttpPost(kPort + 2, "/api/ratelimit", "",
+        CHECK(HttpPost(kApi2Port, "/api/ratelimit", "",
                        "{\"mac\":\"aa-bb-cc-dd-ee-99\",\"uplink_kbps\":11,"
                        "\"downlink_kbps\":11}",
                        body) == 200);
-        CHECK(HttpDelete("/api/ratelimit?mac=aa-bb-cc-dd-ee-99", kPort + 2,
+        CHECK(HttpDelete("/api/ratelimit?mac=aa-bb-cc-dd-ee-99", kApi2Port,
                          body) == 200);
-        CHECK(HttpGet("/api/ratelimit", kPort + 2, body) == 200);
+        CHECK(HttpGet("/api/ratelimit", kApi2Port, body) == 200);
         CHECK(body.find("AA:BB:CC:DD:EE:99") == std::string::npos);
         // batch40 (live CRUD audit): a DELETE for a MAC that is not in the
         // store must NOT fake {"ok":true}; it 404s like the portmap/ban
         // DELETEs (an operator retrying a removal learns it is gone instead of
         // believing a second rule was deleted).
-        CHECK(HttpDelete("/api/ratelimit?mac=AA:BB:CC:DD:EE:99", kPort + 2,
+        CHECK(HttpDelete("/api/ratelimit?mac=AA:BB:CC:DD:EE:99", kApi2Port,
                          body) == 404);
 
         // Ports must lie in [1,65535]; out-of-range values must not wrap.
-        CHECK(HttpPost(kPort + 2, "/api/portmap", "",
+        CHECK(HttpPost(kApi2Port, "/api/portmap", "",
                        "{\"proto\":\"tcp\",\"wan_port\":70000,"
                        "\"lan_ip\":\"192.168.1.53\",\"lan_port\":80}",
                        body) == 400);
-        CHECK(HttpPost(kPort + 2, "/api/portmap", "",
+        CHECK(HttpPost(kApi2Port, "/api/portmap", "",
                        "{\"proto\":\"tcp\",\"wan_port\":-1,"
                        "\"lan_ip\":\"192.168.1.53\",\"lan_port\":80}",
                        body) == 400);
-        CHECK(HttpPost(kPort + 2, "/api/portmap", "",
+        CHECK(HttpPost(kApi2Port, "/api/portmap", "",
                        "{\"proto\":\"tcp\",\"wan_port\":0,"
                        "\"lan_ip\":\"192.168.1.53\",\"lan_port\":80}",
                        body) == 400);
-        CHECK(HttpPost(kPort + 2, "/api/portmap", "",
+        CHECK(HttpPost(kApi2Port, "/api/portmap", "",
                        "{\"proto\":\"tcp\",\"wan_port\":65535,"
                        "\"lan_ip\":\"192.168.1.53\",\"lan_port\":80}",
                        body) == 200);
         // lan_ip must be a strict dotted-quad IPv4: the data plane dials it
         // via sscanf_s "%u.%u.%u.%u", so anything else would be stored as a
         // rule that can never connect - reject it at the API boundary.
-        CHECK(HttpPost(kPort + 2, "/api/portmap", "",
+        CHECK(HttpPost(kApi2Port, "/api/portmap", "",
                        "{\"proto\":\"tcp\",\"wan_port\":65400,"
                        "\"lan_ip\":\"not-an-ip\",\"lan_port\":80}",
                        body) == 400);
-        CHECK(HttpPost(kPort + 2, "/api/portmap", "",
+        CHECK(HttpPost(kApi2Port, "/api/portmap", "",
                        "{\"proto\":\"tcp\",\"wan_port\":65401,"
                        "\"lan_ip\":\"192.168.1.999\",\"lan_port\":80}",
                        body) == 400);
-        CHECK(HttpPost(kPort + 2, "/api/portmap", "",
+        CHECK(HttpPost(kApi2Port, "/api/portmap", "",
                        "{\"proto\":\"tcp\",\"wan_port\":65402,"
                        "\"lan_ip\":\"2001:db8::1\",\"lan_port\":80}",
                        body) == 400);
-        CHECK(HttpPost(kPort + 2, "/api/portmap", "",
+        CHECK(HttpPost(kApi2Port, "/api/portmap", "",
                        "{\"proto\":\"tcp\",\"wan_port\":65403,"
                        "\"lan_ip\":\"192.168.1.75\",\"lan_port\":8080}",
                        body) == 200);
         // A duplicate WAN endpoint would silently shadow the first rule.
-        CHECK(HttpPost(kPort + 2, "/api/portmap", "",
+        CHECK(HttpPost(kApi2Port, "/api/portmap", "",
                        "{\"proto\":\"tcp\",\"wan_port\":65535,"
                        "\"lan_ip\":\"192.168.1.90\",\"lan_port\":90}",
                        body) == 400);
@@ -9395,7 +9501,7 @@ int main(int argc, char** argv) {
         // Rules persist next to the config: the earlier mappings must be in
         // the file, and a fresh load (simulated restart) restores them.
         {
-            std::ifstream in("unused.json.rules.json", std::ios::binary);
+            std::ifstream in(ScratchFile("unused.json.rules.json"), std::ios::binary);
             CHECK(in.good());
             if (in.good()) {
                 std::stringstream ss;
@@ -9404,7 +9510,7 @@ int main(int argc, char** argv) {
                 CHECK(ss.str().find("AA:BB:CC:DD:EE:FF") != std::string::npos);
             }
             vgww::web::RuleStore::Instance().AttachFile(
-                "unused.json.rules.json");
+                ScratchFile("unused.json.rules.json"));
             const auto restored =
                 vgww::web::RuleStore::Instance().PortMaps();
             bool have_8081 = false;
@@ -9414,21 +9520,21 @@ int main(int argc, char** argv) {
             CHECK(have_8081);
         }
         // Leave no trace; production never deletes this file, only the test.
-        std::remove("unused.json.rules.json");
-        std::remove("unused.json");
-        std::remove("unused.json.tmp");
+        std::remove(ScratchFile("unused.json.rules.json").c_str());
+        std::remove(ScratchFile("unused.json").c_str());
+        std::remove(ScratchFile("unused.json.tmp").c_str());
 
         // An empty rule set must persist as a JSON object ("{}"), never the
         // default-null dump ("null"): LoadLocked rejects non-object content
         // (is_object()), which would fake-empty the store on every restart.
         {
-            std::remove("empty.json.rules.json");
+            std::remove(ScratchFile("empty.json.rules.json").c_str());
             vgww::web::RuleStore::Instance().AttachFile(
-                "empty.json.rules.json");
+                ScratchFile("empty.json.rules.json"));
             vgww::web::RuleStore::Instance().AddPortMap(
                 vgww::web::PortMappingRule{"tcp", 4444, "192.168.1.44", 44});
             vgww::web::RuleStore::Instance().RemovePortMap(0);  // -> SaveLocked
-            std::ifstream in("empty.json.rules.json", std::ios::binary);
+            std::ifstream in(ScratchFile("empty.json.rules.json"), std::ios::binary);
             CHECK(in.good());
             if (in.good()) {
                 std::stringstream ss;
@@ -9436,9 +9542,9 @@ int main(int argc, char** argv) {
                 CHECK(ss.str().find("null") == std::string::npos);
                 CHECK(ss.str().find("{") != std::string::npos);
             }
-            std::remove("empty.json.rules.json");
-            std::remove("empty.json");
-            std::remove("empty.json.tmp");
+            std::remove(ScratchFile("empty.json.rules.json").c_str());
+            std::remove(ScratchFile("empty.json").c_str());
+            std::remove(ScratchFile("empty.json.tmp").c_str());
         }
 
         api.Stop();
@@ -9451,7 +9557,7 @@ int main(int argc, char** argv) {
     //      doctrine forbids silent truncation on restore, mirroring POST.
     {
         {
-            std::ofstream poison("poison.json.rules.json", std::ios::binary);
+            std::ofstream poison(ScratchFile("poison.json.rules.json"), std::ios::binary);
             poison << "{\"portmaps\":["
                    << "{\"proto\":\"tcp\",\"wan_port\":70000,"
                    << "\"lan_ip\":\"192.168.1.70\",\"lan_port\":70},"
@@ -9461,7 +9567,7 @@ int main(int argc, char** argv) {
                    << "\"uplink_kbps\":5000000000,\"downlink_kbps\":0}]}";
         }
         vgww::web::RuleStore::Instance().AttachFile(
-            "poison.json.rules.json");
+            ScratchFile("poison.json.rules.json"));
         const auto maps = vgww::web::RuleStore::Instance().PortMaps();
         bool have_8081 = false;
         for (const auto& m : maps) {
@@ -9476,7 +9582,7 @@ int main(int argc, char** argv) {
             if ("AA:BB:CC:DD:EE:99" == r.mac) have_poison_mac = true;
         }
         CHECK(!have_poison_mac);  // kbps wrapped to garbage -> rule skipped
-        std::remove("poison.json.rules.json");
+        std::remove(ScratchFile("poison.json.rules.json").c_str());
     }
 
     // ---- RegisterApi with an injected auth token: mutating calls are
@@ -9486,7 +9592,7 @@ int main(int argc, char** argv) {
         vgww::runtime::Dataplane dp(cfg);
         HttpServer api;
         vgww::web::RegisterApi(api, dp, cfg, "", "boot-secret");
-        constexpr uint16_t kP = 18083;
+        const uint16_t kP = UniquePort();
         CHECK(api.Start("127.0.0.1", kP, error));
 
         CHECK(HttpGet("/api/status", kP, body) == 200);  // reads stay open
@@ -9518,14 +9624,14 @@ int main(int argc, char** argv) {
     //      token (secret boundary), so a full-replacement POST built from a
     //      GET body would silently lock the UI on the next restart. ----
     {
-        const char* kCfgPath = "tokencfg.json";
-        std::remove(kCfgPath);
+        const std::string kCfgPath = ScratchFile("tokencfg.json");
+        std::remove(kCfgPath.c_str());
         vgww::core::Config cfg;
         cfg.web.token = "keep-me";
         vgww::runtime::Dataplane dp(cfg);
         HttpServer api;
         vgww::web::RegisterApi(api, dp, cfg, kCfgPath, "keep-me");
-        constexpr uint16_t kP = 18084;
+        const uint16_t kP = UniquePort();
         CHECK(api.Start("127.0.0.1", kP, error));
 
         // A GET-shaped body carries no "token" field; saving it must keep
@@ -9577,7 +9683,7 @@ int main(int argc, char** argv) {
                       std::string::npos);
             }
         }
-        std::remove(kCfgPath);
+        std::remove(kCfgPath.c_str());
         const std::string tmp_path = std::string(kCfgPath) + ".tmp";
         std::remove(tmp_path.c_str());
         api.Stop();
@@ -9724,11 +9830,11 @@ int main(int argc, char** argv) {
     //      auth token stays out (GET is unauthenticated; POST keeps the
     //      running token), so this guard must never round-trip it.
     {
-        const char* kCfg53 = "rxcfg.json";
-        const char* kLease53 = "rxcfg-leases.json";
-        std::remove(kCfg53);
+        const std::string kCfg53 = ScratchFile("rxcfg.json");
+        const std::string kLease53 = ScratchFile("rxcfg-leases.json");
+        std::remove(kCfg53.c_str());
         std::remove((std::string(kCfg53) + ".tmp").c_str());
-        std::remove(kLease53);
+        std::remove(kLease53.c_str());
 
         vgww::core::Config cfg53;
         cfg53.adapter = "WebTestNICConfigFields";
@@ -9771,7 +9877,7 @@ int main(int argc, char** argv) {
         cfg53.perf.workers = 1;
         cfg53.perf.ring_capacity = 64;
         cfg53.perf.max_conns = 64;
-        cfg53.web.port = 18095;
+        cfg53.web.port = static_cast<uint16_t>(UniquePort());
         cfg53.web.token = "shh";
 
         cfg53.bridge.enabled = false;
@@ -9785,7 +9891,7 @@ int main(int argc, char** argv) {
         CHECK(dp53.Start(start_err53));
         HttpServer api53;
         vgww::web::RegisterApi(api53, dp53, cfg53, kCfg53, "shh");
-        constexpr uint16_t kP53 = 18095;
+        const uint16_t kP53 = UniquePort();
         std::string api_err53;
         CHECK(api53.Start("127.0.0.1", kP53, api_err53));
 
@@ -9869,9 +9975,9 @@ int main(int argc, char** argv) {
         api53.Stop();
         std::string stop_err53;
         CHECK(dp53.Stop(stop_err53));
-        std::remove(kCfg53);
+        std::remove(kCfg53.c_str());
         std::remove((std::string(kCfg53) + ".tmp").c_str());
-        std::remove(kLease53);
+        std::remove(kLease53.c_str());
     }
 
     // ---- S5.7: adapter-name matcher (defect #2) ----
@@ -9999,8 +10105,8 @@ int main(int argc, char** argv) {
     //      the poll window; the poll count therefore measures lock blocking,
     //      not disk speed.
     {
-        const char* kPath = "conc.json.rules.json";
-        std::remove(kPath);
+        const std::string kPath = ScratchFile("conc.json.rules.json");
+        std::remove(kPath.c_str());
         auto& store = vgww::web::RuleStore::Instance();
         store.AttachFile("");
         store.Clear();
@@ -10102,18 +10208,18 @@ int main(int argc, char** argv) {
 
         store.AttachFile("");
         store.Clear();
-        std::remove(kPath);
+        std::remove(kPath.c_str());
     }
 
     // ---- M8: rules.json loading must enforce the same caps as the API:
     //      an oversize file is rejected WHOLESALE (the store stays exactly
     //      as it was; no half-loaded rule set) ----
     {
-        const char* kPath = "oversize.json.rules.json";
+        const std::string kPath = ScratchFile("oversize.json.rules.json");
         auto& store = vgww::web::RuleStore::Instance();
 
         // Oversize bans (kMaxBans + 1): rejected, store stays empty.
-        std::remove(kPath);
+        std::remove(kPath.c_str());
         {
             std::ofstream out(kPath, std::ios::binary);
             out << "{\"bans\":[";
@@ -10127,7 +10233,7 @@ int main(int argc, char** argv) {
         store.Clear();
         store.AttachFile(kPath);
         CHECK(store.Bans().empty());   // rejected wholesale
-        std::remove(kPath);
+        std::remove(kPath.c_str());
 
         // Oversize portmaps (kMaxPortMaps + 1): rejected too.
         {
@@ -10144,7 +10250,7 @@ int main(int argc, char** argv) {
         store.Clear();
         store.AttachFile(kPath);
         CHECK(store.PortMaps().empty());   // rejected wholesale
-        std::remove(kPath);
+        std::remove(kPath.c_str());
 
         // Exactly at the cap must still load (the guard must not off-by-one).
         // batch144: the entries must be DISTINCT targets - a ban list is a set
@@ -10168,7 +10274,7 @@ int main(int argc, char** argv) {
         store.Clear();
         store.AttachFile(kPath);
         CHECK(store.Bans().size() == ::vgww::core::limits::kMaxBans);
-        std::remove(kPath);
+        std::remove(kPath.c_str());
 
         // A rejected oversize file must leave a NON-EMPTY store exactly as
         // it was (no half-load, no wipe).
@@ -10188,7 +10294,7 @@ int main(int argc, char** argv) {
         if (store.Bans().size() == 1) {
             CHECK(store.Bans()[0].value == "02:00:00:00:00:01");
         }
-        std::remove(kPath);
+        std::remove(kPath.c_str());
 
         // Oversize ratelimits (kMaxRateLimits + 1): rejected wholesale, and a
         // pre-existing store must survive the rejection untouched.
@@ -10212,7 +10318,7 @@ int main(int argc, char** argv) {
         if (store.RateLimits().size() == 1) {
             CHECK(store.RateLimits()[0].mac == "02:00:00:00:00:02");
         }
-        std::remove(kPath);
+        std::remove(kPath.c_str());
 
         // Exactly at the portmap cap must still load (the guard must not
         // off-by-one); mirror of the bans at-cap case above.
@@ -10230,7 +10336,7 @@ int main(int argc, char** argv) {
         }
         store.AttachFile(kPath);
         CHECK(store.PortMaps().size() == ::vgww::core::limits::kMaxPortMaps);
-        std::remove(kPath);
+        std::remove(kPath.c_str());
         store.AttachFile("");
         store.Clear();
     }
@@ -10251,8 +10357,8 @@ int main(int argc, char** argv) {
     //      a canonical POST would not match the legacy entry (duplicate) and a
     //      canonical DELETE could not remove it. IP-valued bans stay as-is. ----
     {
-        const char* kPath = "legacy-mac.json.rules.json";
-        std::remove(kPath);
+        const std::string kPath = ScratchFile("legacy-mac.json.rules.json");
+        std::remove(kPath.c_str());
         {
             std::ofstream out(kPath, std::ios::binary);
             out << "{\"bans\":[{\"kind\":\"mac\","
@@ -10264,8 +10370,8 @@ int main(int argc, char** argv) {
         vgww::core::Config cfg;
         vgww::runtime::Dataplane dp(cfg);
         HttpServer api;
-        vgww::web::RegisterApi(api, dp, cfg, "legacy-mac.json");
-        constexpr uint16_t kP = 18091;
+        vgww::web::RegisterApi(api, dp, cfg, ScratchFile("legacy-mac.json"));
+        const uint16_t kP = UniquePort();
         CHECK(api.Start("127.0.0.1", kP, error));
 
         // Migrated to canonical form on load (memory + GET).
@@ -10293,7 +10399,7 @@ int main(int argc, char** argv) {
         api.Stop();
         vgww::web::RuleStore::Instance().AttachFile("");
         vgww::web::RuleStore::Instance().Clear();
-        std::remove(kPath);
+        std::remove(kPath.c_str());
     }
 
     // ---- M9: one stalled client must not delay other requests. The old
@@ -10304,7 +10410,7 @@ int main(int argc, char** argv) {
         srv.Route("GET", "/api/ping", [](const Request&) {
             return Response::Json("{\"pong\":true}");
         });
-        constexpr uint16_t kP = 18085;
+        const uint16_t kP = UniquePort();
         CHECK(srv.Start("127.0.0.1", kP, error));
 
         asio::io_context io;
@@ -10344,7 +10450,7 @@ int main(int argc, char** argv) {
         srv.Route("GET", "/api/ping", [](const Request&) {
             return Response::Json("{\"pong\":true}");
         });
-        constexpr uint16_t kP = 18086;
+        const uint16_t kP = UniquePort();
         CHECK(srv.Start("127.0.0.1", kP, error));
 
         asio::io_context io;
@@ -10419,7 +10525,7 @@ int main(int argc, char** argv) {
         srv.Route("GET", "/api/ping", [](const Request&) {
             return Response::Json("{\"pong\":true}");
         });
-        constexpr uint16_t kP = 18089;
+        const uint16_t kP = UniquePort();
 
         // (a) Start then immediately Stop with no client ever connecting:
         //     the pending accept must be interrupted, not joined-on forever.
@@ -10453,8 +10559,8 @@ int main(int argc, char** argv) {
     //      assembles the server; the endpoints then list leases and manage
     //      static bindings (cap / duplicate / token rules). ----
     {
-        const char* kLeasePath = "web-dhcp-leases.json";
-        std::remove(kLeasePath);
+        const std::string kLeasePath = ScratchFile("web-dhcp-leases.json");
+        std::remove(kLeasePath.c_str());
         vgww::core::Config cfg;
         cfg.adapter = "WebTestNIC";
         cfg.mode = vgww::core::Mode::kMain;
@@ -10490,7 +10596,7 @@ int main(int argc, char** argv) {
 
         HttpServer api;
         vgww::web::RegisterApi(api, dp, cfg, "", "boot-secret");
-        constexpr uint16_t kP = 18085;
+        const uint16_t kP = UniquePort();
         CHECK(api.Start("127.0.0.1", kP, error));
 
         // GET lists the config bindings; leases start empty (no DISCOVER was
@@ -10560,7 +10666,7 @@ int main(int argc, char** argv) {
         api.Stop();
         std::string stop_error;
         CHECK(dp.Stop(stop_error));
-        std::remove(kLeasePath);
+        std::remove(kLeasePath.c_str());
     }
 
     TestWebDhcp6BindingsCrud();
