@@ -5049,6 +5049,81 @@ static void TestA6PerfEdit() {
     I18n::Instance().SetLang(Lang::ZhCN);
 }
 
+// P141 B-2: the data source publishes ONLY clients on the gateway's own LAN
+// (dataplane.cpp marks every published ClientRate with lan=true; WAN-side
+// sources are skipped), so a "WAN" filter always emptied the table - the option
+// promised data the command could never produce. The filter must not offer WAN.
+static void TestP141B2NoWanFilterOption() {
+    using namespace vgww::ui;
+    FixTextMetrics();
+    I18n::Instance().SetLang(Lang::En);
+
+    ShellFakeSource source;
+    RecordingExecutor executor;
+    UiController controller(source, executor);
+    std::string start_error;
+    CHECK(controller.Start(start_error));
+
+    UiSnapshot snapshot = MakeRulesSnapshot(1, 1);
+    snapshot.clients.clear();
+    {
+        vgww::runtime::Dataplane::ClientRate c;
+        c.ip.bytes[0] = 192;
+        c.ip.bytes[1] = 168;
+        c.ip.bytes[2] = 1;
+        c.ip.bytes[3] = 10;
+        c.mac = {0x02, 0x00, 0x00, 0x00, 0x00, 0x0A};
+        c.lan = true;  // the ONLY kind of client the source ever publishes
+        c.up_bps = 100;
+        c.down_bps = 200;
+        c.last_seen_s = 5;
+        snapshot.clients.push_back(c);
+    }
+
+    UiApp app;
+    app.Compose(controller, snapshot);
+    app.root().Arrange({0.0f, 0.0f, 1280.0f, 900.0f});
+    app.router().Navigate("dashboard");
+    app.Update(snapshot);
+    app.root().Arrange({0.0f, 0.0f, 1280.0f, 900.0f});
+
+    auto* filter = dynamic_cast<SelectElement*>(
+        FindById(app.root(), "dash.filter"));
+    CHECK(filter != nullptr);
+    if (filter == nullptr) {
+        controller.Stop();
+        FixTextMetrics();
+        return;
+    }
+    std::printf("P141B2 filter options=%zu\n", filter->options().size());
+    for (const auto& opt : filter->options()) {
+        std::printf("P141B2   option=[%ls]\n", opt.first.c_str());
+    }
+    // Exactly the views the data source can answer: all / lan.
+    CHECK(filter->options().size() == 2);
+    // No WAN option (it always filtered to an empty table).
+    const bool has_wan = std::any_of(
+        filter->options().begin(), filter->options().end(),
+        [](const std::pair<std::wstring, std::wstring>& o) {
+            return o.first == L"wan";
+        });
+    CHECK(!has_wan);
+    // A language switch must relabel the same two options (the relabel path
+    // lists them again and must not resurrect WAN).
+    I18n::Instance().SetLang(Lang::ZhCN);
+    app.Update(snapshot);
+    app.root().Arrange({0.0f, 0.0f, 1280.0f, 900.0f});
+    CHECK(filter->options().size() == 2);
+    CHECK(!std::any_of(
+        filter->options().begin(), filter->options().end(),
+        [](const std::pair<std::wstring, std::wstring>& o) {
+            return o.first == L"wan";
+        }));
+    I18n::Instance().SetLang(Lang::En);
+    controller.Stop();
+    FixTextMetrics();
+}
+
 // batch22 A2: dashboard client filter (all/lan/wan) + sort (key/dir), mirroring
 // the Web dashboard. Red anchors: filtered row SET, sort DIRECTION, empty state.
 static void TestA2DashboardFilterSort() {
@@ -5130,11 +5205,14 @@ static void TestA2DashboardFilterSort() {
     CHECK(order()[2] == mac("1E"));
     CHECK(!empty->visible);
 
-    // Filter WAN: only B remains.
-    filter->SetSelectedValue(L"wan");
-    app.Update(snapshot);
-    CHECK(order().size() == 1);
-    CHECK(order()[0] == mac("14"));
+    // P141 B-2: there is no WAN option (the source never publishes a WAN
+    // client, so the filter could only ever empty the table).
+    CHECK(filter->options().size() == 2);
+    CHECK(!std::any_of(
+        filter->options().begin(), filter->options().end(),
+        [](const std::pair<std::wstring, std::wstring>& o) {
+            return o.first == L"wan";
+        }));
 
     // Sort by upload desc: B(900), A(100), D(50), C(0).
     filter->SetSelectedValue(L"all");
@@ -5164,14 +5242,10 @@ static void TestA2DashboardFilterSort() {
     CHECK(order()[3] == mac("28"));
 
     // Empty state: a filter that matches nothing shows the placeholder and no
-    // rows.
-    snapshot.clients.erase(
-        std::remove_if(snapshot.clients.begin(), snapshot.clients.end(),
-                       [](const vgww::runtime::Dataplane::ClientRate& c) {
-                           return !c.lan;
-                       }),
-        snapshot.clients.end());
-    filter->SetSelectedValue(L"wan");
+    // rows (P141 B-2: the LAN filter is the only real view besides "all", so the
+    // empty state is exercised through it).
+    snapshot.clients.clear();
+    filter->SetSelectedValue(L"lan");
     app.Update(snapshot);
     CHECK(order().empty());
     CHECK(empty->visible);
@@ -27019,6 +27093,111 @@ static void TestB42SaveFailureShowsReason() {
     controller.Stop();
 }
 
+// P141 B-3: after an async save+apply FAILS, the re-entry guard stays armed
+// (its only disarm was a real edit), so a retry with NO intervening edit was
+// silently dropped even though nothing had been persisted - the operator saw
+// the Danger toast, clicked Save again, and got nothing. The command-failure
+// broadcast (app.cpp DrainCommandResults -> OnCommandFailed) must release the
+// guard so the retry really posts a second SaveConfigCmd.
+static void TestP141B3ApplyFailureAllowsResave() {
+    using namespace vgww::ui;
+    FixTextMetrics();
+    I18n::Instance().SetLang(Lang::ZhCN);
+
+    ShellFakeSource source;
+    FailingSaveExecutor executor;
+    UiController controller(source, executor);
+    std::string error;
+    CHECK(controller.Start(error));
+
+    UiSnapshot snapshot = MakeRulesSnapshot(1, 1);
+    ConfigView& view = snapshot.config;
+    view.adapter = "NIC 1";
+    view.mode = "main";
+    view.gateway_ip = "192.168.1.1";
+    view.gateway_mask = "255.255.255.0";
+    view.gateway_mac = "02:00:00:00:00:01";
+    view.dhcp_enabled = true;
+    view.dhcp_pool_start = "192.168.1.100";
+    view.dhcp_pool_end = "192.168.1.200";
+    view.dhcp_lease_s = 86400;
+    view.dhcp_dns = {"1.1.1.1"};
+    view.ipv6_enabled = true;
+    view.ula_prefix = "fd00:0000:0000:0000:0000:0000:0000:0000";
+    view.prefix_len = 64;
+    view.ra_lifetime_s = 1800;
+    view.ipv6_dns = {"fd00::1"};
+    view.dhcp6_enabled = true;
+    view.dhcp6_pool_start = "fd00:0000:0000:0000:0000:0000:0000:1000";
+    view.dhcp6_pool_end = "fd00:0000:0000:0000:0000:0000:0000:1fff";
+    view.dhcp6_lease_s = 3600;
+    view.web_port = 8080;
+    view.web_bind = "127.0.0.1";
+    view.vlan_id = 0;
+    view.bridge_enabled = false;
+    view.bridge_up = "NIC 1";
+    view.bridge_down = "NIC 2";
+    view.bridge_table_size = 4096;
+    view.perf_workers = 4;
+    view.perf_max_conns = 2048;
+    view.perf_dial_timeout_ms = 5000;
+    view.config_path = "";
+
+    UiApp app;
+    app.Compose(controller, snapshot);
+    app.root().Arrange({0.0f, 0.0f, 1280.0f, 800.0f});
+    app.router().Navigate("settings");
+    app.Update(snapshot);
+    app.root().Arrange({0.0f, 0.0f, 1280.0f, 800.0f});
+
+    auto* save = dynamic_cast<Button*>(FindById(app.root(), "settings.save"));
+    CHECK(save != nullptr);
+    if (save == nullptr) {
+        controller.Stop();
+        FixTextMetrics();
+        return;
+    }
+
+    // A real edit so the first save is a real command (and the false-second
+    // click below is meaningful: the guard would otherwise be idle).
+    if (auto* port = dynamic_cast<TextInputElement*>(
+            FindById(app.root(), "settings.web_port"))) {
+        TypeInto(*port, L"18081");
+    }
+    app.root().Arrange({0.0f, 0.0f, 1280.0f, 800.0f});
+
+    // First save: the command is posted and the async apply FAILS.
+    executor.commands.clear();
+    const std::size_t toast_base = app.toasts().active_count();
+    ClickElement(*save);
+    WaitForSaveOutcome(app, executor, 1, toast_base);
+    CHECK(executor.commands.size() == 1);
+    // The failure toast really arrived (the broadcast we rely on is drained by
+    // WaitForSaveOutcome -> DrainCommandResultsForTest).
+    if (!app.toasts().toasts().empty()) {
+        CHECK(app.toasts().toasts().back().kind == ToastKind::Danger);
+    }
+
+    // Retry WITHOUT any edit: the failed apply must have released the guard,
+    // so this click posts a SECOND SaveConfigCmd instead of being dropped.
+    ClickElement(*save);
+    {
+        const auto deadline = std::chrono::steady_clock::now() +
+                              std::chrono::seconds(3);
+        while (executor.commands.size() < 2 &&
+               std::chrono::steady_clock::now() < deadline) {
+            controller.DrainResults();
+            std::this_thread::sleep_for(std::chrono::milliseconds(5));
+        }
+    }
+    CHECK(executor.commands.size() == 2);
+    if (executor.commands.size() == 2) {
+        CHECK(std::get_if<SaveConfigCmd>(&executor.commands[1]) != nullptr);
+    }
+    controller.Stop();
+    FixTextMetrics();
+}
+
 // P1-8: copying the gateway address confirms with the short "copied" bubble.
 static void TestB27CopyBubble() {
     using namespace vgww::ui;
@@ -34472,6 +34651,128 @@ static void TestB33iEmptyAdapterDefaultsToBest() {
     FixTextMetrics();
 }
 
+/// batch33i follow-up (P141 B-1): the empty-adapter auto-select only painted
+/// the picker box. The SAVE value stayed "" because adapter_value_ (the only
+/// field ReadDraft() serializes) was never written by the fallback branch, so a
+/// first-run save with a detected adapter still persisted an empty adapter - a
+/// config that bound nothing on the next start. The save payload must carry the
+/// auto-selected adapter, not an empty string.
+static void TestP141B1EmptyAdapterSaveCarriesSelection() {
+    using namespace vgww::ui;
+    FixTextMetrics();
+    I18n::Instance().SetLang(Lang::ZhCN);
+
+    ShellFakeSource source;
+    RecordingExecutor executor;
+    UiController controller(source, executor);
+    std::string start_error;
+    CHECK(controller.Start(start_error));
+
+    UiSnapshot snap = MakeRulesSnapshot(1, 1);
+    // The first-run state: an EMPTY configured adapter...
+    snap.config.adapter.clear();
+    // ...but real, detected adapters (BuildAdapterChoices ranks best-first).
+    snap.adapters.clear();
+    {
+        vgww::runtime::Dataplane::AdapterInfo info;
+        info.friendly_name = "NIC 2";
+        info.device = "\\DEVICE\\{P141-2222}";
+        info.is_up = false;
+        info.media_connected = false;
+        snap.adapters.push_back(info);
+    }
+    {
+        vgww::runtime::Dataplane::AdapterInfo info;
+        info.friendly_name = "NIC 1";
+        info.device = "\\DEVICE\\{P141-1111}";
+        info.is_up = true;
+        info.media_connected = true;
+        info.ipv4.push_back(
+            {static_cast<uint32_t>((192u) | (168u << 8) | (0u << 16) |
+                                   (24u << 24)),
+             24});
+        snap.adapters.push_back(info);
+    }
+    // A valid base config so the save command is actually generated (the save
+    // path runs the full SettingsDraft::ToConfig -> ValidateConfig chain).
+    ConfigView& view = snap.config;
+    view.mode = "main";
+    view.gateway_ip = "192.168.0.240";
+    view.gateway_mask = "255.255.255.0";
+    view.gateway_mac = "02:00:00:00:00:01";
+    view.dhcp_enabled = true;
+    view.dhcp_pool_start = "192.168.0.100";
+    view.dhcp_pool_end = "192.168.0.200";
+    view.dhcp_lease_s = 86400;
+    view.dhcp_dns = {"1.1.1.1"};
+    view.ipv6_enabled = true;
+    view.ula_prefix = "fd00:0000:0000:0000:0000:0000:0000:0000";
+    view.prefix_len = 64;
+    view.ra_lifetime_s = 1800;
+    view.ipv6_dns = {"fd00::1"};
+    view.dhcp6_enabled = true;
+    view.dhcp6_pool_start = "fd00:0000:0000:0000:0000:0000:0000:1000";
+    view.dhcp6_pool_end = "fd00:0000:0000:0000:0000:0000:0000:1fff";
+    view.dhcp6_lease_s = 3600;
+    view.web_port = 18080;
+    view.web_bind = "127.0.0.1";
+    view.vlan_id = 0;
+    view.bridge_enabled = false;
+    view.bridge_up = "NIC 1";
+    view.bridge_down = "NIC 2";
+    view.bridge_table_size = 4096;
+    view.perf_workers = 4;
+    view.perf_max_conns = 2048;
+    view.perf_dial_timeout_ms = 5000;
+
+    UiApp app;
+    app.Compose(controller, snap);
+    app.root().Arrange({0.0f, 0.0f, 1280.0f, 900.0f});
+    app.router().Navigate("settings");
+    app.Update(snap);
+    app.root().Arrange({0.0f, 0.0f, 1280.0f, 900.0f});
+
+    auto* pick = dynamic_cast<SelectElement*>(
+        FindById(app.root(), "settings.adapter_pick"));
+    CHECK(pick != nullptr);
+    if (pick == nullptr) {
+        controller.Stop();
+        FixTextMetrics();
+        return;
+    }
+    // The picker auto-selected the most usable adapter.
+    std::printf("P141B1 pick selected=[%ls]\n",
+                pick->selected_value().c_str());
+    CHECK(pick->selected_value() == L"NIC 1");
+
+    auto* save = dynamic_cast<Button*>(FindById(app.root(), "settings.save"));
+    CHECK(save != nullptr && save->enabled);
+    if (save == nullptr || !save->enabled) {
+        controller.Stop();
+        FixTextMetrics();
+        return;
+    }
+
+    // First-run direct save: no user edit at all.
+    executor.commands.clear();
+    ClickElement(*save);
+    CHECK(WaitForCommands(executor, 1, controller));
+    CHECK(executor.commands.size() == 1);
+    if (executor.commands.size() == 1) {
+        const auto* cmd = std::get_if<SaveConfigCmd>(&executor.commands[0]);
+        CHECK(cmd != nullptr);
+        if (cmd != nullptr) {
+            std::printf("P141B1 saved adapter=[%s]\n",
+                        cmd->config.adapter.c_str());
+            // The auto-selected value must be persisted, not "".
+            CHECK(!cmd->config.adapter.empty());
+            CHECK(cmd->config.adapter == "NIC 1");
+        }
+    }
+    controller.Stop();
+    FixTextMetrics();
+}
+
 /// batch33j: the curve must read as a CONTINUOUS LINE, not a bar chart. The old
 /// renderer painted one 16 px block per ring slot (60 slots across a 992 px
 /// card), which is exactly the blocky look the Task Manager graph does not
@@ -37468,6 +37769,7 @@ int main() {
     TestB269ReadDraftIndependentOfMode();
     TestA1ThemeSelect();
     TestA2DashboardFilterSort();
+    TestP141B2NoWanFilterOption();
     TestA6PerfEdit();
     TestA7DashboardCards();
     TestA8TokenEdit();
@@ -37822,6 +38124,7 @@ int main() {
     TestB27SettingsUnsavedPrompt();
     TestB27SaveToast();
     TestB42SaveFailureShowsReason();
+    TestP141B3ApplyFailureAllowsResave();
     TestB27CopyBubble();
     TestB27DialogSafeDefaultFocus();
     TestB27LinkHoverTransition();
@@ -37918,6 +38221,7 @@ int main() {
     TestB34aPortmapDropsReachDashboard();
     TestB33gPerfCurveTooltip();
     TestB33iEmptyAdapterDefaultsToBest();
+    TestP141B1EmptyAdapterSaveCarriesSelection();
     TestB33jCurveIsContinuous();
     TestB33kGradientAndAxisTicks();
     if (g_failures == 0) {

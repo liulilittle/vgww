@@ -513,6 +513,12 @@ namespace vgww {
                 void Build(Element& host, PageContext& ctx) override;
                 void Update(const UiSnapshot& snapshot, I18n& i18n) override;
                 bool ConfirmLeave(std::function<void()> proceed) override;
+                /// batch42: an async save+apply that FAILED leaves the re-entry
+                /// guard armed (the only disarm was a subsequent edit), so the
+                /// next identical Save was silently dropped with no feedback,
+                /// even though nothing had been persisted. The command failure
+                /// broadcast releases the guard so a retry really posts again.
+                void OnCommandFailed() override;
 
             private:
                 SettingsDraft ReadDraft() const;
@@ -1477,6 +1483,18 @@ void SettingsPage::RefreshDirty() {
                 }
             }
 
+            void SettingsPage::OnCommandFailed() {
+                // batch42 + P141 B-3: the re-entry guard is wired on every
+                // Save but only an intervening EDIT disarms it. When the async
+                // save+apply FAILS (Danger toast from the drained result), the
+                // operator who saw the error and wants to retry without editing
+                // would have had their Save silently dropped - the guard was
+                // still armed with nothing persisted. The command-failure
+                // broadcast is exactly this moment: release the guard so the
+                // retry posts again.
+                save_guard_armed_ = false;
+            }
+
             void SettingsPage::Update(const UiSnapshot& snapshot, I18n& i18n) {
                 RefreshLabels(i18n);
                 config_path_ = snapshot.config.config_path;
@@ -1690,6 +1708,21 @@ void SettingsPage::RefreshDirty() {
                     return false;
                 }
                 save_guard_armed_ = true;
+                // batch33i + P141 B-1: on a first run the configured adapter is
+                // EMPTY, so RefreshAdapterOptions auto-selects the most usable
+                // detected adapter into the picker box - but `adapter_value_`
+                // (the only field ReadDraft() serializes) was never written, so
+                // a direct save persisted "" and the next start bound nothing.
+                // The picker is the single source of truth for the saved value:
+                // mirror its current selection here (only when there is no
+                // explicit value yet, so a user pick still wins).
+                if (adapter_value_.empty() && adapter_pick_ != nullptr) {
+                    const std::wstring shown = adapter_pick_->selected_value();
+                    if (!shown.empty() && shown != L"__none__") {
+                        adapter_value_ = shown;
+                        RefreshAdapterPathRow();
+                    }
+                }
                 // Seed the Config from the on-disk file: sections the snapshot
                 // does not expose (perf details, static bindings, token) must
                 // survive a UI save.

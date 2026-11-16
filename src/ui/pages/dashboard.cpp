@@ -998,7 +998,7 @@ namespace vgww {
                 SelectElement* filter_ = nullptr;
                 SelectElement* sort_ = nullptr;
                 SelectElement* dir_ = nullptr;
-                enum class ClientFilter { All, Lan, Wan };
+                enum class ClientFilter { All, Lan };
                 enum class ClientSort { Rate, Up, Down, Seen };
                 ClientFilter client_filter_ = ClientFilter::All;
                 ClientSort client_sort_ = ClientSort::Rate;
@@ -1236,25 +1236,24 @@ namespace vgww {
                 // batch22 A2: filter + sort toolbar. Same control vocabulary as
                 // Settings (SelectElement), so the look matches the rest of the
                 // app; the option VALUES stay ASCII tokens while the labels are
-                // localized.
+                // localized. P141 B-2: there is NO WAN option - the data source
+                // publishes only LAN clients (WAN-side sources are skipped), so
+                // a WAN filter could never show a row.
                 auto toolbar = std::make_unique<StackPanel>(Orientation::Horizontal, 8.0f);
                 StackPanel* toolbar_raw = static_cast<StackPanel*>(body->Add(std::move(toolbar)));
                 toolbar_raw->id = "dash.controls";
                 filter_ = static_cast<SelectElement*>(toolbar_raw->Add(std::make_unique<SelectElement>()));
                 filter_->id = "dash.filter";
                 filter_->SetOptions({{L"all", i18n.T(Str::DashFilterAll)},
-                                     {L"lan", i18n.T(Str::DashFilterLan)},
-                                     {L"wan", i18n.T(Str::DashFilterWan)}});
+                                     {L"lan", i18n.T(Str::DashFilterLan)}});
                 filter_->SetSelectedValueSilent(L"all");
                 filter_->on_changed = [this] {
                     if (filter_ == nullptr) {
                         return;
                     }
                     const std::wstring value = filter_->selected_value();
-                    client_filter_ = value == L"lan"
-                                         ? ClientFilter::Lan
-                                         : (value == L"wan" ? ClientFilter::Wan
-                                                            : ClientFilter::All);
+                    client_filter_ = value == L"lan" ? ClientFilter::Lan
+                                                     : ClientFilter::All;
                     // batch331: an explicit view change must repaint even while
                     // the table is frozen by a stopped service. Update()'s
                     // rebuild gate is `dataplane_running ||
@@ -1767,14 +1766,12 @@ namespace vgww {
 
                 // batch22 A2: filter -> sort -> rows. The filter/sort state is
                 // owned by the page; the semantics mirror the Web dashboard
-                // (all/lan/wan, rate/up/down/activity, asc/desc).
+                // (all/lan; WAN was removed in P141 B-2 because the data source
+                // never publishes a WAN client).
                 std::vector<const vgww::runtime::Dataplane::ClientRate*> filtered;
                 filtered.reserve(snapshot.clients.size());
                 for (const auto& client : snapshot.clients) {
                     if (client_filter_ == ClientFilter::Lan && !client.lan) {
-                        continue;
-                    }
-                    if (client_filter_ == ClientFilter::Wan && client.lan) {
                         continue;
                     }
                     filtered.push_back(&client);
@@ -1942,8 +1939,7 @@ namespace vgww {
                 if (filter_ != nullptr) {
                     const std::wstring keep = filter_->selected_value();
                     filter_->SetOptions({{L"all", i18n.T(Str::DashFilterAll)},
-                                         {L"lan", i18n.T(Str::DashFilterLan)},
-                                         {L"wan", i18n.T(Str::DashFilterWan)}});
+                                         {L"lan", i18n.T(Str::DashFilterLan)}});
                     filter_->SetSelectedValueSilent(keep);
                 }
                 if (sort_ != nullptr) {
