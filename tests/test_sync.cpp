@@ -9,6 +9,7 @@
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
+#include <filesystem>
 #include <cstdio>
 #include <fstream>
 #include <functional>
@@ -20,7 +21,23 @@
 #include <type_traits>
 #include <vector>
 
-static int g_failures = 0;
+static     // P139: per-process scratch directory (pid leaf) so parallel
+    // instances never write and delete the same lease/config file.
+    std::string ScratchDir() {
+        const std::string leaf = "vgww-tests-sync-" +
+                                 std::to_string(::GetCurrentProcessId());
+        const std::filesystem::path dir =
+            std::filesystem::temp_directory_path() / leaf;
+        std::error_code ec;
+        std::filesystem::create_directories(dir, ec);
+        return dir.string();
+    }
+
+    std::string ScratchFile(const char* name) {
+        return (std::filesystem::path(ScratchDir()) / name).string();
+    }
+
+int g_failures = 0;
 #define CHECK(cond) do { if (!(cond)) { ++g_failures; \
     std::printf("FAIL %s:%d: %s\n", __FILE__, __LINE__, #cond); } } while (0)
 
@@ -498,7 +515,7 @@ static void TestRealExecutorAgainstRuleStore() {
     store.AttachFile("");
     store.Clear();
 
-    const std::string save_path = "test_executor_save.json";
+    const std::string save_path = ScratchFile("test_executor_save.json");
     std::remove(save_path.c_str());
 
     vgww::core::Config cfg;

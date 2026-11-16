@@ -9,6 +9,10 @@
 #include <atomic>
 #include <cstdio>
 #include <cstring>
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#include <windows.h>
 #include <filesystem>
 #include <fstream>
 #include <iterator>
@@ -17,6 +21,24 @@
 namespace {
 
     // batch326: scratch paths come from the OS temp folder (portable).
+    // P139: every document this process writes gets its OWN directory
+    // under the temp root, keyed by pid. A shared "vgww-tests" leaf let
+    // parallel instances write and delete the same lease file, which is
+    // exactly the cross-talk that turned this suite red under a parallel run.
+    std::string ScratchDir() {
+        const std::string leaf = "vgww-tests-dhcp-" +
+                                 std::to_string(::GetCurrentProcessId());
+        const std::filesystem::path dir =
+            std::filesystem::temp_directory_path() / leaf;
+        std::error_code ec;
+        std::filesystem::create_directories(dir, ec);
+        return dir.string();
+    }
+
+    std::string ScratchFile(const char* name) {
+        return (std::filesystem::path(ScratchDir()) / name).string();
+    }
+
     std::string AbsentPath(const char* leaf) {
         return (std::filesystem::temp_directory_path() / "vgww-tests" / leaf)
             .string();
@@ -537,8 +559,9 @@ void TestStaticBindingReservesPoolAddress() {
         CHECK(ip != 0);
 
         const auto t_dump = t0 + std::chrono::seconds(100);
-        const std::string path = "test_dhcp_leases_remaining.json";
-        std::remove(path.c_str());
+        const std::string path = ScratchFile("test_dhcp_leases_remaining.json");
+        std::error_code rm_ec_1;
+        std::filesystem::remove(path, rm_ec_1);
         CHECK(server.DumpLeases(path, t_dump));
 
         DhcpServer restored(config);
@@ -549,7 +572,8 @@ void TestStaticBindingReservesPoolAddress() {
             // 3500s remaining, NOT a fresh 3600s from now.
             CHECK(leases[0].expires_in_s == 3500u);
         }
-        std::remove(path.c_str());
+        std::error_code rm_ec_2;
+        std::filesystem::remove(path, rm_ec_2);
     }
 
     // batch134: a persisted file can name the SAME address for two different
@@ -574,7 +598,7 @@ void TestStaticBindingReservesPoolAddress() {
         config.dhcp.pool_end = vgww::core::ParseIpv4("192.168.0.110", ok);
         config.dhcp.lease_seconds = 3600;
 
-        const std::string path = "test_dhcp_leases_dup_addr.json";
+        const std::string path = ScratchFile("test_dhcp_leases_dup_addr.json");
         {
             std::ofstream out(path);
             out << "{\"version\":1,\"leases\":["
@@ -608,7 +632,8 @@ void TestStaticBindingReservesPoolAddress() {
         CHECK("first" == owner_100);
         CHECK(1 == dropped);  // the collided entry is counted, never silent
 
-        std::remove(path.c_str());
+        std::error_code rm_ec_3;
+        std::filesystem::remove(path, rm_ec_3);
     }
 
     // batch119: the dropped-entry counter must be reachable from the status
@@ -626,7 +651,7 @@ void TestStaticBindingReservesPoolAddress() {
         CHECK(ok);
         config.dhcp.lease_seconds = 3600;
 
-        const std::string path = "test_dhcp_leases_b119.json";
+        const std::string path = ScratchFile("test_dhcp_leases_b119.json");
         {
             std::ofstream out(path);
             out << "{\"version\":1,\"leases\":["
@@ -643,7 +668,8 @@ void TestStaticBindingReservesPoolAddress() {
         CHECK(1 == dropped);
         CHECK(1 == server.DroppedLeaseCount());
         CHECK(1 == server.LeaseCount());
-        std::remove(path.c_str());
+        std::error_code rm_ec_4;
+        std::filesystem::remove(path, rm_ec_4);
     }
 
     // batch121: strict-parse refusals must be countable from the status
@@ -671,7 +697,7 @@ void TestStaticBindingReservesPoolAddress() {
         CHECK(ok);
         config.dhcp.lease_seconds = 3600;
 
-        const std::string path = "test_dhcp_leases_b120.json";
+        const std::string path = ScratchFile("test_dhcp_leases_b120.json");
         {
             std::ofstream out(path);
             out << "this is not json";
@@ -686,8 +712,10 @@ void TestStaticBindingReservesPoolAddress() {
             std::ifstream aside(path + ".corrupt");
             CHECK(aside.good());  // evidence preserved, loss flagged
         }
-        std::remove(path.c_str());
-        std::remove((path + ".corrupt").c_str());
+        std::error_code rm_ec_5;
+        std::filesystem::remove(path, rm_ec_5);
+        std::error_code rm_ec_6;
+        std::filesystem::remove(path + ".corrupt", rm_ec_6);
     }
 
     void TestLeaseLoadSkipsIllegal() {
@@ -708,7 +736,7 @@ void TestStaticBindingReservesPoolAddress() {
         cfg.ip = vgww::core::ParseIpv4("192.168.0.105", ok);
         config.dhcp.static_bindings.push_back(cfg);
 
-        const std::string path = "test_dhcp_leases_illegal.json";
+        const std::string path = ScratchFile("test_dhcp_leases_illegal.json");
         {
             std::ofstream out(path);
             out << "{\"version\":1,\"leases\":["
@@ -765,7 +793,8 @@ void TestStaticBindingReservesPoolAddress() {
         CHECK(server3.LoadLeases(path, std::chrono::steady_clock::now(),
                                  nullptr) ==
               DhcpServer::LoadOutcome::kCorrupt);
-        std::remove(path.c_str());
+        std::error_code rm_ec_7;
+        std::filesystem::remove(path, rm_ec_7);
     }
 
     void TestLegacyLeaseMissingExpiresRestored() {
@@ -785,7 +814,7 @@ void TestStaticBindingReservesPoolAddress() {
         config.dhcp.pool_end = vgww::core::ParseIpv4("192.168.0.110", ok);
         config.dhcp.lease_seconds = 3600;
 
-        const std::string path = "test_dhcp_leases_legacy.json";
+        const std::string path = ScratchFile("test_dhcp_leases_legacy.json");
         {
             std::ofstream out(path);
             out << "{\"version\":1,\"leases\":["
@@ -812,7 +841,8 @@ void TestStaticBindingReservesPoolAddress() {
         CHECK(ok);
         CHECK(server.Acquire(mac, t0 + std::chrono::seconds(1),
                              DhcpServer::OfferStage::kAck) == expected_ip);
-        std::remove(path.c_str());
+        std::error_code rm_ec_8;
+        std::filesystem::remove(path, rm_ec_8);
     }
 
     void TestPoolSkipsNetworkAndBroadcast() {
@@ -900,7 +930,7 @@ void TestStaticBindingReservesPoolAddress() {
             mac, std::chrono::steady_clock::now(), DhcpServer::OfferStage::kAck);
         CHECK(ip != 0);
 
-        const std::string path = "lease-roundtrip-tmp.json";
+        const std::string path = ScratchFile("lease-roundtrip-tmp.json");
         CHECK(server.DumpLeases(path, std::chrono::steady_clock::now()));
 
         vgww::core::Config config2;
@@ -916,7 +946,8 @@ void TestStaticBindingReservesPoolAddress() {
         const uint32_t again = server2.Acquire(
             mac, std::chrono::steady_clock::now(), DhcpServer::OfferStage::kAck);
         CHECK(again == ip);
-        std::remove(path.c_str());
+        std::error_code rm_ec_9;
+        std::filesystem::remove(path, rm_ec_9);
     }
 
     void TestDeclineMarksAddressBad() {
@@ -1530,15 +1561,17 @@ void TestLeaseHostnameLearnt() {
     CHECK(leases[0].hostname == "renamed-box");
 
     // The name survives a dump/reload round-trip.
-    const std::string path = "test_dhcp_leases_hostname.json";
-    std::remove(path.c_str());
+    const std::string path = ScratchFile("test_dhcp_leases_hostname.json");
+    std::error_code rm_ec_10;
+    std::filesystem::remove(path, rm_ec_10);
     CHECK(server.DumpLeases(path, t0 + std::chrono::seconds(10)));
     DhcpServer restored(config);
     CHECK(restored.LoadLeases(path, t0 + std::chrono::seconds(10)));
     leases = restored.Leases(t0 + std::chrono::seconds(10));
     CHECK(!leases.empty());
     CHECK(leases[0].hostname == "renamed-box");
-    std::remove(path.c_str());
+    std::error_code rm_ec_11;
+    std::filesystem::remove(path, rm_ec_11);
 }
 
     // --- F1: strict frame validation (BOOTREQUEST / Ethernet / UDP 67) -----
@@ -1678,8 +1711,9 @@ void TestLeaseHostnameLearnt() {
         const auto t0 = std::chrono::steady_clock::now();
         CHECK(server.Acquire(mac, t0, DhcpServer::OfferStage::kAck) != 0);
 
-        const std::string path = "test_dhcp_leases_version.json";
-        std::remove(path.c_str());
+        const std::string path = ScratchFile("test_dhcp_leases_version.json");
+        std::error_code rm_ec_12;
+        std::filesystem::remove(path, rm_ec_12);
         CHECK(server.DumpLeases(path, t0));
 
         std::ifstream file(path, std::ios::binary);
@@ -1692,7 +1726,8 @@ void TestLeaseHostnameLearnt() {
         // The versioned file still loads.
         DhcpServer restored(config);
         CHECK(restored.LoadLeases(path, t0));
-        std::remove(path.c_str());
+        std::error_code rm_ec_13;
+        std::filesystem::remove(path, rm_ec_13);
     }
 
     // batch82: the v4 lease writer now rides the shared durable writer. A
@@ -1708,8 +1743,9 @@ void TestLeaseHostnameLearnt() {
         const auto t0 = std::chrono::steady_clock::now();
         CHECK(server.Acquire(mac, t0, DhcpServer::OfferStage::kAck) != 0);
 
-        const std::string path = "b-flush-dhcp-leases.json";
-        std::remove(path.c_str());
+        const std::string path = ScratchFile("b-flush-dhcp-leases.json");
+        std::error_code rm_ec_14;
+        std::filesystem::remove(path, rm_ec_14);
         CHECK(server.DumpLeases(path, t0));
         std::string original;
         {
@@ -1737,7 +1773,8 @@ void TestLeaseHostnameLearnt() {
         // A recovered device writes again (the file must not be held open:
         // Windows refuses to replace a destination with an open handle).
         CHECK(server.DumpLeases(path, t0 + std::chrono::seconds(6)));
-        std::remove(path.c_str());
+        std::error_code rm_ec_15;
+        std::filesystem::remove(path, rm_ec_15);
     }
 
     // batch82: a corrupt file must be preserved, not silently overwritten by
@@ -1749,10 +1786,12 @@ void TestLeaseHostnameLearnt() {
         config.dhcp.pool_end = kPoolEnd;
         DhcpServer server(config);
 
-        const std::string path = "b-corrupt-dhcp-leases.json";
+        const std::string path = ScratchFile("b-corrupt-dhcp-leases.json");
         const std::string aside = path + ".corrupt";
-        std::remove(path.c_str());
-        std::remove(aside.c_str());
+        std::error_code rm_ec_16;
+        std::filesystem::remove(path, rm_ec_16);
+        std::error_code rm_ec_17;
+        std::filesystem::remove(aside, rm_ec_17);
         const std::string garbage = "{\"version\":1,\"leases\":[{\"mac\":";
         {
             std::ofstream out(path, std::ios::binary);
@@ -1767,7 +1806,8 @@ void TestLeaseHostnameLearnt() {
                           std::istreambuf_iterator<char>()) == garbage);
         std::ifstream gone(path, std::ios::binary);
         CHECK(!gone.good());
-        std::remove(aside.c_str());
+        std::error_code rm_ec_18;
+        std::filesystem::remove(aside, rm_ec_18);
     }
 
     // batch85: a scanner holding the lease file for a moment is NOT
@@ -1780,8 +1820,9 @@ void TestLeaseHostnameLearnt() {
         config.dhcp.pool_start = kPoolStart;
         config.dhcp.pool_end = kPoolEnd;
         const auto t0 = std::chrono::steady_clock::now();
-        const std::string path = "b-lock-dhcp-leases.json";
-        std::remove(path.c_str());
+        const std::string path = ScratchFile("b-lock-dhcp-leases.json");
+        std::error_code rm_ec_19;
+        std::filesystem::remove(path, rm_ec_19);
         {
             DhcpServer writer(config);
             const WireMac mac{0x95, 1, 1, 1, 1, 1};
@@ -1802,7 +1843,8 @@ void TestLeaseHostnameLearnt() {
         CHECK(outcome == DhcpServer::LoadOutcome::kRestored);
         CHECK(calls.load() == 3);
         CHECK(server.LeaseCount() == 1);
-        std::remove(path.c_str());
+        std::error_code rm_ec_20;
+        std::filesystem::remove(path, rm_ec_20);
     }
 
     void TestLeaseLoadUnreadablePausesDump() {
@@ -1811,8 +1853,9 @@ void TestLeaseHostnameLearnt() {
         config.dhcp.pool_start = kPoolStart;
         config.dhcp.pool_end = kPoolEnd;
         const auto t0 = std::chrono::steady_clock::now();
-        const std::string path = "b-lock2-dhcp-leases.json";
-        std::remove(path.c_str());
+        const std::string path = ScratchFile("b-lock2-dhcp-leases.json");
+        std::error_code rm_ec_21;
+        std::filesystem::remove(path, rm_ec_21);
         {
             DhcpServer writer(config);
             const WireMac mac{0x96, 1, 1, 1, 1, 1};
@@ -1850,7 +1893,8 @@ void TestLeaseHostnameLearnt() {
         DhcpServer fresh(config);
         CHECK(fresh.LoadLeases(path, t0, nullptr) ==
               DhcpServer::LoadOutcome::kRestored);
-        std::remove(path.c_str());
+        std::error_code rm_ec_22;
+        std::filesystem::remove(path, rm_ec_22);
     }
 
     // batch87: a blocked lease writer recovers on the next dump once the file
@@ -1862,8 +1906,9 @@ void TestLeaseHostnameLearnt() {
         config.dhcp.pool_start = kPoolStart;
         config.dhcp.pool_end = kPoolEnd;
         const auto t0 = std::chrono::steady_clock::now();
-        const std::string path = "b-recover-dhcp-leases.json";
-        std::remove(path.c_str());
+        const std::string path = ScratchFile("b-recover-dhcp-leases.json");
+        std::error_code rm_ec_23;
+        std::filesystem::remove(path, rm_ec_23);
         {
             DhcpServer writer(config);
             const WireMac mac{0x97, 1, 1, 1, 1, 1};
@@ -1897,7 +1942,8 @@ void TestLeaseHostnameLearnt() {
         CHECK(reloaded.LoadLeases(path, t0, nullptr) ==
               DhcpServer::LoadOutcome::kRestored);
         CHECK(reloaded.LeaseCount() == merged);
-        std::remove(path.c_str());
+        std::error_code rm_ec_24;
+        std::filesystem::remove(path, rm_ec_24);
     }
 
     // batch206: a client served DURING the blocked window must keep the
@@ -1913,8 +1959,9 @@ void TestLeaseHostnameLearnt() {
         config.dhcp.pool_start = kPoolStart;
         config.dhcp.pool_end = kPoolEnd;
         const auto t0 = std::chrono::steady_clock::now();
-        const std::string path = "b206-same-mac-dhcp-leases.json";
-        std::remove(path.c_str());
+        const std::string path = ScratchFile("b206-same-mac-dhcp-leases.json");
+        std::error_code rm_ec_25;
+        std::filesystem::remove(path, rm_ec_25);
         const WireMac mac{0xA6, 6, 6, 6, 6, 6};
 
         // Session 1: the client holds some address and it reaches the file.
@@ -1973,7 +2020,8 @@ void TestLeaseHostnameLearnt() {
                 server.Acquire(other, t0, DhcpServer::OfferStage::kAck);
             CHECK(other_ip != live_ip);
         }
-        std::remove(path.c_str());
+        std::error_code rm_ec_26;
+        std::filesystem::remove(path, rm_ec_26);
     }
     void TestLeaseSaveFailureReported() {
         vgww::core::Config config;
@@ -2378,8 +2426,9 @@ void TestLeaseHostnameLearnt() {
         // The whole point: DumpLeases must be TOTAL. It used to throw out of
         // the function (nlohmann strict dump), which this catches explicitly
         // so a regression is a clean CHECK failure, not a test-process abort.
-        const std::string path = "test_dhcp_leases_b123_utf8.json";
-        std::remove(path.c_str());
+        const std::string path = ScratchFile("test_dhcp_leases_b123_utf8.json");
+        std::error_code rm_ec_27;
+        std::filesystem::remove(path, rm_ec_27);
         bool threw = false;
         bool dumped = false;
         try {
@@ -2401,7 +2450,8 @@ void TestLeaseHostnameLearnt() {
         if (!back.empty()) {
             CHECK(back[0].hostname == expected);
         }
-        std::remove(path.c_str());
+        std::error_code rm_ec_28;
+        std::filesystem::remove(path, rm_ec_28);
     }
 
     // batch123: the CONTROL path (WebUI / POST /api/dhcp/bindings) is operator

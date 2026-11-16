@@ -291,6 +291,26 @@ namespace {
         return fn();
     }
 
+    // P139: parallel instances of this suite must not bind the same v6 sink
+    // port. Probe-bind port 0 on the requested family and read back the
+    // ephemeral port; 0 means the probe failed and the caller CHECKs instead
+    // of sending every v6 flow at a port nobody owns.
+    uint16_t UniqueUdpPort(bool v6) {
+        asio::io_context io;
+        asio::ip::udp::socket probe(io);
+        std::error_code err;
+        probe.open(v6 ? asio::ip::udp::v6() : asio::ip::udp::v4(), err);
+        if (err) return 0;
+        probe.bind(asio::ip::udp::endpoint(
+                       v6 ? asio::ip::make_address("::1")
+                          : asio::ip::make_address("127.0.0.1"),
+                       0),
+                   err);
+        if (err) return 0;
+        const uint16_t port = probe.local_endpoint(err).port();
+        return err ? 0 : port;
+    }
+
     std::vector<uint8_t> BuildArpRequest(const WireMac& src_mac,
                                          uint32_t sender_ip) {
         std::vector<uint8_t> f(kArpFrameLen, 0);
@@ -708,7 +728,11 @@ namespace {
                                              0, 0, 0, 0, 0, 0, 0, 1};
         constexpr uint16_t kSport = 51000;
         constexpr uint16_t kDport = 9;
-        constexpr uint16_t kDport6 = 45681;
+        // P139: the v6 sink port is probed per process (bind 0, read back).
+        // A fixed 45681 made the second parallel instance's bind fail and the
+        // CHECK below turn red with no diagnostic about the real cause.
+        const uint16_t kDport6 = UniqueUdpPort(true);
+        CHECK(0 != kDport6);
 
         asio::io_context sink_io;
         asio::ip::udp::socket sink6(sink_io);
@@ -718,6 +742,11 @@ namespace {
             sink6.bind(asio::ip::udp::endpoint(
                            asio::ip::make_address_v6("::1"), kDport6),
                        sink_err);
+        }
+        if (sink_err) {
+            std::fprintf(stderr,
+                         "[b295] v6 sink bind failed: %s\n",
+                         sink_err.message().c_str());
         }
         CHECK(!sink_err);
 

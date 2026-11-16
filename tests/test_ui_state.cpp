@@ -41,10 +41,26 @@ namespace {
     using uis::RectI;
     using uis::WindowState;
 
+    // P139: per-process scratch directory (pid leaf) so parallel
+    // instances never write and delete the same lease/config file.
+    std::string ScratchDir() {
+        const std::string leaf = "vgww-tests-uistate-" +
+                                 std::to_string(::GetCurrentProcessId());
+        const std::filesystem::path dir =
+            std::filesystem::temp_directory_path() / leaf;
+        std::error_code ec;
+        std::filesystem::create_directories(dir, ec);
+        return dir.string();
+    }
+
+    std::string ScratchFile(const char* name) {
+        return (std::filesystem::path(ScratchDir()) / name).string();
+    }
+
     // batch326: scratch path in the OS temp folder (portable across machines).
     const std::wstring kDir =
         (std::filesystem::temp_directory_path() / L"vgww-tests" /
-         L"b258-ui-state")
+         (L"b258-ui-state-" + std::to_wstring(::GetCurrentProcessId())))
             .wstring();
     const std::wstring kPath = kDir + L"\\ui_state.json";
 

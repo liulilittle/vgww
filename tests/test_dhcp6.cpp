@@ -18,6 +18,10 @@
 #include <atomic>
 #include <cstdio>
 #include <cstring>
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#include <windows.h>
 #include <filesystem>
 #include <fstream>
 #include <iterator>
@@ -26,6 +30,24 @@
 namespace {
 
     // batch326: scratch paths come from the OS temp folder (portable).
+    // P139: every document this process writes gets its OWN directory
+    // under the temp root, keyed by pid. A shared "vgww-tests" leaf let
+    // parallel instances write and delete the same lease file, which is
+    // exactly the cross-talk that turned this suite red under a parallel run.
+    std::string ScratchDir() {
+        const std::string leaf = "vgww-tests-dhcp6-" +
+                                 std::to_string(::GetCurrentProcessId());
+        const std::filesystem::path dir =
+            std::filesystem::temp_directory_path() / leaf;
+        std::error_code ec;
+        std::filesystem::create_directories(dir, ec);
+        return dir.string();
+    }
+
+    std::string ScratchFile(const char* name) {
+        return (std::filesystem::path(ScratchDir()) / name).string();
+    }
+
     std::string AbsentPath(const char* leaf) {
         return (std::filesystem::temp_directory_path() / "vgww-tests" / leaf)
             .string();
@@ -1026,7 +1048,7 @@ namespace {
         Config config = MakeConfig();
         Dhcp6Server server(config);
 
-        const std::string path = "test_dhcp6_leases_dup_addr.json";
+        const std::string path = ScratchFile("test_dhcp6_leases_dup_addr.json");
         {
             std::ofstream out(path);
             out << "{\"version\":1,\"leases\":["
@@ -1060,7 +1082,8 @@ namespace {
         CHECK(1 == dropped);
         CHECK(1 == server.DroppedLeaseCount());  // batch119: surfaced, not silent
 
-        std::remove(path.c_str());
+        std::error_code rm_ec_1;
+        std::filesystem::remove(path, rm_ec_1);
     }
 
     // batch122: DHCPv6 parse refusals are counted like the v4 sibling.
@@ -1076,7 +1099,7 @@ namespace {
     void TestB120Leases6FileCorruptIsFlagged() {
         Config config = MakeConfig();
         Dhcp6Server server(config);
-        const std::string path = "test_dhcp6_leases_b120.json";
+        const std::string path = ScratchFile("test_dhcp6_leases_b120.json");
         {
             std::ofstream out(path);
             out << "{\"version\":99}";
@@ -1090,8 +1113,10 @@ namespace {
             std::ifstream aside(path + ".corrupt");
             CHECK(aside.good());
         }
-        std::remove(path.c_str());
-        std::remove((path + ".corrupt").c_str());
+        std::error_code rm_ec_2;
+        std::filesystem::remove(path, rm_ec_2);
+        std::error_code rm_ec_3;
+        std::filesystem::remove(path + ".corrupt", rm_ec_3);
     }
 
     void TestLeases6LoadSkipsIllegal() {
@@ -1103,7 +1128,7 @@ namespace {
         config.ipv6.dhcpv6.static_bindings.push_back(cfg);
         Dhcp6Server server(config);
 
-        const std::string path = "test_dhcp6_leases_illegal.json";
+        const std::string path = ScratchFile("test_dhcp6_leases_illegal.json");
         {
             std::ofstream out(path);
             out << "{\"version\":1,\"leases\":["
@@ -1161,7 +1186,8 @@ namespace {
         CHECK(server3.LoadLeases(path, std::chrono::steady_clock::now(),
                                  nullptr) ==
               Dhcp6Server::LoadOutcome::kCorrupt);
-        std::remove(path.c_str());
+        std::error_code rm_ec_4;
+        std::filesystem::remove(path, rm_ec_4);
     }
 
     // --- 12e. OBS-1: legacy v6 file missing expires_in_s is restored ------
@@ -1175,7 +1201,7 @@ namespace {
         Config config = MakeConfig();
         Dhcp6Server server(config);
 
-        const std::string path = "test_dhcp6_leases_legacy.json";
+        const std::string path = ScratchFile("test_dhcp6_leases_legacy.json");
         {
             std::ofstream out(path);
             out << "{\"version\":1,\"leases\":["
@@ -1202,7 +1228,8 @@ namespace {
             0x10, 0x00};
         CHECK(server.Acquire(kClientDuid, 1, t0 + std::chrono::seconds(1),
                              Dhcp6Server::OfferStage::kAck) == expected);
-        std::remove(path.c_str());
+        std::error_code rm_ec_5;
+        std::filesystem::remove(path, rm_ec_5);
     }
 
     // --- 13. lease file round-trip (version + atomic replace) -------------
@@ -1216,9 +1243,11 @@ namespace {
             server.Acquire(kOtherDuid, 2, t0, Dhcp6Server::OfferStage::kAck);
         CHECK(!IsZeroAddr(a) && !IsZeroAddr(b) && a != b);
 
-        const std::string path = "test_dhcp6_leases_roundtrip.json";
-        std::remove(path.c_str());
-        std::remove((path + ".tmp").c_str());
+        const std::string path = ScratchFile("test_dhcp6_leases_roundtrip.json");
+        std::error_code rm_ec_6;
+        std::filesystem::remove(path, rm_ec_6);
+        std::error_code rm_ec_7;
+        std::filesystem::remove(path + ".tmp", rm_ec_7);
         CHECK(server.DumpLeases(path, t0));
 
         std::ifstream file(path, std::ios::binary);
@@ -1243,7 +1272,8 @@ namespace {
                                Dhcp6Server::OfferStage::kAck) == a);
         CHECK(restored.Acquire(kOtherDuid, 2, t0,
                                Dhcp6Server::OfferStage::kAck) == b);
-        std::remove(path.c_str());
+        std::error_code rm_ec_8;
+        std::filesystem::remove(path, rm_ec_8);
     }
 
     // --- 13b. batch82: shared durable writer + corrupt-file preservation ---
@@ -1255,8 +1285,9 @@ namespace {
         CHECK(!IsZeroAddr(server.Acquire(kClientDuid, 1, t0,
                                          Dhcp6Server::OfferStage::kAck)));
 
-        const std::string path = "b-flush-dhcp6-leases.json";
-        std::remove(path.c_str());
+        const std::string path = ScratchFile("b-flush-dhcp6-leases.json");
+        std::error_code rm_ec_9;
+        std::filesystem::remove(path, rm_ec_9);
         CHECK(server.DumpLeases(path, t0));
         std::string original;
         {
@@ -1281,15 +1312,18 @@ namespace {
         }
 
         CHECK(server.DumpLeases(path, t0 + std::chrono::seconds(6)));
-        std::remove(path.c_str());
+        std::error_code rm_ec_10;
+        std::filesystem::remove(path, rm_ec_10);
     }
 
     void TestCorruptLease6FilePreserved() {
         Dhcp6Server server(MakeConfig());
-        const std::string path = "b-corrupt-dhcp6-leases.json";
+        const std::string path = ScratchFile("b-corrupt-dhcp6-leases.json");
         const std::string aside = path + ".corrupt";
-        std::remove(path.c_str());
-        std::remove(aside.c_str());
+        std::error_code rm_ec_11;
+        std::filesystem::remove(path, rm_ec_11);
+        std::error_code rm_ec_12;
+        std::filesystem::remove(aside, rm_ec_12);
         const std::string garbage = "{\"version\":1,\"leases\":[{\"duid\":";
         {
             std::ofstream out(path, std::ios::binary);
@@ -1304,7 +1338,8 @@ namespace {
                           std::istreambuf_iterator<char>()) == garbage);
         std::ifstream gone(path, std::ios::binary);
         CHECK(!gone.good());
-        std::remove(aside.c_str());
+        std::error_code rm_ec_13;
+        std::filesystem::remove(aside, rm_ec_13);
     }
 
     // batch85: same discipline as v4 - a transient holder is retried, and a
@@ -1312,8 +1347,9 @@ namespace {
     void TestLease6LoadTransientLockIsNotCorrupt() {
         Config config = MakeConfig();
         const auto t0 = std::chrono::steady_clock::now();
-        const std::string path = "b-lock-dhcp6-leases.json";
-        std::remove(path.c_str());
+        const std::string path = ScratchFile("b-lock-dhcp6-leases.json");
+        std::error_code rm_ec_14;
+        std::filesystem::remove(path, rm_ec_14);
         {
             Dhcp6Server writer(config);
             CHECK(!IsZeroAddr(writer.Acquire(
@@ -1334,14 +1370,16 @@ namespace {
         CHECK(outcome == Dhcp6Server::LoadOutcome::kRestored);
         CHECK(calls.load() == 3);
         CHECK(server.LeaseCount() == 1);
-        std::remove(path.c_str());
+        std::error_code rm_ec_15;
+        std::filesystem::remove(path, rm_ec_15);
     }
 
     void TestLease6LoadUnreadablePausesDump() {
         Config config = MakeConfig();
         const auto t0 = std::chrono::steady_clock::now();
-        const std::string path = "b-lock2-dhcp6-leases.json";
-        std::remove(path.c_str());
+        const std::string path = ScratchFile("b-lock2-dhcp6-leases.json");
+        std::error_code rm_ec_16;
+        std::filesystem::remove(path, rm_ec_16);
         {
             Dhcp6Server writer(config);
             CHECK(!IsZeroAddr(writer.Acquire(
@@ -1376,15 +1414,17 @@ namespace {
         Dhcp6Server fresh(config);
         CHECK(fresh.LoadLeases(path, t0, nullptr) ==
               Dhcp6Server::LoadOutcome::kRestored);
-        std::remove(path.c_str());
+        std::error_code rm_ec_17;
+        std::filesystem::remove(path, rm_ec_17);
     }
 
     // batch87: blocked v6 lease writer recovers on the next dump.
     void TestLease6DumpRecoversFromBlocked() {
         Config config = MakeConfig();
         const auto t0 = std::chrono::steady_clock::now();
-        const std::string path = "b-recover-dhcp6-leases.json";
-        std::remove(path.c_str());
+        const std::string path = ScratchFile("b-recover-dhcp6-leases.json");
+        std::error_code rm_ec_18;
+        std::filesystem::remove(path, rm_ec_18);
         {
             Dhcp6Server writer(config);
             CHECK(!IsZeroAddr(writer.Acquire(
@@ -1415,14 +1455,15 @@ namespace {
         CHECK(reloaded.LoadLeases(path, t0, nullptr) ==
               Dhcp6Server::LoadOutcome::kRestored);
         CHECK(reloaded.LeaseCount() == merged);
-        std::remove(path.c_str());
+        std::error_code rm_ec_19;
+        std::filesystem::remove(path, rm_ec_19);
     }
 
     // --- 14. oversized lease file is rejected (cap) -----------------------
     void TestLoadCap() {
         Config config = MakeConfig();
         Dhcp6Server server(config);
-        const std::string path = "test_dhcp6_leases_oversized.json";
+        const std::string path = ScratchFile("test_dhcp6_leases_oversized.json");
         {
             std::ofstream out(path, std::ios::binary);
             CHECK(out.good());
@@ -1433,7 +1474,8 @@ namespace {
         }
         CHECK(!server.LoadLeases(path, std::chrono::steady_clock::now()));
         CHECK(server.LeaseCount() == 0);
-        std::remove(path.c_str());
+        std::error_code rm_ec_20;
+        std::filesystem::remove(path, rm_ec_20);
 
         // Corrupt JSON is rejected without loading anything.
         {
@@ -1442,7 +1484,8 @@ namespace {
         }
         CHECK(!server.LoadLeases(path, std::chrono::steady_clock::now()));
         CHECK(server.LeaseCount() == 0);
-        std::remove(path.c_str());
+        std::error_code rm_ec_21;
+        std::filesystem::remove(path, rm_ec_21);
     }
 
     // --- 15. per-DUID rate limit ------------------------------------------
@@ -2083,9 +2126,11 @@ static void TestB81DumpLeasesDoesNotStallLockHolders() {
     });
     started.store(true, std::memory_order_release);
 
-    const std::string path = "test_b81_leases6.json";
-    std::remove(path.c_str());
-    std::remove((path + ".tmp").c_str());
+    const std::string path = ScratchFile("test_b81_leases6.json");
+    std::error_code rm_ec_22;
+    std::filesystem::remove(path, rm_ec_22);
+    std::error_code rm_ec_23;
+    std::filesystem::remove(path + ".tmp", rm_ec_23);
 
     // Window 1 (baseline): no dump, just the probe contending with itself.
     while (probes.load(std::memory_order_relaxed) < 50) {
@@ -2158,8 +2203,10 @@ static void TestB81DumpLeasesDoesNotStallLockHolders() {
                 dump_rate > 0.0 ? baseline_rate / dump_rate : 0.0);
     // 5x: red measures a 40x-400x drop; green stays within a small factor.
     CHECK(dump_rate * 5.0 > baseline_rate);
-    std::remove(path.c_str());
-    std::remove((path + ".tmp").c_str());
+    std::error_code rm_ec_24;
+    std::filesystem::remove(path, rm_ec_24);
+    std::error_code rm_ec_25;
+    std::filesystem::remove(path + ".tmp", rm_ec_25);
 }
 
 }  // namespace

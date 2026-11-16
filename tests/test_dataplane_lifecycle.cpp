@@ -40,6 +40,22 @@
 
 namespace {
 
+    // P139: per-process scratch directory (pid leaf) so parallel
+    // instances never write and delete the same lease/config file.
+    std::string ScratchDir() {
+        const std::string leaf = "vgww-tests-dpl-" +
+                                 std::to_string(::GetCurrentProcessId());
+        const std::filesystem::path dir =
+            std::filesystem::temp_directory_path() / leaf;
+        std::error_code ec;
+        std::filesystem::create_directories(dir, ec);
+        return dir.string();
+    }
+
+    std::string ScratchFile(const char* name) {
+        return (std::filesystem::path(ScratchDir()) / name).string();
+    }
+
     int g_failures = 0;
 
 #define CHECK(cond)                                                        \
@@ -622,7 +638,7 @@ namespace {
     /// executor the UI uses.
     void TestB137ReplaceBindingThroughExecutorIsAtomic() {
         const vgww::core::Config config = MakeDhcpMainConfig();
-        const std::string lease_path = "b137-replace-leases.json";
+        const std::string lease_path = ScratchFile("b137-replace-leases.json");
         std::remove(lease_path.c_str());
 
         vgww::runtime::Dataplane dataplane(config, lease_path);
@@ -836,7 +852,7 @@ namespace {
     /// Main-mode DISCOVER -> OFFER, asserted byte for byte.
     void TestDhcpDiscoverGetsOffer() {
         const vgww::core::Config config = MakeDhcpMainConfig();
-        const std::string lease_path = "offer-leases.json";
+        const std::string lease_path = ScratchFile("offer-leases.json");
         std::remove(lease_path.c_str());
 
         vgww::runtime::Dataplane dataplane(config, lease_path);
@@ -890,7 +906,7 @@ namespace {
     /// still runs (no Stop before the assertion).
     void TestB99V4LeasesDumpedPeriodically() {
         const vgww::core::Config config = MakeDhcpMainConfig();
-        const std::string lease_path = "periodic-leases.json";
+        const std::string lease_path = ScratchFile("periodic-leases.json");
         std::remove(lease_path.c_str());
 
         vgww::runtime::Dataplane dataplane(config, lease_path);
@@ -931,7 +947,7 @@ namespace {
     /// verdict on Start), and only a later clean stop may clear it.
     void TestB102StopDirtyVerdictSurvivesRestart() {
         const vgww::core::Config config = MakeDhcpMainConfig();
-        const std::string lease_path = "b102-stop-dirty.json";
+        const std::string lease_path = ScratchFile("b102-stop-dirty.json");
         std::remove(lease_path.c_str());
         vgww::runtime::Dataplane dataplane(config, lease_path);
         dataplane.SetDriverClient(std::make_unique<FakeDriverClient>());
@@ -972,7 +988,7 @@ namespace {
     /// survives the server teardown.
     void TestB100StopReportsLeaseDumpFailure() {
         const vgww::core::Config config = MakeDhcpMainConfig();
-        const std::string lease_path = "b100-stop-dump.json";
+        const std::string lease_path = ScratchFile("b100-stop-dump.json");
         std::remove(lease_path.c_str());
         {
             vgww::runtime::Dataplane dataplane(config, lease_path);
@@ -1069,7 +1085,7 @@ namespace {
         {
             vgww::core::Config config = MakeDhcpMainConfig();
             config.dhcp.enabled = false;
-            const std::string lease_path = "disabled-leases.json";
+            const std::string lease_path = ScratchFile("disabled-leases.json");
             std::remove(lease_path.c_str());
 
             vgww::runtime::Dataplane dataplane(config, lease_path);
@@ -1087,7 +1103,7 @@ namespace {
 
         {
             const vgww::core::Config config = MakeDhcpMainConfig();
-            const std::string lease_path = "corrupt-leases.json";
+            const std::string lease_path = ScratchFile("corrupt-leases.json");
             std::remove(lease_path.c_str());
             {
                 std::ofstream out(lease_path, std::ios::binary);
@@ -1112,7 +1128,7 @@ namespace {
     void TestV6DisabledWhenIpv6Off() {
         vgww::core::Config config = MakeDhcp6MainConfig();
         config.ipv6.enabled = false;  // dhcpv6.enabled stays true
-        const std::string lease_path = "v6off-leases.json";
+        const std::string lease_path = ScratchFile("v6off-leases.json");
         std::remove(lease_path.c_str());
 
         vgww::runtime::Dataplane dataplane(config, lease_path);
@@ -1140,7 +1156,7 @@ namespace {
     /// from the assembled DHCPv6 server.
     void TestDhcp6SolicitViaDataplane() {
         const vgww::core::Config config = MakeDhcp6MainConfig();
-        const std::string lease_path = "solicit6-leases.json";
+        const std::string lease_path = ScratchFile("solicit6-leases.json");
         const std::string lease6_path = lease_path + ".leases6";
         std::remove(lease_path.c_str());
         std::remove(lease6_path.c_str());
@@ -1177,7 +1193,7 @@ namespace {
     void TestRsNoRaWhenIpv6Disabled() {
         vgww::core::Config config = MakeDhcp6MainConfig();
         config.ipv6.enabled = false;
-        const std::string lease_path = "rs-gate-leases.json";
+        const std::string lease_path = ScratchFile("rs-gate-leases.json");
         std::remove(lease_path.c_str());
 
         vgww::runtime::Dataplane dataplane(config, lease_path);
@@ -1202,7 +1218,7 @@ namespace {
     void TestBypassSendsNoRa() {
         vgww::core::Config config = MakeDhcp6MainConfig();
         config.mode = vgww::core::Mode::kBypass;
-        const std::string lease_path = "bypass-ra-leases.json";
+        const std::string lease_path = ScratchFile("bypass-ra-leases.json");
         std::remove(lease_path.c_str());
 
         vgww::runtime::Dataplane dataplane(config, lease_path);

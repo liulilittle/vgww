@@ -3728,7 +3728,7 @@ static void TestP122WebConfigBindingCapRefusalIsAudited() {
     std::remove(path.c_str());
     std::remove(ScratchFile("p122_leases.json").c_str());
     // batch164: the v6 lease store is derived from the v4 path (LeaseFile6).
-    std::remove("p122_leases.json.leases6");
+    std::remove(ScratchFile("p122_leases.json.leases6").c_str());
     std::filesystem::remove_all(rules, ec);
 }
 
@@ -3832,7 +3832,7 @@ static void TestP123WebConfigMergeMatchesDuidByValue() {
     std::remove(path.c_str());
     std::remove(ScratchFile("p123_leases.json").c_str());
     // batch164: the v6 lease store is derived from the v4 path (LeaseFile6).
-    std::remove("p123_leases.json.leases6");
+    std::remove(ScratchFile("p123_leases.json.leases6").c_str());
     std::error_code ec;
     std::filesystem::remove_all(rules, ec);
 }
@@ -3953,7 +3953,7 @@ static void TestP124WebConfigV6BindingCapRefusalIsAudited() {
     std::remove(path.c_str());
     std::remove(ScratchFile("p124_leases.json").c_str());
     // batch164: the v6 lease store is derived from the v4 path (LeaseFile6).
-    std::remove("p124_leases.json.leases6");
+    std::remove(ScratchFile("p124_leases.json.leases6").c_str());
     std::error_code ec2;
     std::filesystem::remove_all(rules, ec2);
 }
@@ -4611,9 +4611,15 @@ static void TestB90ConcurrentBlockedRecovery() {
         CHECK(RuleDocHasWanPort(body, 9400));  // disk rule merged
         CHECK(RuleDocHasWanPort(body, 9500));  // live rule written
     }
-    // No temp leftovers from the racing writers.
+    // No temp leftovers from the racing writers. The scan must cover the
+    // directory the rules actually live in: iterating "." only worked because
+    // the ctest WORKING_DIRECTORY happened to be the repository root, and a
+    // parallel instance's leftovers were invisible to it.
     size_t leftovers = 0;
-    for (const auto& entry : std::filesystem::directory_iterator(".")) {
+    const std::string rules_dir =
+        std::filesystem::path(path).parent_path().string();
+    for (const auto& entry :
+         std::filesystem::directory_iterator(rules_dir)) {
         const std::string name = entry.path().filename().string();
         if (0 == name.rfind(path + ".tmp.", 0)) {
             ++leftovers;
@@ -10440,7 +10446,7 @@ int main(int argc, char** argv) {
     // A rejected document is preserved for the operator to inspect; the TEST
     // must not leave it behind, or the working tree accumulates one permanent
     // neighbour per run.
-    std::remove((std::string("oversize.json.rules.json") + ".corrupt").c_str());
+    std::remove((ScratchFile("oversize.json.rules.json") + ".corrupt").c_str());
 
     // ---- P8 deviation 1 (audit B): legacy persisted rules may hold
     //      non-canonical

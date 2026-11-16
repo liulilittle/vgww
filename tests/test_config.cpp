@@ -34,6 +34,24 @@ namespace {
         }                                                                  \
     } while (0)
 
+    // P139: every scratch document lives in a per-process directory under
+    // the OS temp root. A bare CWD-relative name makes parallel instances
+    // collide (one renames onto another's destination, one removes another's
+    // file mid-write), which is exactly the cross-talk that turned this suite
+    // red under a parallel run.
+    std::string ScratchDir() {
+        const std::string leaf =
+            std::string("vgww-tests-config-") + std::to_string(::GetCurrentProcessId());
+        const std::filesystem::path dir =
+            std::filesystem::temp_directory_path() / leaf;
+        std::error_code ec;
+        std::filesystem::create_directories(dir, ec);
+        return dir.string();
+    }
+
+    std::string ScratchFile(const char* name) {
+        return (std::filesystem::path(ScratchDir()) / name).string();
+    }
     bool WriteFile(const std::string& path, const std::string& content) {
         std::ofstream out(path);
         if (!out) return false;
@@ -82,7 +100,7 @@ namespace {
     /// durability the volume never provided (the "saved" config/rule set can
     /// vanish or come back torn after a power cut).
     void TestFileFlushFailureIsNotSaved() {
-        const std::string path = "b-flush-record.json";
+        const std::string path = ScratchFile("b-flush-record.json");
         std::remove(path.c_str());
         const auto read_all = [](const std::string& p) {
             std::ifstream in(p, std::ios::binary);
@@ -110,7 +128,9 @@ namespace {
         CHECK(read_all(path) == original);
         // No temp leftovers next to the destination.
         size_t stale = 0;
-        for (const auto& entry : std::filesystem::directory_iterator(".")) {
+        const std::string scan_dir =
+            std::filesystem::path(path).parent_path().string();
+        for (const auto& entry : std::filesystem::directory_iterator(scan_dir)) {
             const std::string name = entry.path().filename().string();
             if (0 == name.rfind("b-flush-record.json.tmp.", 0)) {
                 ++stale;
@@ -132,7 +152,7 @@ namespace {
     /// thread, and asserts the temp is gone - which only the retrying delete
     /// achieves.
     void TestTempCleanupRetriesWhileLocked() {
-        const std::string path = "b-tmp-lock.json";
+        const std::string path = ScratchFile("b-tmp-lock.json");
         std::remove(path.c_str());
 
         std::atomic<bool> held{false};
@@ -144,7 +164,7 @@ namespace {
         // delete sharing so the first DeleteFileW fails, then let a helper
         // thread close it shortly after (still well inside the 200 ms budget).
         vgww::core::SetPreDeleteHookForTest([&](const std::string& p) {
-            if (p.find("b-tmp-lock.json.tmp.") != 0) {
+            if (p.find("b-tmp-lock.json.tmp.") == std::string::npos) {
                 return;
             }
             held_name = p;
@@ -190,7 +210,7 @@ namespace {
     /// still be there byte-for-byte for them to inspect - the same
     /// "preserve, never silently destroy" rule the rules/lease stores follow.
     void TestLoadFailureDoesNotTouchTheFile() {
-        const std::string path = "b-load-corrupt.json";
+        const std::string path = ScratchFile("b-load-corrupt.json");
         std::remove(path.c_str());
         const std::string garbage = "{\"gateway\":";
         {
@@ -218,7 +238,7 @@ namespace {
     /// bounded number of times, then reports it as unreadable (never as
     /// "missing" and never as "corrupt").
     void TestConfigOpenRetryOnTransientLock() {
-        const std::string path = "b-open-retry.json";
+        const std::string path = ScratchFile("b-open-retry.json");
         std::remove(path.c_str());
         Config c;
         c.adapter = "retry-A";
@@ -249,7 +269,7 @@ namespace {
     void TestConfigOpenFailureIsClassified() {
         // An existing file that stays un-openable is reported as unreadable
         // (with the OS error) and is left untouched.
-        const std::string path = "b-open-locked.json";
+        const std::string path = ScratchFile("b-open-locked.json");
         std::remove(path.c_str());
         {
             std::ofstream out(path, std::ios::binary);
@@ -307,7 +327,7 @@ namespace {
     }
 
     void TestLoadValidConfig() {
-        const std::string path = "test_config_valid.json";
+        const std::string path = ScratchFile("test_config_valid.json");
         // NOTE: keep raw strings OUT of macro arguments - the MSVC traditional
         // preprocessor mis-parses them. Assign first, assert separately.
         const std::string json_text = R"({
@@ -335,7 +355,7 @@ namespace {
         std::string error;
         // Missing gateway section must be rejected.
         error.clear();
-        const std::string path2 = "test_config_no_gateway.json";
+        const std::string path2 = ScratchFile("test_config_no_gateway.json");
         CHECK(WriteFile(path2, "{}"));
         CHECK(!Config::LoadFromFile(path2, error).has_value());
         std::remove(path2.c_str());
@@ -376,7 +396,7 @@ namespace {
 
     void TestPerfValidation() {
         const auto reject = [](const std::string& perf) {
-            const auto r = LoadFromText("test_cfg_perf.json",
+            const auto r = LoadFromText(ScratchFile("test_cfg_perf.json"),
                                         Skeleton("\"perf\":" + perf));
             CHECK(r.wrote);
             CHECK(!r.config.has_value());
@@ -397,7 +417,7 @@ namespace {
 
         // The old default (65536) stays loadable: cap = old default.
         const auto cap_ok = LoadFromText(
-            "test_cfg_perf.json", Skeleton(R"("perf":{"udp_flow_cap":65536})"));
+            ScratchFile("test_cfg_perf.json"), Skeleton(R"("perf":{"udp_flow_cap":65536})"));
         CHECK(cap_ok.wrote);
         CHECK(cap_ok.config.has_value());
         if (cap_ok.config) {
@@ -406,7 +426,7 @@ namespace {
 
         // All minimums accepted.
         const auto ok = LoadFromText(
-            "test_cfg_perf.json",
+            ScratchFile("test_cfg_perf.json"),
             Skeleton(R"("perf":{"workers":1,"rx_batch":1,"max_conns":1,"udp_flow_cap":1,"ring_capacity":1,"dial_timeout_ms":1})"));
         CHECK(ok.wrote);
         CHECK(ok.config.has_value());
@@ -424,7 +444,7 @@ namespace {
 
     void TestGatewayValidation() {
         const auto reject = [](const std::string& json) {
-            const auto r = LoadFromText("test_cfg_gateway.json", json);
+            const auto r = LoadFromText(ScratchFile("test_cfg_gateway.json"), json);
             CHECK(r.wrote);
             CHECK(!r.config.has_value());
         };
@@ -438,7 +458,7 @@ namespace {
 
         // Valid masks (255.255.255.0, 255.255.0.0) accepted.
         const auto ok = LoadFromText(
-            "test_cfg_gateway.json",
+            ScratchFile("test_cfg_gateway.json"),
             GatewayJson("192.168.0.40", "255.255.0.0"));
         CHECK(ok.wrote);
         CHECK(ok.config.has_value());
@@ -450,7 +470,7 @@ namespace {
                                      "255.255.255.254"};
         for (const char* mask : valid_masks) {
             const auto r = LoadFromText(
-                "test_cfg_gateway.json", GatewayJson("192.168.0.40", mask));
+                ScratchFile("test_cfg_gateway.json"), GatewayJson("192.168.0.40", mask));
             CHECK(r.wrote);
             CHECK(r.config.has_value());
             if (r.config) {
@@ -463,7 +483,7 @@ namespace {
 
     void TestIpv6Validation() {
         const auto reject = [](const std::string& ipv6) {
-            const auto r = LoadFromText("test_cfg_ipv6.json",
+            const auto r = LoadFromText(ScratchFile("test_cfg_ipv6.json"),
                                         Skeleton("\"ipv6\":" + ipv6));
             CHECK(r.wrote);
             CHECK(!r.config.has_value());
@@ -486,7 +506,7 @@ namespace {
 
         // A valid ULA + lifetime is accepted and the bytes are wired through.
         const auto ok = LoadFromText(
-            "test_cfg_ipv6.json",
+            ScratchFile("test_cfg_ipv6.json"),
             Skeleton(
                 R"("ipv6":{"enabled":true,"ula_prefix":"fdaa:0:0::/48","ra_lifetime_s":65535})"));
         CHECK(ok.wrote);
@@ -502,7 +522,7 @@ namespace {
 
         // A bare prefix + explicit prefix_len key also works.
         const auto no_slash = LoadFromText(
-            "test_cfg_ipv6.json",
+            ScratchFile("test_cfg_ipv6.json"),
             Skeleton(R"("ipv6":{"enabled":true,"ula_prefix":"fd00::","prefix_len":64})"));
         CHECK(no_slash.wrote);
         CHECK(no_slash.config.has_value());
@@ -513,7 +533,7 @@ namespace {
 
         // RDNSS: up to 3 full v6 addresses are accepted and byte-preserved.
         const auto dns_ok = LoadFromText(
-            "test_cfg_ipv6.json",
+            ScratchFile("test_cfg_ipv6.json"),
             Skeleton(
                 R"("ipv6":{"enabled":true,"ula_prefix":"fd00::/64","dns":["fd00::53","fe80::1"]})"));
         CHECK(dns_ok.wrote);
@@ -527,7 +547,7 @@ namespace {
         }
         // An empty dns list is allowed (no RDNSS => today's behavior).
         const auto empty_dns = LoadFromText(
-            "test_cfg_ipv6.json",
+            ScratchFile("test_cfg_ipv6.json"),
             Skeleton(
                 R"("ipv6":{"enabled":true,"ula_prefix":"fd00::/64","dns":[]})"));
         CHECK(empty_dns.wrote);
@@ -537,7 +557,7 @@ namespace {
         }
         // An unspecified address (::) must be skipped, not advertised.
         const auto zero_dns = LoadFromText(
-            "test_cfg_ipv6.json",
+            ScratchFile("test_cfg_ipv6.json"),
             Skeleton(
                 R"("ipv6":{"enabled":true,"ula_prefix":"fd00::/64","dns":["::","fd00::1"]})"));
         CHECK(zero_dns.wrote);
@@ -549,7 +569,7 @@ namespace {
         // Reject: more than 3, a "/length" suffix, malformed, non-string.
         const auto reject_dns = [&](const std::string& dns) {
             const auto r = LoadFromText(
-                "test_cfg_ipv6.json",
+                ScratchFile("test_cfg_ipv6.json"),
                 Skeleton(R"("ipv6":{"enabled":true,"ula_prefix":"fd00::/64","dns":)"
                             + dns + "}"));
             CHECK(r.wrote);
@@ -565,7 +585,7 @@ namespace {
     void TestVlanValidation() {
         // A valid single access VLAN must load and preserve its id.
         const auto ok = LoadFromText(
-            "test_cfg_vlan.json", Skeleton(R"("vlan":{"id":100})"));
+            ScratchFile("test_cfg_vlan.json"), Skeleton(R"("vlan":{"id":100})"));
         CHECK(ok.wrote);
         CHECK(ok.config.has_value());
         if (ok.config) {
@@ -573,7 +593,7 @@ namespace {
             CHECK(ok.config->vlan.enabled());
         }
         // Absent section = disabled, id stays 0.
-        const auto absent = LoadFromText("test_cfg_vlan.json", Skeleton(""));
+        const auto absent = LoadFromText(ScratchFile("test_cfg_vlan.json"), Skeleton(""));
         CHECK(absent.wrote);
         CHECK(absent.config.has_value());
         if (absent.config) {
@@ -582,7 +602,7 @@ namespace {
         // Lower boundary: 1 is the smallest valid, explicit id (the example
         // file ships with id:1 - a 0 there would be rejected at load).
         const auto lo = LoadFromText(
-            "test_cfg_vlan.json", Skeleton(R"("vlan":{"id":1})"));
+            ScratchFile("test_cfg_vlan.json"), Skeleton(R"("vlan":{"id":1})"));
         CHECK(lo.wrote);
         CHECK(lo.config.has_value());
         if (lo.config) {
@@ -592,7 +612,7 @@ namespace {
         // Out-of-range and reserved ids must be rejected, never accepted.
         const auto reject = [](const std::string& vlan) {
             const auto r = LoadFromText(
-                "test_cfg_vlan.json", Skeleton("\"vlan\":" + vlan));
+                ScratchFile("test_cfg_vlan.json"), Skeleton("\"vlan\":" + vlan));
             CHECK(r.wrote);
             CHECK(!r.config.has_value());
         };
@@ -609,7 +629,7 @@ namespace {
         const auto reject = [](const uint32_t port) {
             const std::string json =
                 Skeleton("\"web\":{\"port\":" + std::to_string(port) + "}");
-            const auto r = LoadFromText("test_cfg_web.json", json);
+            const auto r = LoadFromText(ScratchFile("test_cfg_web.json"), json);
             CHECK(r.wrote);
             CHECK(!r.config.has_value());
         };
@@ -620,7 +640,7 @@ namespace {
         reject(1023);
         reject(70000);
 
-        const auto lo = LoadFromText("test_cfg_web.json",
+        const auto lo = LoadFromText(ScratchFile("test_cfg_web.json"),
                                      Skeleton(R"("web":{"port":1024})"));
         CHECK(lo.wrote);
         CHECK(lo.config.has_value());
@@ -628,7 +648,7 @@ namespace {
             CHECK(lo.config->web.port == 1024);
         }
 
-        const auto hi = LoadFromText("test_cfg_web.json",
+        const auto hi = LoadFromText(ScratchFile("test_cfg_web.json"),
                                      Skeleton(R"("web":{"port":65535})"));
         CHECK(hi.wrote);
         CHECK(hi.config.has_value());
@@ -640,19 +660,19 @@ namespace {
     void TestStringAndDnsSuperLargeCaps() {
         std::string a256(256, 'a');
         std::string a257(257, 'a');
-        const auto okA = LoadFromText("test_cfg_a256.json",
+        const auto okA = LoadFromText(ScratchFile("test_cfg_a256.json"),
             Skeleton("\"adapter\":\"" + a256 + "\""));
         CHECK(okA.wrote);
         CHECK(okA.config.has_value());
-        const auto badA = LoadFromText("test_cfg_a257.json",
+        const auto badA = LoadFromText(ScratchFile("test_cfg_a257.json"),
             Skeleton("\"adapter\":\"" + a257 + "\""));
         CHECK(badA.wrote);
         CHECK(!badA.config.has_value());
-        const auto okT = LoadFromText("test_cfg_t256.json",
+        const auto okT = LoadFromText(ScratchFile("test_cfg_t256.json"),
             Skeleton("\"web\":{\"port\":8080,\"token\":\"" + a256 + "\"}"));
         CHECK(okT.wrote);
         CHECK(okT.config.has_value());
-        const auto badT = LoadFromText("test_cfg_t257.json",
+        const auto badT = LoadFromText(ScratchFile("test_cfg_t257.json"),
             Skeleton("\"web\":{\"port\":8080,\"token\":\"" + a257 + "\"}"));
         CHECK(badT.wrote);
         CHECK(!badT.config.has_value());
@@ -683,7 +703,7 @@ namespace {
     // ---------------------------------------------------------------------
 
     void TestModeDefaultsToBypass() {
-        const auto r = LoadFromText("test_cfg_mode.json", Skeleton(""));
+        const auto r = LoadFromText(ScratchFile("test_cfg_mode.json"), Skeleton(""));
         CHECK(r.wrote);
         CHECK(r.config.has_value());
         if (r.config) {
@@ -693,7 +713,7 @@ namespace {
     }
 
     void TestModeMainParsed() {
-        const auto r = LoadFromText("test_cfg_mode.json",
+        const auto r = LoadFromText(ScratchFile("test_cfg_mode.json"),
                                     Skeleton(R"("mode":"main")"));
         CHECK(r.wrote);
         CHECK(r.config.has_value());
@@ -710,7 +730,7 @@ namespace {
         for (const char* value : bad_modes) {
             const std::string text =
                 Skeleton(std::string("\"mode\":\"") + value + "\"");
-            const auto r = LoadFromText("test_cfg_mode.json", text);
+            const auto r = LoadFromText(ScratchFile("test_cfg_mode.json"), text);
             CHECK(r.wrote);
             CHECK(!r.config.has_value());
             CHECK(r.error.find("mode") != std::string::npos);
@@ -723,7 +743,7 @@ namespace {
         const char* bad_values[] = {"1", "true", "{}", "[]", "null"};
         for (const char* value : bad_values) {
             const auto r = LoadFromText(
-                "test_cfg_mode.json",
+                ScratchFile("test_cfg_mode.json"),
                 Skeleton(std::string("\"mode\":") + value));
             CHECK(r.wrote);
             CHECK(!r.config.has_value());
@@ -739,7 +759,7 @@ namespace {
     void TestDhcpConfigParsed() {
         const std::string section =
             R"("dhcp":{"enabled":true,"pool":["192.168.0.100","192.168.0.200"],"lease_hours":12})";
-        const auto r = LoadFromText("test_cfg_dhcp.json", Skeleton(section));
+        const auto r = LoadFromText(ScratchFile("test_cfg_dhcp.json"), Skeleton(section));
         CHECK(r.wrote);
         CHECK(r.config.has_value());
         if (r.config) {
@@ -756,11 +776,11 @@ namespace {
 
         // Malformed shapes are rejected (never silently ignored).
         const auto not_object =
-            LoadFromText("test_cfg_dhcp.json", Skeleton(R"("dhcp":[])"));
+            LoadFromText(ScratchFile("test_cfg_dhcp.json"), Skeleton(R"("dhcp":[])"));
         CHECK(not_object.wrote);
         CHECK(!not_object.config.has_value());
         const auto wrong_enabled = LoadFromText(
-            "test_cfg_dhcp.json",
+            ScratchFile("test_cfg_dhcp.json"),
             Skeleton(R"("dhcp":{"enabled":"yes"})"));
         CHECK(wrong_enabled.wrote);
         CHECK(!wrong_enabled.config.has_value());
@@ -772,7 +792,7 @@ namespace {
         // regression silently swallowed JsonToIpv4 failures and left a
         // 0.0.0.0 bound that failed later with a confusing error.
         const auto bad = LoadFromText(
-            "test_cfg_dhcp.json",
+            ScratchFile("test_cfg_dhcp.json"),
             Skeleton(R"("dhcp":{"pool":["192.168.0.100","bad"]})"));
         CHECK(bad.wrote);
         CHECK(!bad.config.has_value());
@@ -783,7 +803,7 @@ namespace {
         const char* bad[] = {"0", "8761"};
         for (const char* hours : bad) {
             const auto r = LoadFromText(
-                "test_cfg_dhcp.json",
+                ScratchFile("test_cfg_dhcp.json"),
                 Skeleton(std::string("\"dhcp\":{\"lease_hours\":") + hours +
                          "}"));
             CHECK(r.wrote);
@@ -792,19 +812,19 @@ namespace {
         }
         // A non-numeric value is a hard error too (never a silent default).
         const auto wrong_type = LoadFromText(
-            "test_cfg_dhcp.json", Skeleton(R"("dhcp":{"lease_hours":"12"})"));
+            ScratchFile("test_cfg_dhcp.json"), Skeleton(R"("dhcp":{"lease_hours":"12"})"));
         CHECK(wrong_type.wrote);
         CHECK(!wrong_type.config.has_value());
         // Both bounds are inclusive.
         const auto lo = LoadFromText(
-            "test_cfg_dhcp.json", Skeleton(R"("dhcp":{"lease_hours":1})"));
+            ScratchFile("test_cfg_dhcp.json"), Skeleton(R"("dhcp":{"lease_hours":1})"));
         CHECK(lo.wrote);
         CHECK(lo.config.has_value());
         if (lo.config) {
             CHECK(lo.config->dhcp.lease_seconds == 3600u);
         }
         const auto hi = LoadFromText(
-            "test_cfg_dhcp.json", Skeleton(R"("dhcp":{"lease_hours":8760})"));
+            ScratchFile("test_cfg_dhcp.json"), Skeleton(R"("dhcp":{"lease_hours":8760})"));
         CHECK(hi.wrote);
         CHECK(hi.config.has_value());
         if (hi.config) {
@@ -816,7 +836,7 @@ namespace {
         // One over kMaxDhcpDns (4) is a hard error, not a silent truncation.
         const std::string five =
             R"("dhcp":{"dns":["192.168.0.1","192.168.0.2","192.168.0.3","192.168.0.4","192.168.0.5"]})";
-        const auto over = LoadFromText("test_cfg_dhcp.json", Skeleton(five));
+        const auto over = LoadFromText(ScratchFile("test_cfg_dhcp.json"), Skeleton(five));
         CHECK(over.wrote);
         CHECK(!over.config.has_value());
         CHECK(!over.error.empty());
@@ -824,7 +844,7 @@ namespace {
         // The cap itself is accepted.
         const std::string four =
             R"("dhcp":{"dns":["192.168.0.1","192.168.0.2","192.168.0.3","192.168.0.4"]})";
-        const auto ok = LoadFromText("test_cfg_dhcp.json", Skeleton(four));
+        const auto ok = LoadFromText(ScratchFile("test_cfg_dhcp.json"), Skeleton(four));
         CHECK(ok.wrote);
         CHECK(ok.config.has_value());
         if (ok.config) {
@@ -838,7 +858,7 @@ namespace {
             R"("dhcp":{"static_bindings":[)"
             R"({"mac":"30:fc:68:88:b4:01","ip":"192.168.0.50"},)"
             R"({"mac":"30:fc:68:88:b4:02","ip":"192.168.0.50"}]})";
-        const auto ip = LoadFromText("test_cfg_dhcp.json", Skeleton(dup_ip));
+        const auto ip = LoadFromText(ScratchFile("test_cfg_dhcp.json"), Skeleton(dup_ip));
         CHECK(ip.wrote);
         CHECK(!ip.config.has_value());
 
@@ -847,7 +867,7 @@ namespace {
             R"("dhcp":{"static_bindings":[)"
             R"({"mac":"30:fc:68:88:b4:01","ip":"192.168.0.50"},)"
             R"({"mac":"30:fc:68:88:b4:01","ip":"192.168.0.51"}]})";
-        const auto mac = LoadFromText("test_cfg_dhcp.json", Skeleton(dup_mac));
+        const auto mac = LoadFromText(ScratchFile("test_cfg_dhcp.json"), Skeleton(dup_mac));
         CHECK(mac.wrote);
         CHECK(!mac.config.has_value());
 
@@ -855,7 +875,7 @@ namespace {
         const std::string gw_binding =
             R"("dhcp":{"static_bindings":[)"
             R"({"mac":"30:fc:68:88:b4:01","ip":"192.168.0.40"}]})";
-        const auto gw = LoadFromText("test_cfg_dhcp.json", Skeleton(gw_binding));
+        const auto gw = LoadFromText(ScratchFile("test_cfg_dhcp.json"), Skeleton(gw_binding));
         CHECK(gw.wrote);
         CHECK(!gw.config.has_value());
     }
@@ -867,12 +887,12 @@ namespace {
                    std::string(len, 'a') + "\"}]}";
         };
 
-        const auto over = LoadFromText("test_cfg_dhcp.json", Skeleton(section(254)));
+        const auto over = LoadFromText(ScratchFile("test_cfg_dhcp.json"), Skeleton(section(254)));
         CHECK(over.wrote);
         CHECK(!over.config.has_value());
 
         // 253 characters is the accepted maximum.
-        const auto ok = LoadFromText("test_cfg_dhcp.json", Skeleton(section(253)));
+        const auto ok = LoadFromText(ScratchFile("test_cfg_dhcp.json"), Skeleton(section(253)));
         CHECK(ok.wrote);
         CHECK(ok.config.has_value());
         if (ok.config) {
@@ -885,7 +905,7 @@ namespace {
         // Pool outside the gateway subnet (192.168.0.0/24).
         const std::string outside =
             R"("dhcp":{"enabled":true,"pool":["10.0.0.100","10.0.0.200"]})";
-        const auto bypass = LoadFromText("test_cfg_dhcp.json", Skeleton(outside));
+        const auto bypass = LoadFromText(ScratchFile("test_cfg_dhcp.json"), Skeleton(outside));
         CHECK(bypass.wrote);
         CHECK(bypass.config.has_value());
         if (bypass.config) {
@@ -895,7 +915,7 @@ namespace {
             CHECK(ok);
         }
         const auto main = LoadFromText(
-            "test_cfg_dhcp.json",
+            ScratchFile("test_cfg_dhcp.json"),
             Skeleton(outside + R"(,"mode":"main")"));
         CHECK(main.wrote);
         CHECK(!main.config.has_value());
@@ -909,11 +929,11 @@ namespace {
             R"("dhcp":{"enabled":true,"pool":["192.168.0.200","192.168.0.100"]})";
         for (const std::string* section : {&contains_gw, &reversed}) {
             const auto skip =
-                LoadFromText("test_cfg_dhcp.json", Skeleton(*section));
+                LoadFromText(ScratchFile("test_cfg_dhcp.json"), Skeleton(*section));
             CHECK(skip.wrote);
             CHECK(skip.config.has_value());
             const auto reject = LoadFromText(
-                "test_cfg_dhcp.json",
+                ScratchFile("test_cfg_dhcp.json"),
                 Skeleton(*section + R"(,"mode":"main")"));
             CHECK(reject.wrote);
             CHECK(!reject.config.has_value());
@@ -923,11 +943,11 @@ namespace {
         // parses it (pool semantics skipped).
         const std::string no_pool = R"("dhcp":{"enabled":true})";
         const auto no_pool_bypass =
-            LoadFromText("test_cfg_dhcp.json", Skeleton(no_pool));
+            LoadFromText(ScratchFile("test_cfg_dhcp.json"), Skeleton(no_pool));
         CHECK(no_pool_bypass.wrote);
         CHECK(no_pool_bypass.config.has_value());
         const auto no_pool_main = LoadFromText(
-            "test_cfg_dhcp.json", Skeleton(no_pool + R"(,"mode":"main")"));
+            ScratchFile("test_cfg_dhcp.json"), Skeleton(no_pool + R"(,"mode":"main")"));
         CHECK(no_pool_main.wrote);
         CHECK(!no_pool_main.config.has_value());
     }
@@ -942,7 +962,7 @@ namespace {
             R"("static_bindings":[{)"
             R"("duid":"0003000100ff","ip":"fd00::5000","hostname":"nas"}]}},)"
             R"("mode":"main")";
-        const auto ok = LoadFromText("test_cfg_dhcp6.json", Skeleton(ok_section));
+        const auto ok = LoadFromText(ScratchFile("test_cfg_dhcp6.json"), Skeleton(ok_section));
         CHECK(ok.wrote);
         CHECK(ok.config.has_value());
         if (ok.config) {
@@ -966,7 +986,7 @@ namespace {
         // Defaults: both pool keys absent stays zero in the config; the server
         // derives prefix::1000 - prefix::1FFF (spec section 5.2).
         const auto defaults = LoadFromText(
-            "test_cfg_dhcp6.json",
+            ScratchFile("test_cfg_dhcp6.json"),
             Skeleton(R"("ipv6":{"enabled":true,"ula_prefix":"fd00::/64",)"
                      R"("dhcpv6":{"enabled":true}},"mode":"main")"));
         CHECK(defaults.wrote);
@@ -981,7 +1001,7 @@ namespace {
 
         const auto reject = [](const std::string& d6) {
             const auto r = LoadFromText(
-                "test_cfg_dhcp6.json",
+                ScratchFile("test_cfg_dhcp6.json"),
                 Skeleton(R"("ipv6":{"enabled":true,"ula_prefix":"fd00::/64",)"
                          R"("dhcpv6":)" + d6 + R"(},"mode":"main")"));
             CHECK(r.wrote);
@@ -1050,7 +1070,7 @@ namespace {
             }
             cap += "]}";
             const auto r = LoadFromText(
-                "test_cfg_dhcp6.json",
+                ScratchFile("test_cfg_dhcp6.json"),
                 Skeleton(R"("ipv6":{"enabled":true,"ula_prefix":"fd00::/64",)"
                          R"("dhcpv6":)" + cap + R"(},"mode":"main")"));
             CHECK(r.wrote);
@@ -1061,7 +1081,7 @@ namespace {
         }
         // Bypass parses the section but does not enforce pool semantics.
         const auto bypass = LoadFromText(
-            "test_cfg_dhcp6.json",
+            ScratchFile("test_cfg_dhcp6.json"),
             Skeleton(R"("ipv6":{"enabled":true,"ula_prefix":"fd00::/64",)"
                      R"("dhcpv6":{"enabled":true,"pool_start":"fd01::1000"}})"));
         CHECK(bypass.wrote);
@@ -1074,7 +1094,7 @@ namespace {
 
     /// Absent bridge section: disabled, default table size, empty ports.
     void TestBridgeConfigDefaults() {
-        const auto r = LoadFromText("test_cfg_bridge.json", Skeleton(""));
+        const auto r = LoadFromText(ScratchFile("test_cfg_bridge.json"), Skeleton(""));
         CHECK(r.wrote);
         CHECK(r.config.has_value());
         if (r.config) {
@@ -1088,7 +1108,7 @@ namespace {
     /// A complete bridge section parses verbatim.
     void TestBridgeConfigParse() {
         const auto r = LoadFromText(
-            "test_cfg_bridge.json",
+            ScratchFile("test_cfg_bridge.json"),
             Skeleton(R"("bridge":{"enabled":true,"upstream":"NIC 1","downstream":"NIC 2","mac_table_size":1024})"));
         CHECK(r.wrote);
         CHECK(r.config.has_value());
@@ -1103,7 +1123,7 @@ namespace {
     /// Upstream and downstream must differ; the error names the section.
     void TestBridgeRejectsSamePorts() {
         const auto r = LoadFromText(
-            "test_cfg_bridge.json",
+            ScratchFile("test_cfg_bridge.json"),
             Skeleton(R"("bridge":{"enabled":true,"upstream":"NIC 1","downstream":"NIC 1"})"));
         CHECK(r.wrote);
         CHECK(!r.config.has_value());
@@ -1113,13 +1133,13 @@ namespace {
     /// Enabled bridges need both ports named.
     void TestBridgeRejectsEmptyPorts() {
         const auto empty_down = LoadFromText(
-            "test_cfg_bridge.json",
+            ScratchFile("test_cfg_bridge.json"),
             Skeleton(R"("bridge":{"enabled":true,"upstream":"NIC 1","downstream":""})"));
         CHECK(empty_down.wrote);
         CHECK(!empty_down.config.has_value());
         CHECK(empty_down.error.find("bridge") != std::string::npos);
         const auto empty_up = LoadFromText(
-            "test_cfg_bridge.json",
+            ScratchFile("test_cfg_bridge.json"),
             Skeleton(R"("bridge":{"enabled":true,"upstream":"","downstream":"NIC 2"})"));
         CHECK(empty_up.wrote);
         CHECK(!empty_up.config.has_value());
@@ -1130,7 +1150,7 @@ namespace {
     void TestBridgeMacTableSizeBounds() {
         const auto reject = [](const std::string& size) {
             const auto r = LoadFromText(
-                "test_cfg_bridge.json",
+                ScratchFile("test_cfg_bridge.json"),
                 Skeleton("\"bridge\":{\"enabled\":true,\"upstream\":\"NIC "
                          "1\",\"downstream\":\"NIC 2\",\"mac_table_size\":" +
                          size + "}"));
@@ -1141,7 +1161,7 @@ namespace {
         reject("65537");
         const auto accept = [](const std::string& size, uint32_t want) {
             const auto r = LoadFromText(
-                "test_cfg_bridge.json",
+                ScratchFile("test_cfg_bridge.json"),
                 Skeleton("\"bridge\":{\"enabled\":true,\"upstream\":\"NIC "
                          "1\",\"downstream\":\"NIC 2\",\"mac_table_size\":" +
                          size + "}"));
@@ -1158,6 +1178,27 @@ namespace {
 /// batch329: the sample config lives at the repository root. The ctest
 /// working directory depends on the generator (VS: build/Release, Ninja:
 /// build/), so probe the known layouts instead of hardcoding one.
+/// P139: locate the repository root from the EXECUTABLE location, not
+/// the CWD. The old "../../" / "../" / "." probe only worked because
+/// ctest happened to run from a build directory; any other CWD made the
+/// sample unaddressable and turned the round-trip test red. Walking up
+/// from the exe for a known build input is CWD-independent (same
+/// approach as test_ui.cpp FindRepoRoot).
+std::filesystem::path FindRepoRoot() {
+    wchar_t exe[MAX_PATH * 2] = {};
+    const DWORD len = ::GetModuleFileNameW(nullptr, exe, MAX_PATH * 2);
+    if (0 == len) return {};
+    std::filesystem::path p(exe, exe + len);
+    for (int i = 0; i < 8; ++i) {
+        if (std::filesystem::exists(p / "scripts" / "check-source-hygiene.mjs")) {
+            return p;
+        }
+        if (!p.has_parent_path()) break;
+        p = p.parent_path();
+    }
+    return {};
+}
+
 std::string ExampleConfigPath() {
     static const char* kCandidates[] = {
         "../../config.example.json",  // Visual Studio multi-config: build/Release
@@ -1168,6 +1209,15 @@ std::string ExampleConfigPath() {
         std::ifstream probe(candidate);
         if (probe.good()) {
             return std::string(candidate);
+        }
+    }
+    // P139: fall back to the exe-relative repository root.
+    const std::filesystem::path root = FindRepoRoot();
+    if (!root.empty()) {
+        const std::filesystem::path candidate = root / "config.example.json";
+        std::ifstream probe(candidate);
+        if (probe.good()) {
+            return candidate.string();
         }
     }
     return std::string();
@@ -1291,7 +1341,7 @@ void TestConfigJsonRoundTrip() {
     const std::string duid_key = "\"duid\":\"00030001aabb\"";
     CHECK(json.find(duid_key) != std::string::npos);
 
-    const std::string path = "test_cfg_roundtrip.json";
+    const std::string path = ScratchFile("test_cfg_roundtrip.json");
     CHECK(WriteFile(path, json));
     std::string error;
     const auto loaded = Config::LoadFromFile(path, error);
@@ -1367,7 +1417,7 @@ void TestConfigJsonRoundTrip() {
     const std::string plain_json = plain.ToJsonString();
     CHECK(plain_json.find("\"vlan\"") == std::string::npos);
     CHECK(plain_json.find("\"pool\"") == std::string::npos);
-    const std::string plain_path = "test_cfg_roundtrip_plain.json";
+    const std::string plain_path = ScratchFile("test_cfg_roundtrip_plain.json");
     CHECK(WriteFile(plain_path, plain_json));
     error.clear();
     const auto plain_loaded = Config::LoadFromFile(plain_path, error);
@@ -1433,7 +1483,7 @@ void TestToJsonStringRejectsNonWholeHourLease() {
 
 void TestConfigSaveAtomic() {
     const vgww::core::Config original = MakeFullConfig();
-    const std::string path = "test_cfg_save_atomic.json";
+    const std::string path = ScratchFile("test_cfg_save_atomic.json");
     std::remove(path.c_str());
     std::string error = "seed";
     CHECK(original.SaveToFile(path, error));
@@ -1454,12 +1504,12 @@ void TestConfigSaveAtomic() {
     // Failure 1: missing directory -> false + error, nothing created.
     error.clear();
     CHECK(!original.SaveToFile(
-        "test_cfg_no_such_dir/sub/test_cfg_save_atomic.json", error));
+        ScratchFile("test_cfg_no_such_dir/sub/test_cfg_save_atomic.json"), error));
     CHECK(!error.empty());
 
     // Failure 2: the target exists as a directory -> the rename cannot
     // replace it; the directory survives and no tmp file is left behind.
-    const std::string blocked = "test_cfg_save_blocked";
+    const std::string blocked = ScratchFile("test_cfg_save_blocked");
     _rmdir(blocked.c_str());
     CHECK(0 == _mkdir(blocked.c_str()));
     error.clear();
@@ -1472,11 +1522,11 @@ void TestConfigSaveAtomic() {
     }
 
     // A pre-existing file keeps its bytes when a save to a bad path fails.
-    const std::string keep = "test_cfg_keep.json";
+    const std::string keep = ScratchFile("test_cfg_keep.json");
     CHECK(WriteFile(keep, "SENTINEL"));
     error.clear();
     CHECK(!original.SaveToFile(
-        "test_cfg_no_such_dir/sub/test_cfg_keep.json", error));
+        ScratchFile("test_cfg_no_such_dir/sub/test_cfg_keep.json"), error));
     CHECK(!error.empty());
     {
         std::ifstream in(keep);
@@ -1489,7 +1539,7 @@ void TestConfigSaveAtomic() {
     // A target held open without FILE_SHARE_DELETE must make the save fail
     // cleanly: no truncation, no tmp left behind, the original bytes survive.
     {
-        const std::string locked = "test_cfg_locked.json";
+        const std::string locked = ScratchFile("test_cfg_locked.json");
         CHECK(WriteFile(locked, "ORIGINAL"));
         const HANDLE h = ::CreateFileA(
             locked.c_str(), GENERIC_READ,
@@ -1518,7 +1568,7 @@ void TestConfigSaveAtomic() {
     // file object (tmp + rename). An in-place rewrite would keep the same
     // file identity and could leave a half-written target behind.
     {
-        const std::string id_path = "test_cfg_identity.json";
+        const std::string id_path = ScratchFile("test_cfg_identity.json");
         CHECK(WriteFile(id_path, "OLD"));
         const auto file_index = [](const std::string& p, uint64_t& index) {
             const HANDLE h = ::CreateFileA(
@@ -1552,7 +1602,7 @@ void TestConfigSaveAtomic() {
     /// other's just-loaded change with a stale snapshot. UpdateFile serializes
     /// load-mutate-publish per path; without it only one of N survives.
     void TestB94ConfigUpdateSerialized() {
-        const std::string path = "test_cfg_b94_update.json";
+        const std::string path = ScratchFile("test_cfg_b94_update.json");
         std::remove(path.c_str());
         {
             Config seed = MakeFullConfig();
@@ -1622,7 +1672,7 @@ void TestConfigSaveAtomic() {
     /// cross-process guard: a second owner must be refused a non-blocking
     /// lock while the first holds it, and UpdateFile must wait for it.
     void TestB95ConfigFileLockExcludesOtherOwners() {
-        const std::string path = "test_cfg_b95_lock.json";
+        const std::string path = ScratchFile("test_cfg_b95_lock.json");
         std::remove(path.c_str());
         {
             const Config seed = MakeFullConfig();
@@ -1680,7 +1730,7 @@ void TestConfigSaveAtomic() {
     /// must not delete the bindings that reached disk meanwhile (the UI owns
     /// its settings, the binding routes own their lists).
     void TestB96SettingsSavePreservesNewerBindings() {
-        const std::string path = "test_cfg_b96_bindings.json";
+        const std::string path = ScratchFile("test_cfg_b96_bindings.json");
         std::remove(path.c_str());
         const Config snapshot = MakeFullConfig();
         std::string error;
@@ -1741,7 +1791,7 @@ void TestConfigSaveAtomic() {
     /// (no duplicates), delete of an absent key still succeeds, and an empty
     /// path reports false instead of pretending durability.
     void TestB97SharedBindingPersistence() {
-        const std::string path = "test_cfg_b97_bindings.json";
+        const std::string path = ScratchFile("test_cfg_b97_bindings.json");
         std::remove(path.c_str());
         const Config seed = MakeFullConfig();
         std::string error;
@@ -1806,7 +1856,7 @@ void TestConfigSaveAtomic() {
     /// wait budget, the save must FAIL loudly instead of publishing without
     /// mutual exclusion (which would overwrite the other process's document).
     void TestB107LockTimeoutRefusesTheWrite() {
-        const std::string path = "test_cfg_b107_lock.json";
+        const std::string path = ScratchFile("test_cfg_b107_lock.json");
         std::remove(path.c_str());
         const Config cfg = MakeFullConfig();
         std::string error;
@@ -1847,7 +1897,7 @@ void TestConfigSaveAtomic() {
     /// It must not steal a file another process is publishing: the rename is
     /// refused while the destination's lock is held elsewhere.
     void TestB108SetAsideRespectsCrossProcessLock() {
-        const std::string path = "test_cfg_b108_aside.json";
+        const std::string path = ScratchFile("test_cfg_b108_aside.json");
         const std::string aside = path + ".corrupt";
         std::remove(path.c_str());
         std::remove(aside.c_str());
@@ -1893,7 +1943,7 @@ void TestConfigSaveAtomic() {
     /// produces still loads. Otherwise one write could persist a config the
     /// next start refuses wholesale (a single-write brick).
     void TestB109UpdateFileRejectsUnloadableDocument() {
-        const std::string path = "test_cfg_b109_validator.json";
+        const std::string path = ScratchFile("test_cfg_b109_validator.json");
         std::remove(path.c_str());
         Config seed = MakeFullConfig();
         std::string error;
@@ -1919,7 +1969,9 @@ void TestConfigSaveAtomic() {
         CHECK(read_back(path) == before);  // destination untouched
 
         size_t stale = 0;
-        for (const auto& entry : std::filesystem::directory_iterator(".")) {
+        const std::string scan_dir =
+            std::filesystem::path(path).parent_path().string();
+        for (const auto& entry : std::filesystem::directory_iterator(scan_dir)) {
             const std::string name = entry.path().filename().string();
             if (0 == name.rfind("test_cfg_b109_validator.json.tmp.", 0)) {
                 ++stale;
@@ -1943,8 +1995,8 @@ void TestConfigSaveAtomic() {
     /// an unloadable document is never published, and an existing destination
     /// keeps its previous bytes.
     void TestB110SaveToFileRejectsUnloadableDocument() {
-        const std::string fresh = "test_cfg_b110_fresh.json";
-        const std::string keep = "test_cfg_b110_keep.json";
+        const std::string fresh = ScratchFile("test_cfg_b110_fresh.json");
+        const std::string keep = ScratchFile("test_cfg_b110_keep.json");
         std::remove(fresh.c_str());
         std::remove(keep.c_str());
 
@@ -1981,7 +2033,7 @@ void TestConfigSaveAtomic() {
     /// binding (delete + add churn at the cap) vanished from disk. Refuse the
     /// save instead; the operator sees a failure, not a quiet loss.
     void TestB116SettingsSaveRefusesToDropDiskBindings() {
-        const std::string path = "test_cfg_b116_cap.json";
+        const std::string path = ScratchFile("test_cfg_b116_cap.json");
         std::remove(path.c_str());
         using vgww::core::limits::kMaxStaticBindings;
         using vgww::core::ParseIpv4;
@@ -2350,7 +2402,7 @@ static void TestB105ProgrammaticConfigObeysLoaderRules() {
         CHECK(ok);
         error.clear();
         if (vgww::core::ValidateConfig(c, error)) {
-            const std::string path = "b105_roundtrip.json";
+            const std::string path = ScratchFile("b105_roundtrip.json");
             std::string save_error;
             CHECK(c.SaveToFile(path, save_error));
             std::string load_error;
@@ -2453,7 +2505,7 @@ static void TestB106CliOverrideMustValidate() {
 // and round-trips.
 void TestB84WebBindBounds() {
     const auto load_section = [](const std::string& section) {
-        return LoadFromText("test_cfg_b84_bind.json", Skeleton(section));
+        return LoadFromText(ScratchFile("test_cfg_b84_bind.json"), Skeleton(section));
     };
     {
         const auto r = load_section(R"("web":{"bind":""})");
@@ -2519,20 +2571,20 @@ void TestExampleDhcpPoolKeys() {
 
     // One key without the other is a hard error, never a silent half pool.
     const auto only_start = LoadFromText(
-        "test_cfg_poolkey.json",
+        ScratchFile("test_cfg_poolkey.json"),
         Skeleton(R"("dhcp":{"pool_start":"192.168.0.100"})"));
     CHECK(only_start.wrote);
     CHECK(!only_start.config.has_value());
     CHECK(!only_start.error.empty());
     const auto only_end = LoadFromText(
-        "test_cfg_poolkey.json",
+        ScratchFile("test_cfg_poolkey.json"),
         Skeleton(R"("dhcp":{"pool_end":"192.168.0.200"})"));
     CHECK(only_end.wrote);
     CHECK(!only_end.config.has_value());
 
     // Both keys together parse to the same bytes as the array form.
     const auto both = LoadFromText(
-        "test_cfg_poolkey.json",
+        ScratchFile("test_cfg_poolkey.json"),
         Skeleton(R"("dhcp":{"pool_start":"192.168.0.100",)"
                  R"("pool_end":"192.168.0.200"})"));
     CHECK(both.wrote);
@@ -2548,7 +2600,7 @@ void TestExampleDhcpPoolKeys() {
     }
     // A malformed compat value is rejected (never silently zero).
     const auto malformed = LoadFromText(
-        "test_cfg_poolkey.json",
+        ScratchFile("test_cfg_poolkey.json"),
         Skeleton(R"("dhcp":{"pool_start":"garbage",)"
                  R"("pool_end":"192.168.0.200"})"));
     CHECK(malformed.wrote);
@@ -2611,7 +2663,7 @@ void TestUiLanguagePersistence() {
         }
         CHECK(removed);
         CHECK(json.find("ui_language") == std::string::npos);
-        const std::string path = "test_cfg_uilang_default.json";
+        const std::string path = ScratchFile("test_cfg_uilang_default.json");
         CHECK(WriteFile(path, json));
         std::string error;
         auto c = Config::LoadFromFile(path, error);
@@ -2622,7 +2674,7 @@ void TestUiLanguagePersistence() {
     {
         Config c = MakeFullConfig();
         c.ui_language = "ja";
-        const std::string path = "test_cfg_uilang_rt.json";
+        const std::string path = ScratchFile("test_cfg_uilang_rt.json");
         std::string error;
         CHECK(c.SaveToFile(path, error));
         auto loaded = Config::LoadFromFile(path, error);
@@ -2633,7 +2685,7 @@ void TestUiLanguagePersistence() {
         // unknown code is preserved verbatim (the UI falls back at apply).
         Config base = MakeFullConfig();
         base.ui_language = "zz";
-        const std::string path = "test_cfg_uilang_bad.json";
+        const std::string path = ScratchFile("test_cfg_uilang_bad.json");
         std::string error;
         CHECK(base.SaveToFile(path, error));
         auto c = Config::LoadFromFile(path, error);
@@ -2659,7 +2711,7 @@ void TestThemePersistence() {
     {
         Config base = MakeFullConfig();
         base.theme = "light";
-        const std::string path = "test_cfg_theme_roundtrip.json";
+        const std::string path = ScratchFile("test_cfg_theme_roundtrip.json");
         std::string error;
         CHECK(base.SaveToFile(path, error));
         auto c = Config::LoadFromFile(path, error);
@@ -2675,7 +2727,7 @@ void TestThemePersistence() {
         if (pos != std::string::npos) {
             json.erase(pos, std::string(",\"theme\":\"dark\"").size());
         }
-        const std::string path = "test_cfg_theme_default.json";
+        const std::string path = ScratchFile("test_cfg_theme_default.json");
         CHECK(WriteFile(path, json));
         std::string error;
         auto c = Config::LoadFromFile(path, error);
@@ -2692,7 +2744,7 @@ void TestThemePersistence() {
             json.replace(pos, std::string(",\"theme\":\"dark\"").size(),
                          ",\"theme\":\"neon\"");
         }
-        const std::string path = "test_cfg_theme_bad.json";
+        const std::string path = ScratchFile("test_cfg_theme_bad.json");
         CHECK(WriteFile(path, json));
         std::string error;
         auto c = Config::LoadFromFile(path, error);
@@ -2720,7 +2772,7 @@ void TestUiScalePersistence() {
     {
         Config base = MakeFullConfig();
         base.ui_scale = "200";
-        const std::string path = "test_cfg_uiscale_roundtrip.json";
+        const std::string path = ScratchFile("test_cfg_uiscale_roundtrip.json");
         std::string error;
         CHECK(base.SaveToFile(path, error));
         auto c = Config::LoadFromFile(path, error);
@@ -2736,7 +2788,7 @@ void TestUiScalePersistence() {
         if (pos != std::string::npos) {
             json.erase(pos, std::string(",\"ui_scale\":\"auto\"").size());
         }
-        const std::string path = "test_cfg_uiscale_default.json";
+        const std::string path = ScratchFile("test_cfg_uiscale_default.json");
         CHECK(WriteFile(path, json));
         std::string error;
         auto c = Config::LoadFromFile(path, error);
@@ -2753,7 +2805,7 @@ void TestUiScalePersistence() {
             json.replace(pos, std::string("\"ui_scale\":\"auto\"").size(),
                          "\"ui_scale\":\"123\"");
         }
-        const std::string path = "test_cfg_uiscale_bad.json";
+        const std::string path = ScratchFile("test_cfg_uiscale_bad.json");
         CHECK(WriteFile(path, json));
         std::string error;
         auto c = Config::LoadFromFile(path, error);
@@ -2794,7 +2846,7 @@ void TestB34lWrongTypeRejected() {
          R"("ipv6":{"enabled":false,"dhcpv6":{"static_bindings":"x"}})"},
     };
     for (const Case& c : cases) {
-        const auto r = LoadFromText("test_cfg_b34l_type.json",
+        const auto r = LoadFromText(ScratchFile("test_cfg_b34l_type.json"),
                                     Skeleton(c.section));
         CHECK(r.wrote);
         if (r.config.has_value()) {
@@ -2826,7 +2878,7 @@ void TestB34lFractionalIntegerRejected() {
         R"("ipv6":{"enabled":false,"dhcpv6":{"lease_seconds":3600.5}})",
     };
     for (const char* section : sections) {
-        const auto r = LoadFromText("test_cfg_b34l_frac.json",
+        const auto r = LoadFromText(ScratchFile("test_cfg_b34l_frac.json"),
                                     Skeleton(section));
         CHECK(r.wrote);
         if (r.config.has_value()) {
@@ -2842,7 +2894,7 @@ void TestB34lFractionalIntegerRejected() {
 // A JSON boolean is not a number and must not be accepted as one.
 void TestB34lBooleanAsIntegerRejected() {
     const auto r =
-        LoadFromText("test_cfg_b34l_bool.json", Skeleton(R"("dhcp":{"lease_hours":true})"));
+        LoadFromText(ScratchFile("test_cfg_b34l_bool.json"), Skeleton(R"("dhcp":{"lease_hours":true})"));
     CHECK(r.wrote);
     CHECK(!r.config.has_value());
     CHECK(!r.error.empty());
@@ -2859,7 +2911,7 @@ void TestB34lPoolExcludesReservedAddresses() {
     };
     for (const char* pool : pool_literals) {
         const auto r = LoadFromText(
-            "test_cfg_b34l_pool.json",
+            ScratchFile("test_cfg_b34l_pool.json"),
             Skeleton(std::string(pool) + R"(,"mode":"main")"));
         CHECK(r.wrote);
         if (r.config.has_value()) {
@@ -2880,7 +2932,7 @@ void TestB34lStaticBindingExcludesReservedAddresses() {
         R"("dhcp":{"static_bindings":[{"mac":"30:fc:68:88:b4:01","ip":"192.168.0.0"}]})",
     };
     for (const char* section : literals) {
-        const auto r = LoadFromText("test_cfg_b34l_bind.json",
+        const auto r = LoadFromText(ScratchFile("test_cfg_b34l_bind.json"),
                                     Skeleton(section));
         CHECK(r.wrote);
         if (r.config.has_value()) {
@@ -2905,7 +2957,7 @@ void TestB34lGatewayMacMustBeUnicast() {
         const std::string json =
             "{\"gateway\":{\"ipv4\":\"192.168.0.40\",\"mask\":\"255.255.255.0\","
             "\"mac\":\"" + std::string(mac) + "\"}}";
-        const auto r = LoadFromText("test_cfg_b34l_mac.json", json);
+        const auto r = LoadFromText(ScratchFile("test_cfg_b34l_mac.json"), json);
         CHECK(r.wrote);
         if (r.config.has_value()) {
             std::fprintf(stderr,
@@ -2917,7 +2969,7 @@ void TestB34lGatewayMacMustBeUnicast() {
     // A locally-administered unicast MAC (02:...) is legitimate and must
     // still load: the check is "unicast", not "globally administered".
     const auto ok = LoadFromText(
-        "test_cfg_b34l_mac_ok.json",
+        ScratchFile("test_cfg_b34l_mac_ok.json"),
         R"({"gateway":{"ipv4":"192.168.0.40","mask":"255.255.255.0","mac":"02:00:00:00:00:01"}})");
     CHECK(ok.wrote);
     CHECK(ok.config.has_value());
@@ -2939,7 +2991,7 @@ void TestB34lGatewayMacMustBeUnicast() {
 // VLAN tagging and silently gets none - the operator believes traffic is
 // isolated when it is not. Either honour the flag or refuse the file.
 void TestB34mVlanEnabledWithoutIdRejected() {
-    const auto r = LoadFromText("test_cfg_b34m_vlan.json",
+    const auto r = LoadFromText(ScratchFile("test_cfg_b34m_vlan.json"),
                                 Skeleton(R"("vlan":{"enabled":true})"));
     CHECK(r.wrote);
     if (r.config.has_value()) {
@@ -2952,7 +3004,7 @@ void TestB34mVlanEnabledWithoutIdRejected() {
     CHECK(!r.error.empty());
 
     // The documented enable path must still work.
-    const auto ok = LoadFromText("test_cfg_b34m_vlan_ok.json",
+    const auto ok = LoadFromText(ScratchFile("test_cfg_b34m_vlan_ok.json"),
                                  Skeleton(R"("vlan":{"enabled":true,"id":100})"));
     CHECK(ok.wrote);
     CHECK(ok.config.has_value());
@@ -2972,7 +3024,7 @@ void TestB34mDhcpv6RequiresIpv6() {
         R"("mode":"main","ipv6":{"enabled":false,"dhcpv6":{"enabled":true}})",
     };
     for (const char* section : sections) {
-        const auto r = LoadFromText("test_cfg_b34m_d6.json", Skeleton(section));
+        const auto r = LoadFromText(ScratchFile("test_cfg_b34m_d6.json"), Skeleton(section));
         CHECK(r.wrote);
         if (r.config.has_value()) {
             std::fprintf(stderr,
@@ -2985,7 +3037,7 @@ void TestB34mDhcpv6RequiresIpv6() {
     }
     // The consistent combination must still load.
     const auto ok = LoadFromText(
-        "test_cfg_b34m_d6_ok.json",
+        ScratchFile("test_cfg_b34m_d6_ok.json"),
         Skeleton(R"("ipv6":{"enabled":true,"ula_prefix":"fd00::/64","dhcpv6":{"enabled":true}})"));
     CHECK(ok.wrote);
     CHECK(ok.config.has_value());
@@ -3010,7 +3062,7 @@ void TestB34mDhcpDnsMustBeUsable() {
         R"("dhcp":{"dns":["192.168.0.40"]})",     // the gateway itself
     };
     for (const char* section : unusable) {
-        const auto r = LoadFromText("test_cfg_b34m_dns.json",
+        const auto r = LoadFromText(ScratchFile("test_cfg_b34m_dns.json"),
                                     Skeleton(section));
         CHECK(r.wrote);
         if (r.config.has_value()) {
@@ -3024,12 +3076,12 @@ void TestB34mDhcpDnsMustBeUsable() {
     }
     // Duplicates and ordinary public resolvers stay accepted.
     const auto dup = LoadFromText(
-        "test_cfg_b34m_dns_dup.json",
+        ScratchFile("test_cfg_b34m_dns_dup.json"),
         Skeleton(R"("dhcp":{"dns":["8.8.8.8","8.8.8.8"]})"));
     CHECK(dup.wrote);
     CHECK(dup.config.has_value());
     const auto normal = LoadFromText(
-        "test_cfg_b34m_dns_ok.json",
+        ScratchFile("test_cfg_b34m_dns_ok.json"),
         Skeleton(R"("dhcp":{"dns":["8.8.8.8","192.168.0.1"]})"));
     CHECK(normal.wrote);
     CHECK(normal.config.has_value());
@@ -3043,7 +3095,7 @@ void TestB34mDhcpDnsMustBeUsable() {
 // The combination is therefore a silent throughput cap and must be refused.
 void TestB34mRxBatchMustFitRing() {
     const auto r = LoadFromText(
-        "test_cfg_b34m_ring.json",
+        ScratchFile("test_cfg_b34m_ring.json"),
         Skeleton(R"("perf":{"rx_batch":4096,"ring_capacity":1})"));
     CHECK(r.wrote);
     if (r.config.has_value()) {
@@ -3063,7 +3115,7 @@ void TestB34mRxBatchMustFitRing() {
         R"("perf":{"rx_batch":1,"ring_capacity":1})",
     };
     for (const char* section : ok_sections) {
-        const auto ok = LoadFromText("test_cfg_b34m_ring_ok.json",
+        const auto ok = LoadFromText(ScratchFile("test_cfg_b34m_ring_ok.json"),
                                      Skeleton(section));
         CHECK(ok.wrote);
         CHECK(ok.config.has_value());
@@ -3096,7 +3148,7 @@ void TestB20WebEnabledDefault() {
     if (pos != std::string::npos && erase_len > 0) {
         json.erase(pos, erase_len);
     }
-    const std::string path = "test_cfg_web_missing.json";
+    const std::string path = ScratchFile("test_cfg_web_missing.json");
     CHECK(WriteFile(path, json));
     {
         std::string error;
@@ -3108,7 +3160,7 @@ void TestB20WebEnabledDefault() {
     {
         Config off = MakeFullConfig();
         off.web.enabled = false;
-        const std::string p2 = "test_cfg_web_off.json";
+        const std::string p2 = ScratchFile("test_cfg_web_off.json");
         std::string error;
         CHECK(off.SaveToFile(p2, error));
         CHECK(off.ToJsonString().find("\"enabled\":false") != std::string::npos);
@@ -3156,7 +3208,7 @@ static void TestDefaultDnsFallbackObeysResolverRules() {
 
     vgww::core::Config main_config = MakeFullConfig();
     main_config.dhcp.dns.clear();
-    const std::string main_path = "a1_default_dns_main.json";
+    const std::string main_path = ScratchFile("a1_default_dns_main.json");
     std::string error;
     CHECK(WriteFile(main_path, main_config.ToJsonString()));
     const auto loaded = vgww::core::Config::LoadFromFile(main_path, error);
@@ -3170,7 +3222,7 @@ static void TestDefaultDnsFallbackObeysResolverRules() {
     vgww::core::Config bypass_config = MakeFullConfig();
     bypass_config.mode = vgww::core::Mode::kBypass;
     bypass_config.dhcp.dns.clear();
-    const std::string bypass_path = "a1_default_dns_bypass.json";
+    const std::string bypass_path = ScratchFile("a1_default_dns_bypass.json");
     CHECK(WriteFile(bypass_path, bypass_config.ToJsonString()));
     const auto reloaded =
         vgww::core::Config::LoadFromFile(bypass_path, error);
@@ -3190,10 +3242,10 @@ static void TestDefaultDnsFallbackObeysResolverRules() {
     bad.dhcp.pool_start = bad.dhcp.pool_end;
     bad.dhcp.pool_end = start;
     std::string save_error;
-    CHECK(!bad.SaveToFile("a1_default_dns_bad.json", save_error));
+    CHECK(!bad.SaveToFile(ScratchFile("a1_default_dns_bad.json"), save_error));
     CHECK(save_error.find("validation rejected") == std::string::npos);
     CHECK(save_error.find("pool") != std::string::npos);
-    std::remove("a1_default_dns_bad.json");
+    std::remove(ScratchFile("a1_default_dns_bad.json").c_str());
     vgww::core::SetDefaultDnsProbeForTest({});
 }
 

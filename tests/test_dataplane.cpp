@@ -656,8 +656,7 @@ namespace {
     /// Generic checksum-correct TCP segment from the client.
     std::vector<uint8_t> BuildTcpSegment(uint32_t seq, uint32_t ack, uint8_t flags,
                                          const std::string& payload,
-                                         uint16_t sport = 51001,
-                                         uint16_t dport = 45678) {
+                                         uint16_t sport, uint16_t dport) {
         const size_t tcp_len = 20 + payload.size();
         std::vector<uint8_t> f(kEthernetHeaderLen + kIpv4HeaderLenMin + tcp_len);
         BuildEthHeader(f.data(), kGatewayMac, kClientMac, kEthertypeIpv4);
@@ -771,7 +770,8 @@ namespace {
     }
 
     void RunUdpEchoServer6(uint16_t port, std::atomic<bool>& stop,
-                           std::atomic<bool>& ready) {
+                           std::atomic<bool>& ready,
+                           std::atomic<bool>& bound) {
         asio::io_context io;
         asio::ip::udp::socket sock(io);
         std::error_code bind_err;
@@ -785,6 +785,7 @@ namespace {
         }
         sock.non_blocking(true);
         ready.store(true);
+        bound.store(true);
         while (!stop.load()) {
             char buf[2048];
             asio::ip::udp::endpoint peer;
@@ -881,10 +882,51 @@ namespace {
         return false;
     }
 
+    /// P139: parallel instances of this suite must never bind the same
+    /// upstream echo port. A fixed kPort (45678/45679/45680) makes the second
+    /// instance's echo/UDP servers fail their bind, which then hangs the wake
+    /// connect at the end of the run. Probe-bind port 0 and read back the
+    /// ephemeral port the OS actually assigned; 0 means the probe failed and
+    /// every caller must CHECK instead of proceeding into a hang.
+    uint16_t UniquePort() {
+        asio::io_context io;
+        asio::ip::tcp::acceptor probe(io);
+        std::error_code err;
+        probe.open(asio::ip::tcp::v4(), err);
+        if (err) return 0;
+        probe.set_option(asio::socket_base::reuse_address(true), err);
+        if (err) return 0;
+        probe.bind(asio::ip::tcp::endpoint(
+                       asio::ip::make_address("127.0.0.1"), 0),
+                   err);
+        if (err) return 0;
+        const uint16_t port = probe.local_endpoint(err).port();
+        return err ? 0 : port;
+    }
+
+    /// P139: ephemeral UDP port for the IPv4/v6 echo sinks, probed on the
+    /// requested address family (bind 0, read back). 0 = probe failed.
+    uint16_t UniqueUdpPort(bool v6) {
+        asio::io_context io;
+        asio::ip::udp::socket probe(io);
+        std::error_code err;
+        probe.open(v6 ? asio::ip::udp::v6() : asio::ip::udp::v4(), err);
+        if (err) return 0;
+        probe.bind(asio::ip::udp::endpoint(
+                       v6 ? asio::ip::make_address("::1")
+                          : asio::ip::make_address("127.0.0.1"),
+                       0),
+                   err);
+        if (err) return 0;
+        const uint16_t port = probe.local_endpoint(err).port();
+        return err ? 0 : port;
+    }
+
     /// Minimal blocking TCP echo server for the upstream side. Runs TWO
     /// acceptors (127.0.0.1 and ::1) - Windows dual-stack sockets proved
     /// unreliable for this purpose in-process.
-    void RunEchoServer(uint16_t port, std::atomic<bool>& stop) {
+    void RunEchoServer(uint16_t port, std::atomic<bool>& stop,
+                       std::atomic<bool>& ready, std::atomic<bool>& bound) {
         auto serve_one = [&](const char* addr_text, bool v6) {
             asio::io_context io;
             asio::ip::tcp::acceptor acceptor(io);
@@ -901,6 +943,12 @@ namespace {
             }
             acceptor.listen();
             acceptor.non_blocking(true);
+            // P139: publish the bound state only once the acceptor is actually
+            // listening. The old code set no such signal, so the shutdown wake
+            // connect could race the 2 ms poll loop and lose (the accept that
+            // would have unblocked it had not been attempted yet).
+            bound.store(true);
+            ready.store(true);
             while (!stop.load()) {
                 asio::ip::tcp::socket fresh(io);
                 std::error_code accept_err;
@@ -955,7 +1003,7 @@ namespace {
     /// Baseline: three raw sockets, each connected directly to the local echo
     /// server, write + read back their own payload. If this ever fails, the
     /// echo server itself is the problem - not VGWW's data plane.
-    int NativeEchoProbe() {
+    int NativeEchoProbe(uint16_t port) {
         int ok = 0;
         const char* tags[3] = {"mongoose", "panther", "gazelle"};
         for (auto tag : tags) {
@@ -963,7 +1011,7 @@ namespace {
             std::error_code ec;
             asio::ip::tcp::socket s(io);
             s.connect(asio::ip::tcp::endpoint(
-                          asio::ip::make_address("127.0.0.1"), 45678), ec);
+                          asio::ip::make_address("127.0.0.1"), port), ec);
             if (ec) {
                 std::fprintf(stderr, "[dbg] native connect err: %s\n",
                              ec.message().c_str());
@@ -1095,7 +1143,8 @@ namespace {
     /// Non-blocking UDP echo server on 127.0.0.1:`port`. Sets `ready` once
     /// the socket is bound (callers must wait before sending).
     void RunUdpEchoServer(uint16_t port, std::atomic<bool>& stop,
-                          std::atomic<bool>& ready) {
+                          std::atomic<bool>& ready,
+                          std::atomic<bool>& bound) {
         asio::io_context io;
         asio::ip::udp::socket sock(io);
         std::error_code bind_err;
@@ -1110,6 +1159,7 @@ namespace {
         }
         sock.non_blocking(true);
         ready.store(true);
+        bound.store(true);
         while (!stop.load()) {
             char buf[2048];
             asio::ip::udp::endpoint peer;
@@ -2452,8 +2502,9 @@ namespace {
         // A SYN per frame; the stack will refuse most, which is irrelevant -
         // the assertion is about the RING, not about TCP.
         for (int i = 0; i < 200; ++i) {
-            raw->ScriptInbound(BuildTcpSegment(1000u + (uint32_t)i, 0, 0x02, ""),
-                               0);
+            raw->ScriptInbound(
+                BuildTcpSegment(1000u + (uint32_t)i, 0, 0x02, "", 51001, 45678),
+                0);
         }
 
         vgww::runtime::Dataplane dataplane(config);
@@ -2554,29 +2605,57 @@ int main() {
     // Natural SYN retransmission: covers the neighbor-snapshot publish delay.
     fake->ScriptInbound(BuildSyn(51000, 443), 500);
 
+    // P139: every upstream endpoint this scenario talks to is bound by this
+    // process, so the port must be probed per instance. The old fixed
+    // 45678/45679/45680 made a second parallel instance fail all three binds,
+    // after which the wake connect at the end of the run blocked forever.
+    const uint16_t kEchoPort = UniquePort();
+    CHECK(0 != kEchoPort);
+    const uint16_t kUdpPort = UniqueUdpPort(false);
+    CHECK(0 != kUdpPort);
+    const uint16_t kUdp6Port = UniqueUdpPort(true);
+    CHECK(0 != kUdp6Port);
+    std::fprintf(stderr, "[p139] echo=%u udp=%u udp6=%u\n", kEchoPort, kUdpPort,
+                 kUdp6Port);
+
     // Full-duplex relay scenario: SYN to the local echo server, then a
     // scripted handshake + payload exchange at frame level.
     std::atomic<bool> echo_stop{false};
-    std::thread echo_server([&] { RunEchoServer(45678, echo_stop); });
-    fake->ScriptInbound(BuildTcpSegment(1000, 0, 0x02, ""), 300);   // SYN
+    std::atomic<bool> echo_ready{false};
+    std::atomic<bool> echo_bound{false};
+    std::thread echo_server(
+        [&] { RunEchoServer(kEchoPort, echo_stop, echo_ready, echo_bound); });
+    // Wait for BOTH acceptors to be listening before anything dials them.
+    while (!echo_ready.load()) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(2));
+    }
+    CHECK(echo_bound.load());
+    fake->ScriptInbound(BuildTcpSegment(1000, 0, 0x02, "", 51001, kEchoPort),
+                        300);  // SYN
     // Retransmission: covers neighbor-snapshot publish latency (first
     // SYN-ACK is dropped on MAC-miss, exactly like a real client retry).
-    fake->ScriptInbound(BuildTcpSegment(1000, 0, 0x02, ""), 800);   // SYN retransmit
+    fake->ScriptInbound(BuildTcpSegment(1000, 0, 0x02, "", 51001, kEchoPort),
+                        800);  // SYN retransmit
     // IPv6 TCP flow: SYN to the loopback echo port over v6.
-    fake->ScriptInbound(BuildV6TcpSegment(2000, 0, 0x02, 51002, 45678), 900);
+    fake->ScriptInbound(
+        BuildV6TcpSegment(2000, 0, 0x02, 51002, kEchoPort), 900);
 
     // UDP NAT flow: client datagram to a local UDP echo server; the relay
     // must forward it upstream and route the echo back to the client.
     std::atomic<bool> udp_stop{false};
     std::atomic<bool> udp_ready{false};
-    std::thread udp_echo([&] { RunUdpEchoServer(45679, udp_stop, udp_ready); });
+    std::atomic<bool> udp_bound{false};
+    std::thread udp_echo([&] {
+        RunUdpEchoServer(kUdpPort, udp_stop, udp_ready, udp_bound);
+    });
     // Wait for the echo socket BEFORE anything can send to it: an early
     // datagram triggers ICMP port-unreachable and Windows then drops the
     // whole flow (WSAECONNRESET on connected sockets).
     while (!udp_ready.load()) {
         std::this_thread::sleep_for(std::chrono::milliseconds(2));
     }
-    fake->ScriptInbound(BuildUdpRequest(51003, 45679, "PING"), 1100);
+    CHECK(udp_bound.load());
+    fake->ScriptInbound(BuildUdpRequest(51003, kUdpPort, "PING"), 1100);
 
     // Dial-failure path: SYN toward a loopback port with no listener. The
     // port is probed free right before use (fixed low ports may be taken -
@@ -2645,20 +2724,20 @@ int main() {
     raw->ScriptInbound(BuildV6EchoRequest(16), 0);
     CHECK(WaitFor([&] { return ContainsV6EchoReply(raw->SentDown()); }, 3000));
 
-    // IPv6 transparent accept: SYN to [::1]:45678 must yield a v6 SYN-ACK.
-    CHECK(WaitFor([&] { return ContainsV6SynAck(raw->SentDown(), 45678); },
+    // IPv6 transparent accept: SYN to [::1]:kEchoPort must yield a v6 SYN-ACK.
+    CHECK(WaitFor([&] { return ContainsV6SynAck(raw->SentDown(), kEchoPort); },
                   3000));
 
-    // ----- IPv6 full-duplex relay through ::1:45678 ---------------------
+    // ----- IPv6 full-duplex relay through ::1:kEchoPort --------------------
     // Complete the handshake immediately: an unreplied SYN-RCVD connection
     // is retransmitted only a few times before xtcp reclaims it.
-    const uint32_t v6_isn = FindV6ServerIsn(raw->SentDown(), 51002, 45678);
+    const uint32_t v6_isn = FindV6ServerIsn(raw->SentDown(), 51002, kEchoPort);
     CHECK(v6_isn != 0);
     if (v6_isn != 0) {
         raw->InjectNow(BuildV6TcpSegment(2001, v6_isn + 1, 0x10, 51002,
-                                         45678));  // ACK: handshake done
+                                         kEchoPort));  // ACK: handshake done
         raw->InjectNow(BuildV6TcpSegment(2001, v6_isn + 1, 0x18, 51002,
-                                         45678, "hello v6"));  // PSH+ACK
+                                         kEchoPort, "hello v6"));  // PSH+ACK
         CHECK(WaitFor(
             [&] { return ContainsV6Payload(raw->SentDown(), "hello v6"); },
             5000));
@@ -2667,32 +2746,35 @@ int main() {
         // the upstream socket; the server FINs back toward the client.
         // seq advanced by 8 bytes for the "hello v6" payload.
         raw->InjectNow(BuildV6TcpSegment(2009, v6_isn + 1, 0x11, 51002,
-                                         45678));  // FIN|ACK
-        CHECK(WaitFor([&] { return ContainsV6Fin(raw->SentDown(), 45678); },
+                                         kEchoPort));  // FIN|ACK
+        CHECK(WaitFor([&] { return ContainsV6Fin(raw->SentDown(), kEchoPort); },
                       5000));
     }
 
-    // ----- IPv6 UDP relay through [::1]:45680 --------------------------
+    // ----- IPv6 UDP relay through [::1]:kUdp6Port -------------------------
     // The classifier emits kUdpV6 but the dispatch previously had no
     // consumer for it, so v6 UDP was silently dropped. A datagram to the
     // v6 echo server must round-trip through the host socket relay.
     std::atomic<bool> udp6_stop{false};
     std::atomic<bool> udp6_ready{false};
-    std::thread udp6_echo(
-        [&] { RunUdpEchoServer6(45680, udp6_stop, udp6_ready); });
+    std::atomic<bool> udp6_bound{false};
+    std::thread udp6_echo([&] {
+        RunUdpEchoServer6(kUdp6Port, udp6_stop, udp6_ready, udp6_bound);
+    });
     while (!udp6_ready.load()) {
         std::this_thread::sleep_for(std::chrono::milliseconds(2));
     }
-    raw->InjectNow(BuildV6UdpSegment(51004, 45680, "P6NG"));
+    CHECK(udp6_bound.load());
+    raw->InjectNow(BuildV6UdpSegment(51004, kUdp6Port, "P6NG"));
     CHECK(WaitFor([&] { return ContainsV6UdpPayload(raw->SentDown(), "P6NG"); },
                   5000));
 
     // Out-of-order and duplicate datagrams on the SAME flow must all come
     // back: the relay + return path carries one payload per send, never
     // coalescing or dropping under reorder/duplication.
-    raw->InjectNow(BuildV6UdpSegment(51004, 45680, "P6LATE"));
-    raw->InjectNow(BuildV6UdpSegment(51004, 45680, "P6EARLY"));
-    raw->InjectNow(BuildV6UdpSegment(51004, 45680, "P6EARLY"));  // dup
+    raw->InjectNow(BuildV6UdpSegment(51004, kUdp6Port, "P6LATE"));
+    raw->InjectNow(BuildV6UdpSegment(51004, kUdp6Port, "P6EARLY"));
+    raw->InjectNow(BuildV6UdpSegment(51004, kUdp6Port, "P6EARLY"));  // dup
     CHECK(WaitFor([&] { return ContainsV6UdpPayload(raw->SentDown(), "P6LATE") &&
                                ContainsV6UdpPayload(raw->SentDown(), "P6EARLY");
                     },
@@ -2712,7 +2794,7 @@ int main() {
     // The control loop rebuilds the parsed snapshot once per iteration.
     std::this_thread::sleep_for(std::chrono::milliseconds(1200));
     const auto dropped_before = dataplane.GetStats().rx_dropped.load();
-    raw->ScriptInbound(BuildV6TcpSegment(5000, 0, 0x02, 51003, 45678), 0);
+    raw->ScriptInbound(BuildV6TcpSegment(5000, 0, 0x02, 51003, kEchoPort), 0);
     CHECK(WaitFor(
         [&] { return dataplane.GetStats().rx_dropped.load() >= dropped_before + 1; },
         5000));
@@ -2720,7 +2802,7 @@ int main() {
     // UDP NAT round trip: the echoed datagram must come back toward the
     // client with the server's source port.
     CHECK(WaitFor(
-        [&] { return ContainsUdpReply(raw->SentDown(), 45679, "PING"); },
+        [&] { return ContainsUdpReply(raw->SentDown(), kUdpPort, "PING"); },
         5000));
 
     // Bulk UDP: 64 concurrent flows through the NAT table + relay must each
@@ -2729,22 +2811,23 @@ int main() {
         char payload[16];
         std::snprintf(payload, sizeof(payload), "P%u", b);
         raw->InjectNow(BuildUdpRequest(static_cast<uint16_t>(51011 + b),
-                                       45679, payload));
+                                       kUdpPort, payload));
     }
     CHECK(WaitFor(
-        [&] { return CountUdpPayloads(raw->SentDown(), 45679) >= 64; }, 8000));
+        [&] { return CountUdpPayloads(raw->SentDown(), kUdpPort) >= 64; },
+        8000));
 
     // Fragmented IPv4 UDP must not be silently relayed as a truncated
     // datagram: it is diverted to the host path (never appears relayed).
     const uint64_t pass_before =
         dataplane.GetStats().host_passthrough.load();
-    raw->InjectNow(BuildUdpFragment(51015, 45679, "FRAGMENTED"));
+    raw->InjectNow(BuildUdpFragment(51015, kUdpPort, "FRAGMENTED"));
     CHECK(WaitFor(
         [&] {
             return dataplane.GetStats().host_passthrough.load() > pass_before;
         },
         3000));
-    CHECK(!ContainsUdpReply(raw->SentDown(), 45679, "FRAGMENTED"));
+    CHECK(!ContainsUdpReply(raw->SentDown(), kUdpPort, "FRAGMENTED"));
 
     // Fragmented IPv4 ICMP must likewise not answer (or relay) a truncated
     // echo: it is diverted to the host path, and no echo reply appears.
@@ -2804,26 +2887,28 @@ int main() {
         CHECK(dataplane.GetStats().handler_errors.load() ==
               handler_errors_before + 1);
         // The worker survived: a later flow still completes its handshake.
-        raw->InjectNow(BuildSynTo({127, 0, 0, 1}, 51008, 45678));
+        raw->InjectNow(BuildSynTo({127, 0, 0, 1}, 51008, kEchoPort));
         CHECK(WaitFor(
-            [&] { return 0 != FindServerIsn(raw->SentDown(), 51008, 45678); },
+            [&] { return 0 != FindServerIsn(raw->SentDown(), 51008, kEchoPort); },
             5000));
         dataplane.SetDialCompletionProbeForTest(nullptr);
     }
 
     // ----- scripted conversation through the relay ---------------------
     const uint32_t server_isn =
-        FindServerIsn(raw->SentDown(), 51001, 45678);
+        FindServerIsn(raw->SentDown(), 51001, kEchoPort);
     CHECK(server_isn != 0);
     if (server_isn != 0) {
         // Complete the handshake.
-        raw->InjectNow(BuildTcpSegment(1001, server_isn + 1, 0x10, ""));
+        raw->InjectNow(BuildTcpSegment(1001, server_isn + 1, 0x10, "", 51001,
+                                       kEchoPort));
         if (!WaitFor([&] { return dataplane.GetStats().tx_frames.load() >= 4; },
                      2000)) {
             std::fprintf(stderr, "[warn] handshake ACK not echoed yet\n");
         }
         // Send payload; the echo must come back toward the client.
-        raw->InjectNow(BuildTcpSegment(1001, server_isn + 1, 0x18, "hello vgww"));
+        raw->InjectNow(BuildTcpSegment(1001, server_isn + 1, 0x18, "hello vgww",
+                                       51001, kEchoPort));
         CHECK(WaitFor([&] {
             return ContainsPayload(raw->SentDown(), "hello vgww");
         }, 5000));
@@ -2831,17 +2916,18 @@ int main() {
         // Half-close (H3 step 2): the client's FIN must reach the upstream
         // socket as a clean close - the server's FIN must come back to the
         // client (flags 0x11), never an RST. seq advanced by 10 payload bytes.
-        raw->InjectNow(BuildTcpSegment(1011, server_isn + 1, 0x11, ""));
-        CHECK(WaitFor([&] { return ContainsFin(raw->SentDown(), 45678); },
+        raw->InjectNow(BuildTcpSegment(1011, server_isn + 1, 0x11, "", 51001,
+                                       kEchoPort));
+        CHECK(WaitFor([&] { return ContainsFin(raw->SentDown(), kEchoPort); },
                       5000));
-        CHECK(!ContainsRst(raw->SentDown(), 45678));
+        CHECK(!ContainsRst(raw->SentDown(), kEchoPort));
     }
 
     // ----- concurrent connections (shard affinity + registry scaling) -----
     // Sanity check that the echo server itself is healthy with several
     // simultaneous connections (raw sockets, no VGWW in the path).
     std::fprintf(stderr, "[dbg] native-probe=%d/3\n",
-                 NativeEchoProbe());
+                 NativeEchoProbe(kEchoPort));
     // Three independent client ports dial the SAME echo port at nearly the
     // same time. Each must complete its own handshake and echo back its own
     // payload - interleaving must not corrupt or drop any flow.
@@ -2860,13 +2946,13 @@ int main() {
         // Fire all three SYNs back-to-back: true concurrent handshakes.
         for (const auto& f : flows) {
             raw->InjectNow(BuildTcpSegment(f.seq, 0, 0x02, "", f.sport,
-                                           45678));
+                                           kEchoPort));
         }
         for (auto& f : flows) {
             uint32_t isn = 0;
             CHECK(WaitFor(
                 [&] {
-                    isn = FindServerIsn(raw->SentDown(), f.sport, 45678);
+                    isn = FindServerIsn(raw->SentDown(), f.sport, kEchoPort);
                     return isn != 0;
                 },
                 5000));
@@ -2875,7 +2961,7 @@ int main() {
             }
             f.isn = isn;
             raw->InjectNow(BuildTcpSegment(f.seq + 1, isn + 1, 0x18,
-                                           f.tag, f.sport, 45678));
+                                           f.tag, f.sport, kEchoPort));
         }
         // Each flow's payload must come back through its own relay.
         for (const auto& f : flows) {
@@ -2895,7 +2981,7 @@ int main() {
         for (const auto& f : flows) {
             raw->InjectNow(BuildTcpSegment(
                 f.seq + 1 + static_cast<uint32_t>(f.tag.size()),
-                f.isn + 1, 0x11, "", f.sport, 45678));
+                f.isn + 1, 0x11, "", f.sport, kEchoPort));
         }
         for (const auto& f : flows) {
             CHECK(WaitFor(
@@ -2919,7 +3005,7 @@ int main() {
         const uint64_t tcp_before = dataplane.GetStats().tcp_accepted.load();
         for (uint32_t s = 0; s < 70; ++s) {
             raw->ScriptInbound(
-                BuildSyn(static_cast<uint16_t>(52000 + s), 45678), 0);
+                BuildSyn(static_cast<uint16_t>(52000 + s), kEchoPort), 0);
         }
         std::this_thread::sleep_for(std::chrono::milliseconds(2500));
         const uint64_t tcp_delta =
@@ -2973,15 +3059,70 @@ int main() {
     dataplane.Stop();
     echo_stop.store(true);
     {
-        // Unblock the acceptor so the echo thread can exit.
+        // P139: unblock THIS instance's acceptor so the echo thread can exit.
+        // The port must be the one this process bound. The wake is repeated on
+        // a bounded budget so a listener that is momentarily between its poll
+        // and its accept still gets a nudge; a hard failure is CHECKed so a
+        // genuinely dead listener is reported instead of hanging the run.
+        CHECK(echo_bound.load());
+        CHECK(echo_ready.load());
+        // The wake must never block forever. A refused connection is the
+        // EXPECTED outcome once the listener has already exited; what the test
+        // must be able to distinguish is a wake that can never be delivered at
+        // all. The anti-hang guarantee itself is asserted by CHECK(joined.load())
+        // below, so this only records diagnosability.
+        bool wake_ok = false;
+        bool wake_refused = false;
         asio::io_context io;
         asio::ip::tcp::socket wake(io);
-        std::error_code ignored;
-        wake.connect(asio::ip::tcp::endpoint(asio::ip::make_address("127.0.0.1"),
-                                             45678),
-                     ignored);
+        for (int attempt = 0; attempt < 5 && !wake_ok; ++attempt) {
+            std::error_code wake_err;
+            wake.close(wake_err);
+            wake_err = {};
+            wake.connect(
+                asio::ip::tcp::endpoint(asio::ip::make_address("127.0.0.1"),
+                                         kEchoPort),
+                wake_err);
+            wake_ok = !wake_err;
+            if (!wake_ok && wake_err == asio::error::connection_refused) {
+                wake_refused = true;
+            }
+            if (!wake_ok) {
+                std::this_thread::sleep_for(std::chrono::milliseconds(2));
+            }
+        }
+        std::fprintf(stderr, "[p139] wake_ok=%d refused=%d\n", wake_ok ? 1 : 0,
+                     wake_refused ? 1 : 0);
+        // P139: the wake outcome feeds the verdict so a failed wake is
+        // distinguishable from a real success. A refused wake is expected once
+        // the listener is gone, so it is not a failure; any other wake failure
+        // (or an unaccepted wake with no refusal) is counted.
+        if (!wake_ok && !wake_refused) {
+            ++g_failures;
+        }
     }
-    echo_server.join();
+    // Bounded join: if the acceptor thread never wakes, this is where the
+    // run would previously hang forever. A 2 s cap turns that into a
+    // diagnosable failure instead.
+    {
+        std::atomic<bool> joined{false};
+        std::thread waiter([&] {
+            if (echo_server.joinable()) {
+                echo_server.join();
+            }
+            joined.store(true);
+        });
+        for (int waited = 0; waited < 200 && !joined.load(); ++waited) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(10));
+        }
+        CHECK(joined.load());
+        if (joined.load()) {
+            waiter.join();
+        } else {
+            waiter.detach();
+        }
+    }
+    CHECK(echo_bound.load());
     udp_stop.store(true);
     udp_echo.join();
 
