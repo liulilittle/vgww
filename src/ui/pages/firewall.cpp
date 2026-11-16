@@ -261,7 +261,13 @@ namespace vgww {
                 if (ctx_ == nullptr || ctx_->controller == nullptr) {
                     return;
                 }
-                SubmitCommand(*ctx_, Command{AddBanCmd{kind, canonical}});
+                // P141 B-8: a full command queue must not swallow the ban.
+                // Re-open the form with the typed values so the operator can
+                // retry after the busy toast.
+                if (!SubmitCommand(*ctx_, Command{AddBanCmd{kind, canonical}})) {
+                    ShowAddFormFor(Widen(kind), Widen(value));
+                    return;
+                }
             }
 
             const vgww::web::BanEntry* FirewallPage::FindBan(

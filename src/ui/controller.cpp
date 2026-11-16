@@ -869,6 +869,11 @@ namespace vgww {
                                        const core::Config& config,
                                        UiRuntimeFlags flags)
             : dataplane_(dataplane), config_(config), flags_(std::move(flags)),
+              // P141 B-10: `started_` is the UI process start, NOT the data
+              // plane session. uptime_s below is therefore the process
+              // lifetime (a Stop/Start of the forwarding plane does not reset
+              // it). Changing that would require a Start-time reset of the
+              // baseline, which this layer cannot observe.
               started_(std::chrono::steady_clock::now()) {}
 
         ConfigView RealDataSource::ConfigSnapshot() {
@@ -952,6 +957,9 @@ namespace vgww {
             snapshot->adapter_binding = dataplane_.GetAdapterBinding();
             snapshot->adapters = dataplane_.GetAdapters();
             snapshot->driver_running = vgww::driver::NdisrdServiceRunning();
+            // P141 B-10: uptime_s is the UI PROCESS lifetime (since the
+            // RealDataSource was constructed at startup), not the data plane's
+            // current session. It keeps counting across service Stop/Start.
             snapshot->uptime_s = static_cast<uint64_t>(
                 std::chrono::duration_cast<std::chrono::seconds>(
                     snapshot->published_at - started_)

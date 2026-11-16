@@ -79,6 +79,9 @@ namespace vgww {
 
             private:
                 void ShowAddForm();
+                void ShowAddFormFor(const std::wstring& wan_port,
+                                    const std::wstring& lan_ip,
+                                    const std::wstring& lan_port);
                 void SubmitForm(const FormResult& result);
                 void RemoveRule(const std::string& row_id);
                 const vgww::web::PortMappingRule* FindRule(
@@ -155,6 +158,12 @@ namespace vgww {
             }
 
             void PortmapPage::ShowAddForm() {
+                ShowAddFormFor(L"", L"", L"");
+            }
+
+            void PortmapPage::ShowAddFormFor(const std::wstring& wan_port,
+                                             const std::wstring& lan_ip,
+                                             const std::wstring& lan_port) {
                 if (dialog_ == nullptr) {
                     return;
                 }
@@ -166,11 +175,11 @@ namespace vgww {
                                            FormFieldType::Select, L"tcp",
                                            {{L"tcp", L"tcp"}}});
                 fields.push_back(FormField{"wan_port", Str::ColWanPort,
-                                           FormFieldType::Text, L"", {}});
+                                           FormFieldType::Text, wan_port, {}});
                 fields.push_back(FormField{"lan_ip", Str::ColLanIp,
-                                           FormFieldType::Text, L"", {}});
+                                           FormFieldType::Text, lan_ip, {}});
                 fields.push_back(FormField{"lan_port", Str::ColLanPort,
-                                           FormFieldType::Text, L"", {}});
+                                           FormFieldType::Text, lan_port, {}});
                 dialog_->ShowForm(Str::CommonAdd, std::move(fields),
                                   [this](const FormResult& result) {
                                       SubmitForm(result);
@@ -208,8 +217,15 @@ namespace vgww {
                 if (ctx_ == nullptr || ctx_->controller == nullptr) {
                     return;
                 }
-                SubmitCommand(*ctx_, Command{AddPortMapCmd{
-                    "tcp", wan_port, vgww::core::FormatIpv4(parsed), lan_port}});
+                // P141 B-8: SubmitCommand returns false when the command queue
+                // is full (64 slots). The old code ignored the result, so the
+                // dialog closed and the typed rule was lost. Re-open the form
+                // with the same values so the operator can retry.
+                if (!SubmitCommand(*ctx_, Command{AddPortMapCmd{
+                        "tcp", wan_port, vgww::core::FormatIpv4(parsed), lan_port}})) {
+                    ShowAddFormFor(Widen(wan), Widen(lan_ip), Widen(lan));
+                    return;
+                }
             }
 
             const vgww::web::PortMappingRule* PortmapPage::FindRule(

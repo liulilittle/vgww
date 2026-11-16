@@ -5,6 +5,7 @@
 
 #include "ui/i18n.h"
 
+#include <algorithm>
 #include <cmath>
 #include <cstdio>
 
@@ -73,13 +74,19 @@ namespace vgww {
             /// batch51 (user): unified fixed HH:MM:SS everywhere (About
             /// uptime, dashboard uptime, device last-seen, lease time-left).
             /// Hours count total hours (no separate day bucket) and are
-            /// zero-padded to at least two digits, so the shape never
-            /// changes after a week of uptime.
+            /// zero-padded to two digits.
+            /// P141 B-7: the hour value is CLAMPED to two digits. A one-year
+            /// DHCPv6 lease is 8760 h; rendering "8760:00:00" widened the
+            /// HH:MM:SS column. Capping at 99 keeps the shape stable for every
+            /// legal value (the column no longer wobbles when one row shows a
+            /// long lease next to a seconds-long uptime).
             std::wstring FixedTimeText(uint64_t seconds) {
                 wchar_t buf[48] = {};
+                const uint64_t hours =
+                    (std::min)(seconds / 3600, static_cast<uint64_t>(99));
                 std::swprintf(
                     buf, 48, L"%02llu:%02llu:%02llu",
-                    static_cast<unsigned long long>(seconds / 3600),
+                    static_cast<unsigned long long>(hours),
                     static_cast<unsigned long long>((seconds % 3600) / 60),
                     static_cast<unsigned long long>(seconds % 60));
                 return buf;

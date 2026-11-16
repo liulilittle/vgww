@@ -37580,7 +37580,9 @@ static void TestB333ConsoleEmptyHintFollowsLanguageSwitch() {
     CHECK(placeholder->visible);
     const std::wstring zh = placeholder->text();
     CHECK(!zh.empty());
-    CHECK(zh == i18n.T(Str::ConsoleEmptyHint));
+    // P141 B-6: the headless test process never installs the capture pipe, so
+    // the visible placeholder is the "not installed" one, not "no output yet".
+    CHECK(zh == i18n.T(Str::ConsoleEmptyHintNoCapture));
 
     // Switch to English while the ring is STILL empty: the placeholder stays
     // visible, so the old edge-triggered refresh never fires.
@@ -37592,7 +37594,7 @@ static void TestB333ConsoleEmptyHintFollowsLanguageSwitch() {
     CHECK(placeholder != nullptr);
     if (placeholder != nullptr) {
         CHECK(placeholder->visible);
-        CHECK(placeholder->text() == i18n.T(Str::ConsoleEmptyHint));  // RED: zh
+        CHECK(placeholder->text() == i18n.T(Str::ConsoleEmptyHintNoCapture));  // RED: zh
         CHECK(placeholder->text() != zh);
     }
 
@@ -37672,6 +37674,442 @@ static void TestB333PortmapLiveSummaryRendersBothCounters() {
     i18n.SetLang(Lang::ZhCN);
     app.ApplyLanguage();
     controller.Stop();
+}
+
+// P141 B-4: saving a NEW web token clears the input field; the baseline
+// (`applied_`) must follow, or RefreshDirty right after the save sees
+// ReadDraft().web_token (empty) != applied_.web_token (the typed value) and
+// marks the form dirty with the re-entry guard disarmed. A fast second save in
+// that window re-posts and restarts the data plane twice.
+static void TestP141B4TokenSaveSyncsBaseline() {
+    using namespace vgww::ui;
+    FixTextMetrics();
+    I18n::Instance().SetLang(Lang::ZhCN);
+
+    ShellFakeSource source;
+    RecordingExecutor executor;
+    UiController controller(source, executor);
+    std::string start_error;
+    CHECK(controller.Start(start_error));
+
+    const std::filesystem::path cfg =
+        std::filesystem::path(TempDirNarrowUnique("vgww_p141_b4.json"));
+    {
+        vgww::core::Config seed;
+        bool ok = false;
+        seed.adapter = "Ethernet 2";
+        seed.mode = vgww::core::Mode::kBypass;
+        seed.gateway.ipv4 = vgww::core::ParseIpv4("192.168.1.1", ok);
+        seed.gateway.mask = vgww::core::ParseIpv4("255.255.255.0", ok);
+        CHECK(vgww::core::ParseMac("02:00:00:00:00:01", seed.gateway.mac));
+        seed.dhcp.pool_start = vgww::core::ParseIpv4("192.168.1.100", ok);
+        seed.dhcp.pool_end = vgww::core::ParseIpv4("192.168.1.200", ok);
+        seed.dhcp.lease_seconds = 86400;
+        seed.web.port = 8080;
+        seed.web.bind = "127.0.0.1";
+        seed.perf.workers = 4;
+        seed.perf.max_conns = 2048;
+        seed.perf.dial_timeout_ms = 5000;
+        std::string save_error;
+        CHECK(seed.SaveToFile(cfg.string(), save_error));
+    }
+
+    UiSnapshot snapshot = MakeRulesSnapshot(1, 1);
+    ConfigView& view = snapshot.config;
+    view.adapter = "Ethernet 2";
+    view.mode = "bypass";
+    view.gateway_ip = "192.168.1.1";
+    view.gateway_mask = "255.255.255.0";
+    view.gateway_mac = "02:00:00:00:00:01";
+    view.dhcp_pool_start = "192.168.1.100";
+    view.dhcp_pool_end = "192.168.1.200";
+    view.dhcp_lease_s = 86400;
+    view.ula_prefix = "fd00:0000:0000:0000:0000:0000:0000:0000";
+    view.prefix_len = 64;
+    view.ra_lifetime_s = 1800;
+    view.dhcp6_pool_start = "fd00:0000:0000:0000:0000:0000:0000:1000";
+    view.dhcp6_pool_end = "fd00:0000:0000:0000:0000:0000:0000:1fff";
+    view.dhcp6_lease_s = 3600;
+    view.web_bind = "127.0.0.1";
+    view.web_port = 8080;
+    view.ui_scale = "auto";
+    view.theme = "dark";
+    view.perf_workers = 4;
+    view.perf_max_conns = 2048;
+    view.perf_dial_timeout_ms = 5000;
+    view.vlan_id = 0;
+    view.bridge_table_size = 4096;
+    view.config_path = cfg.string();
+
+    UiApp app;
+    app.Compose(controller, snapshot);
+    app.root().Arrange({0.0f, 0.0f, 1280.0f, 800.0f});
+    app.router().Navigate("settings");
+    app.Update(snapshot);
+    app.root().Arrange({0.0f, 0.0f, 1280.0f, 800.0f});
+
+    auto* save = dynamic_cast<Button*>(FindById(app.root(), "settings.save"));
+    auto* dirty =
+        dynamic_cast<BadgeElement*>(FindById(app.root(), "settings.dirty"));
+    auto* token_input =
+        dynamic_cast<TextInputElement*>(FindById(app.root(), "settings.token"));
+    CHECK(save != nullptr && dirty != nullptr && token_input != nullptr);
+    if (save == nullptr || dirty == nullptr || token_input == nullptr) {
+        return;
+    }
+
+    // Type a NEW token and save it.
+    TypeInto(*token_input, L"p141-b4-token");
+    ClickElement(*save);
+    CHECK(WaitForCommands(executor, 1, controller));
+    CHECK(executor.commands.size() == 1);
+
+    // Immediately after the save the token field is cleared. The draft must
+    // equal applied_ (no dirty window): the re-entry guard stays armed, so a
+    // second click with no intervening edit is dropped.
+    CHECK(!dirty->visible);  // RED before B-4: the window leaves it visible
+    ClickElement(*save);
+    CHECK(!WaitForCommands(executor, 2, controller));
+    CHECK(executor.commands.size() == 1);
+
+    { std::error_code e2; std::filesystem::remove(cfg, e2); }
+    I18n::Instance().SetLang(Lang::ZhCN);
+}
+
+// P141 B-5: the mode select is never empty today ({bypass,main} only), but if a
+// future option change ever leaves it empty ReadDraft must fall back to "bypass"
+// explicitly instead of silently keeping whatever the draft defaulted to.
+static void TestP141B5ModeEmptyKeepsBypassDefault() {
+    using namespace vgww::ui;
+    FixTextMetrics();
+    I18n::Instance().SetLang(Lang::ZhCN);
+
+    ShellFakeSource source;
+    RecordingExecutor executor;
+    UiController controller(source, executor);
+    std::string start_error;
+    CHECK(controller.Start(start_error));
+
+    UiSnapshot snapshot = MakeRulesSnapshot(1, 1);
+    ConfigView& view = snapshot.config;
+    view.adapter = "Ethernet 2";
+    view.mode = "bypass";
+    view.gateway_ip = "192.168.1.1";
+    view.gateway_mask = "255.255.255.0";
+    view.gateway_mac = "02:00:00:00:00:01";
+    view.dhcp_pool_start = "192.168.1.100";
+    view.dhcp_pool_end = "192.168.1.200";
+    view.dhcp_lease_s = 86400;
+    view.ula_prefix = "fd00:0000:0000:0000:0000:0000:0000:0000";
+    view.prefix_len = 64;
+    view.ra_lifetime_s = 1800;
+    view.dhcp6_pool_start = "fd00:0000:0000:0000:0000:0000:0000:1000";
+    view.dhcp6_pool_end = "fd00:0000:0000:0000:0000:0000:0000:1fff";
+    view.dhcp6_lease_s = 3600;
+    view.web_port = 8080;
+    view.web_bind = "127.0.0.1";
+    // The Web UI is OFF in this config: an empty mode must still carry the
+    // persisted switch through the save (the default is true, so a regression
+    // that silently drops web_enabled would flip it back to ON).
+    view.web_enabled = false;
+    view.ui_scale = "150";
+    view.theme = "light";
+    view.vlan_id = 0;
+    view.bridge_table_size = 4096;
+
+    UiApp app;
+    app.Compose(controller, snapshot);
+    app.root().Arrange({0.0f, 0.0f, 1280.0f, 800.0f});
+    app.router().Navigate("settings");
+    app.Update(snapshot);
+    app.root().Arrange({0.0f, 0.0f, 1280.0f, 800.0f});
+
+    auto* mode = dynamic_cast<SelectElement*>(FindById(app.root(), "settings.mode"));
+    auto* save = dynamic_cast<Button*>(FindById(app.root(), "settings.save"));
+    CHECK(mode != nullptr && save != nullptr);
+    if (mode == nullptr || save == nullptr) {
+        return;
+    }
+    // Clearing the selection is exactly the "empty mode" the defensive
+    // branch guards: ReadDraft must still produce a valid mode.
+    mode->SetOptions(std::vector<std::pair<std::wstring, std::wstring>>{});
+    CHECK(mode->selected_value().empty());
+    // With the mode empty, a save must fall back to bypass AND still carry
+    // the persisted Web switch (the original code nested web_enabled / ui_scale
+    // inside the mode branch, so an empty mode would silently drop both).
+    executor.commands.clear();
+    ClickElement(*save);
+    CHECK(WaitForCommands(executor, 1, controller));
+    CHECK(executor.commands.size() == 1);
+    if (executor.commands.size() == 1) {
+        const auto* cmd = std::get_if<SaveConfigCmd>(&executor.commands[0]);
+        CHECK(cmd != nullptr);
+        if (cmd != nullptr) {
+            CHECK(cmd->config.mode == vgww::core::Mode::kBypass);
+            // RED before B-5: the empty mode skipped the web_enabled read, so
+            // the persisted OFF flip-flopped back to the default ON.
+            CHECK(!cmd->config.web.enabled);
+        }
+    }
+    I18n::Instance().SetLang(Lang::ZhCN);
+}
+
+// P141 B-6: when the console capture pipe was never installed, the empty
+// placeholder must not claim there is simply "no output yet" - the operator
+// would look for a bug in the service that never logged anywhere.
+static void TestP141B6ConsolePlaceholderDistinguishesNoCapture() {
+    using namespace vgww::ui;
+    FixTextMetrics();
+    console_log::ClearForTest();
+
+    ShellFakeSource source;
+    ShellFakeExecutor executor;
+    UiController controller(source, executor);
+
+    UiSnapshot snapshot;
+    snapshot.seq = 1;
+
+    UiApp app;
+    app.Compose(controller, snapshot);
+    app.router().Navigate("console");
+    app.Update(snapshot);
+    app.root().Arrange({0.0f, 0.0f, 1280.0f, 800.0f});
+
+    auto* placeholder =
+        dynamic_cast<Text*>(FindById(app.root(), "console.empty"));
+    CHECK(placeholder != nullptr);
+    if (placeholder == nullptr) {
+        console_log::ClearForTest();
+        return;
+    }
+    CHECK(placeholder->visible);
+    std::printf("P141B6 text_len=%zu\n", placeholder->text().size());
+    // The test process never installs the capture pipe, so in headless builds
+    // `installed()` is false and the placeholder must say the capture is not
+    // active - not claim there is "no output yet". (RED before B-6: the page
+    // always labeled the empty ring with ConsoleEmptyHint.)
+    CHECK(!console_log::installed());
+    CHECK(placeholder->text() ==
+          I18n::Instance().T(Str::ConsoleEmptyHintNoCapture));
+    I18n::Instance().SetLang(Lang::ZhCN);
+    console_log::ClearForTest();
+}
+
+// P141 B-7: FixedTimeText used %02llu minimum width, so a one-year DHCPv6
+// lease (8760 h) rendered "8760:00:00" and widened the HH:MM:SS column. The
+// hours field is now clamped so the shape never exceeds two digits.
+static void TestP141B7FixedTimeTextWidthStable() {
+    using namespace vgww::ui;
+    I18n::Instance().SetLang(Lang::ZhCN);
+    std::printf("P141B7 8760h=[%ls]\n", FormatTimeLeft(8760u * 3600u).c_str());
+    // RED before the fix: 8760:00:00 (9 chars, 4-digit hours).
+    CHECK(FormatTimeLeft(8760u * 3600u) == L"99:00:00");
+    CHECK(FormatUptime(8760u * 3600u) == L"99:00:00");
+    CHECK(FormatAgo(8760u * 3600u).size() == 8);
+    // Normal values (the previous tests' pinned outputs) are unchanged.
+    CHECK(FormatUptime(90000) == L"25:00:00");
+    CHECK(FormatTimeLeft(90u * 60u) == L"01:30:00");
+    I18n::Instance().SetLang(Lang::ZhCN);
+}
+
+// P141 B-8: when the command queue is full SubmitCommand returns false. The
+// four form pages used to ignore the return value, so the dialog closed and
+// the operator's input was silently lost. Keeping the form (re-open with the
+// same values) preserves the typed input for a retry.
+static void TestP141B8QueueFullKeepsForm() {
+    using namespace vgww::ui;
+    FixTextMetrics();
+    I18n::Instance().SetLang(Lang::ZhCN);
+
+    // A controller whose command queue was never started: every Post returns
+    // false - the deterministic stand-in for a saturated 64-slot queue.
+    ShellFakeSource source;
+    RecordingExecutor executor;
+    UiController controller(source, executor);
+
+    UiSnapshot snapshot = MakeRulesSnapshot(1, 1);
+    snapshot.dataplane_running = true;
+    snapshot.portmaps.push_back(
+        vgww::web::PortMappingRule{"tcp", 8080, "192.168.1.10", 80, 7});
+    vgww::runtime::Dataplane::LeaseView lease;
+    lease.mac = "AA:BB:CC:DD:EE:FF";
+    lease.ip = "192.168.1.100";
+    lease.expires_in_s = 3600;
+    lease.hostname = "pc-1";
+    snapshot.leases.push_back(lease);
+
+    UiApp app;
+    app.Compose(controller, snapshot);
+    app.root().Arrange({0.0f, 0.0f, 1280.0f, 800.0f});
+
+    // --- portmap ----------------------------------------------------------
+    app.router().Navigate("portmap");
+    app.Update(snapshot);
+    app.root().Arrange({0.0f, 0.0f, 1280.0f, 800.0f});
+    auto* pdlg = dynamic_cast<DialogHost*>(FindById(app.root(), "portmap.dialog"));
+    auto* padd = dynamic_cast<Button*>(FindById(app.root(), "portmap.add"));
+    CHECK(pdlg != nullptr && padd != nullptr);
+    if (pdlg != nullptr && padd != nullptr) {
+        ClickElement(*padd);
+        app.root().Arrange({0.0f, 0.0f, 1280.0f, 800.0f});
+        if (auto* w =
+                dynamic_cast<TextInputElement*>(pdlg->form_field("wan_port"))) {
+            w->SetValue(L"8080");
+        }
+        if (auto* ip =
+                dynamic_cast<TextInputElement*>(pdlg->form_field("lan_ip"))) {
+            ip->SetValue(L"192.168.1.5");
+        }
+        if (auto* p =
+                dynamic_cast<TextInputElement*>(pdlg->form_field("lan_port"))) {
+            p->SetValue(L"80");
+        }
+        if (pdlg->OnKeyDown(0x0D)) {
+            // RED before B-8: Confirm() closed the form and the busy toast was
+            // the only feedback - the typed values were gone.
+        }
+        CHECK(pdlg->open() && pdlg->mode() == DialogHost::Mode::Form);
+        if (auto* w =
+                dynamic_cast<TextInputElement*>(pdlg->form_field("wan_port"))) {
+            CHECK(w->value() == L"8080");
+        }
+        CHECK(executor.commands.empty());
+    }
+
+    // --- ratelimit --------------------------------------------------------
+    app.router().Navigate("ratelimit");
+    app.Update(snapshot);
+    app.root().Arrange({0.0f, 0.0f, 1280.0f, 800.0f});
+    auto* rdlg = dynamic_cast<DialogHost*>(FindById(app.root(), "ratelimit.dialog"));
+    auto* radd = dynamic_cast<Button*>(FindById(app.root(), "ratelimit.add"));
+    CHECK(rdlg != nullptr && radd != nullptr);
+    if (rdlg != nullptr && radd != nullptr) {
+        ClickElement(*radd);
+        app.root().Arrange({0.0f, 0.0f, 1280.0f, 800.0f});
+        if (auto* m =
+                dynamic_cast<TextInputElement*>(rdlg->form_field("mac"))) {
+            m->SetValue(L"02:11:22:33:44:55");
+        }
+        if (auto* u =
+                dynamic_cast<TextInputElement*>(rdlg->form_field("up_kbps"))) {
+            u->SetValue(L"1024");
+        }
+        if (auto* d =
+                dynamic_cast<TextInputElement*>(rdlg->form_field("down_kbps"))) {
+            d->SetValue(L"2048");
+        }
+        if (rdlg->OnKeyDown(0x0D)) {
+        }
+        CHECK(rdlg->open() && rdlg->mode() == DialogHost::Mode::Form);
+        if (auto* m =
+                dynamic_cast<TextInputElement*>(rdlg->form_field("mac"))) {
+            CHECK(m->value() == L"02:11:22:33:44:55");
+        }
+    }
+
+    // --- firewall ---------------------------------------------------------
+    app.router().Navigate("firewall");
+    app.Update(snapshot);
+    app.root().Arrange({0.0f, 0.0f, 1280.0f, 800.0f});
+    auto* fdlg = dynamic_cast<DialogHost*>(FindById(app.root(), "firewall.dialog"));
+    auto* fadd = dynamic_cast<Button*>(FindById(app.root(), "firewall.add"));
+    CHECK(fdlg != nullptr && fadd != nullptr);
+    if (fdlg != nullptr && fadd != nullptr) {
+        ClickElement(*fadd);
+        app.root().Arrange({0.0f, 0.0f, 1280.0f, 800.0f});
+        if (auto* v =
+                dynamic_cast<TextInputElement*>(fdlg->form_field("value"))) {
+            v->SetValue(L"01:02:03:04:05:06");
+        }
+        if (fdlg->OnKeyDown(0x0D)) {
+        }
+        CHECK(fdlg->open() && fdlg->mode() == DialogHost::Mode::Form);
+        if (auto* v =
+                dynamic_cast<TextInputElement*>(fdlg->form_field("value"))) {
+            CHECK(v->value() == L"01:02:03:04:05:06");
+        }
+    }
+
+    // --- leases (v4 binding) ---------------------------------------------
+    app.router().Navigate("leases");
+    app.Update(snapshot);
+    app.root().Arrange({0.0f, 0.0f, 1280.0f, 800.0f});
+    auto* ldlg = dynamic_cast<DialogHost*>(FindById(app.root(), "leases.dialog"));
+    auto* tabs = dynamic_cast<SegmentedControl*>(FindById(app.root(), "leases.tabs"));
+    CHECK(ldlg != nullptr && tabs != nullptr);
+    if (ldlg != nullptr && tabs != nullptr) {
+        tabs->SetIndex(2);  // bind4 view
+        app.root().Arrange({0.0f, 0.0f, 1280.0f, 800.0f});
+        auto* ladd = dynamic_cast<Button*>(FindById(app.root(), "leases.add.v4"));
+        CHECK(ladd != nullptr);
+        if (ladd != nullptr) {
+            ClickElement(*ladd);
+            app.root().Arrange({0.0f, 0.0f, 1280.0f, 800.0f});
+        }
+        if (auto* m =
+                dynamic_cast<TextInputElement*>(ldlg->form_field("mac"))) {
+            m->SetValue(L"AA:BB:CC:11:22:33");
+        }
+        if (auto* ip =
+                dynamic_cast<TextInputElement*>(ldlg->form_field("ip"))) {
+            ip->SetValue(L"192.168.1.77");
+        }
+        if (ldlg->OnKeyDown(0x0D)) {
+        }
+        CHECK(ldlg->open() && ldlg->mode() == DialogHost::Mode::Form);
+        if (auto* m =
+                dynamic_cast<TextInputElement*>(ldlg->form_field("mac"))) {
+            CHECK(m->value() == L"AA:BB:CC:11:22:33");
+        }
+    }
+    CHECK(executor.commands.empty());
+    I18n::Instance().SetLang(Lang::ZhCN);
+}
+
+// P141 B-9: the bridge page showed "Bridging is off" whenever the MAC table was
+// empty. A RUNNING bridge with zero learned devices must not claim it is off -
+// it is learning, just nothing has spoken yet.
+static void TestP141B9BridgeRunningEmptyStateNotOff() {
+    using namespace vgww::ui;
+    FixTextMetrics();
+    I18n::Instance().SetLang(Lang::ZhCN);
+
+    ShellFakeSource source;
+    RecordingExecutor executor;
+    UiController controller(source, executor);
+    std::string start_error;
+    CHECK(controller.Start(start_error));
+
+    UiSnapshot snapshot = MakeRulesSnapshot(1, 1);
+    snapshot.config.bridge_enabled = true;
+    snapshot.config.bridge_up = "NIC 1";
+    snapshot.config.bridge_down = "NIC 2";
+    snapshot.config.bridge_table_size = 4096;
+    snapshot.bridge_state = vgww::bridge::BridgeState::kRunning;
+    snapshot.bridge_mac_count = 0;
+
+    UiApp app;
+    app.Compose(controller, snapshot);
+    app.root().Arrange({0.0f, 0.0f, 1280.0f, 800.0f});
+    app.router().Navigate("bridge");
+    app.Update(snapshot);
+    app.root().Arrange({0.0f, 0.0f, 1280.0f, 800.0f});
+
+    auto* empty =
+        dynamic_cast<Text*>(FindById(app.root(), "page.bridge.empty"));
+    CHECK(empty != nullptr);
+    if (empty == nullptr) {
+        return;
+    }
+    std::printf("P141B9 empty_len=%zu off_in=%d\n", empty->text().size(),
+                empty->text().find(L"off") != std::wstring::npos ? 1 : 0);
+    CHECK(empty->visible);
+    // RED before B-9: the running bridge showed the off/not-enabled hint.
+    CHECK(empty->text() != I18n::Instance().T(Str::BridgeEmptyHint));
+    CHECK(empty->text() ==
+          I18n::Instance().T(Str::BridgeEmptyHintRunning));
+    CHECK(!empty->text().empty());
+    I18n::Instance().SetLang(Lang::ZhCN);
 }
 
 int main() {
@@ -38222,6 +38660,12 @@ int main() {
     TestB33gPerfCurveTooltip();
     TestB33iEmptyAdapterDefaultsToBest();
     TestP141B1EmptyAdapterSaveCarriesSelection();
+    TestP141B4TokenSaveSyncsBaseline();
+    TestP141B5ModeEmptyKeepsBypassDefault();
+    TestP141B6ConsolePlaceholderDistinguishesNoCapture();
+    TestP141B7FixedTimeTextWidthStable();
+    TestP141B8QueueFullKeepsForm();
+    TestP141B9BridgeRunningEmptyStateNotOff();
     TestB33jCurveIsContinuous();
     TestB33kGradientAndAxisTicks();
     if (g_failures == 0) {

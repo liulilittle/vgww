@@ -24,8 +24,9 @@ namespace vgww {
 
         /// batch51 (user): fixed HH:MM:SS ("00:00:05", "01:30:00") - the
         /// ONLY formatter for a last-activity timestamp. Hours count total
-        /// hours and are zero-padded to at least two digits, so the shape
-        /// never changes after a week of uptime. (batch30's "5 s ago"
+        /// hours, zero-padded to exactly two digits and clamped at 99 (P141
+        /// B-7) so the shape NEVER changes - a one-year DHCPv6 lease would
+        /// otherwise widen the column to "8760:00:00". (batch30's "5 s ago"
         /// wording was retired in batch51.)
         std::wstring FormatAgo(uint64_t seconds);
 

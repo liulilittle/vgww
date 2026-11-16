@@ -1203,6 +1203,13 @@ namespace vgww {
                 SettingsDraft draft;
                 if (mode_ != nullptr && !mode_->selected_value().empty()) {
                     draft.mode = mode_->selected_value();
+                } else if (mode_ != nullptr) {
+                    // P141 B-5: the mode select is today always {bypass,main},
+                    // but a future option change could leave it empty; fall
+                    // back to the documented default instead of silently
+                    // letting a stale/empty selection drive the save.
+                    draft.mode = L"bypass";
+                }
                 draft.web_enabled =
                     web_enabled_ == nullptr || web_enabled_->checked;
                 if (ui_scale_ != nullptr) {
@@ -1211,7 +1218,6 @@ namespace vgww {
                         (ui_scale_auto_display_ && shown == ui_scale_auto_token_)
                             ? L"auto"
                             : shown;
-                }
                 }
                 if (theme_ != nullptr) {
                     draft.theme = theme_->selected_value();
@@ -1766,6 +1772,15 @@ void SettingsPage::RefreshDirty() {
                 token_clear_requested_ = false;
                 if (auto* token_input = dynamic_cast<TextInputElement*>(token_)) {
                     token_input->SetValue(std::wstring());
+                    // P141 B-4: the applied baseline must mirror the cleared
+                    // field. applied_ = draft (above) carried the typed value,
+                    // so RefreshDirty() immediately after would see
+                    // ReadDraft().web_token (empty) != applied_.web_token (the
+                    // typed value) and mark the form dirty with the re-entry
+                    // guard disarmed - a fast second Save (before the next
+                    // snapshot self-heals) re-posts and restarts the data plane
+                    // twice.
+                    applied_.web_token.clear();
                 }
                 RefreshDirty();
                 // batch42 (review): the outcome toast is produced by the app

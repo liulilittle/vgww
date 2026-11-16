@@ -532,6 +532,13 @@ namespace vgww {
             /// batch288: a paste can fail because another process holds
             /// the clipboard; it must not look like "nothing to paste".
             ClipboardPasteFailed,
+            /// P141 B-6: the console capture pipe is not installed; the empty
+            /// placeholder says so instead of implying the service logged
+            /// nothing.
+            ConsoleEmptyHintNoCapture,
+            /// P141 B-9: the bridge is RUNNING but the MAC table has no
+            /// entries yet; the empty state must not claim bridging is off.
+            BridgeEmptyHintRunning,
             _Count
         };
 

@@ -255,7 +255,15 @@ namespace vgww {
                 if (mac_changed) {
                     cmd.replace_mac = Narrow(original_mac);
                 }
-                SubmitCommand(*ctx_, Command{std::move(cmd)});
+                // P141 B-8: a full command queue must not swallow the rule.
+                // Re-open the form with the typed values so the operator can
+                // retry after the busy toast.
+                if (!SubmitCommand(*ctx_, Command{std::move(cmd)})) {
+                    ShowForm(original_mac.empty() ? Str::CommonAdd
+                                                  : Str::CommonEdit,
+                             Widen(mac), Widen(up), Widen(down), original_mac);
+                    return;
+                }
             }
 
             void RatelimitPage::OnRowAction(const std::string& row_id,

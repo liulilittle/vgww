@@ -415,6 +415,8 @@ namespace vgww {
                 L"已关闭开机自启",  // CmdAutostartDisabled
                 L"复制值",  // CtxMenuCopyValue
                 L"粘贴失败",  // ClipboardPasteFailed
+                L"控制台输出未捕获(当前进程未开启控制台捕获)",  // ConsoleEmptyHintNoCapture
+                L"桥接已启用但尚未学习到设备",  // BridgeEmptyHintRunning
             };
 
 
@@ -814,6 +816,8 @@ namespace vgww {
                 L"Autostart disabled",  // CmdAutostartDisabled
                 L"Copy value",  // CtxMenuCopyValue
                 L"Paste failed",  // ClipboardPasteFailed
+                L"Console capture is not active in this process",  // ConsoleEmptyHintNoCapture
+                L"Bridging is on, but no device has been learned yet",  // BridgeEmptyHintRunning
             };
 
 

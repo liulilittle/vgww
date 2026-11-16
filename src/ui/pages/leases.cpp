@@ -223,7 +223,8 @@ namespace vgww {
                 void ApplyPendingHighlight();
                 void SetTab(LeaseTab tab, bool relayout);
                 void ShowForm(LeaseTab tab, Str title, const std::wstring& key,
-                              const std::wstring& ip, const std::wstring& hostname);
+                              const std::wstring& ip, const std::wstring& hostname,
+                              const std::wstring& original_key = std::wstring());
                 void SubmitForm(LeaseTab tab, const FormResult& result,
                                 const std::wstring& original_key);
                 void OnRowAction(LeaseTab tab, const std::string& row_id,
@@ -685,7 +686,8 @@ namespace vgww {
 
             void LeasesPage::ShowForm(LeaseTab tab, Str title,
                                       const std::wstring& key, const std::wstring& ip,
-                                      const std::wstring& hostname) {
+                                      const std::wstring& hostname,
+                                      const std::wstring& original_key) {
                 if (dialog_ == nullptr) {
                     return;
                 }
@@ -698,7 +700,11 @@ namespace vgww {
                                            {}});
                 fields.push_back(FormField{"hostname", Str::FormHostname,
                                            FormFieldType::Text, hostname, {}});
-                const std::wstring original = key;
+                // P141 B-8: when the form is re-opened after a queue-full
+                // submit, the replace source must stay the ORIGINAL key, not
+                // the typed (possibly changed) one.
+                const std::wstring original =
+                    original_key.empty() ? key : original_key;
                 dialog_->ShowForm(title, std::move(fields),
                                   [this, tab, original](const FormResult& result) {
                                       SubmitForm(tab, result, original);
@@ -758,13 +764,31 @@ namespace vgww {
                     if (!original_key.empty()) {
                         cmd.replace_duid = Narrow(original_key);
                     }
-                    SubmitCommand(*ctx_, Command{std::move(cmd)});
+                    // P141 B-8: a full command queue must not swallow the
+                    // binding. Re-open the form with the typed values.
+                    if (!SubmitCommand(*ctx_, Command{std::move(cmd)})) {
+                        ShowForm(tab,
+                                 original_key.empty() ? Str::CommonAdd
+                                                      : Str::CommonEdit,
+                                 Widen(key), Widen(ip), Widen(hostname),
+                                 original_key);
+                        return;
+                    }
                 } else {
                     AddDhcpBindingCmd cmd{canonical_key, canonical_ip, hostname};
                     if (!original_key.empty()) {
                         cmd.replace_mac = Narrow(original_key);
                     }
-                    SubmitCommand(*ctx_, Command{std::move(cmd)});
+                    // P141 B-8: a full command queue must not swallow the
+                    // binding. Re-open the form with the typed values.
+                    if (!SubmitCommand(*ctx_, Command{std::move(cmd)})) {
+                        ShowForm(tab,
+                                 original_key.empty() ? Str::CommonAdd
+                                                      : Str::CommonEdit,
+                                 Widen(key), Widen(ip), Widen(hostname),
+                                 original_key);
+                        return;
+                    }
                 }
             }
 

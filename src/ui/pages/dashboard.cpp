@@ -1649,11 +1649,13 @@ namespace vgww {
                 // time) as its hover tooltip, so an operator can verify what
                 // the rounded instrument shows.
                 {
-                    // batch29 P1: "uptime" is the SERVICE session length. A
-                    // stopped service must not keep re-writing the tile every
-                    // second (that was the residual 1 Hz repaint after Stop):
-                    // the last running value stays on screen until the service
-                    // starts again.
+                    // P141 B-10: "uptime" here is the UI PROCESS lifetime
+                    // (RealDataSource starts the clock at process start, see
+                    // controller.cpp) - NOT the data-plane session length, so
+                    // a stopped service keeps its last value on screen and a
+                    // restart does not reset the number. The freeze below
+                    // exists so the tile is not repainted every second while
+                    // the service is stopped.
                     if (snapshot.dataplane_running || !uptime_shown_) {
                         // batch30: one human time vocabulary ("1 h 1 min"),
                         // never the old "1h 1m 1s". A SINGLE unit ("4 s") is

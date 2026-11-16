@@ -133,7 +133,14 @@ namespace vgww {
                 table_size_.value->SetText(FormatCount(config.bridge_table_size));
                 mac_count_.value->SetText(FormatCount(snapshot.bridge_mac_count));
                 empty_->visible = (snapshot.bridge_mac_count == 0);
-                empty_->SetMessage(Str::BridgeEmptyHint);  // C5: follows the language
+                // P141 B-9: a RUNNING bridge with an empty MAC table is not
+                // "off" - it is learning, just nothing has spoken yet. Only the
+                // stopped/never-started state gets the "Bridging is off" text.
+                const bool running =
+                    snapshot.bridge_state == vgww::bridge::BridgeState::kRunning;
+                empty_->SetMessage(running ? Str::BridgeEmptyHintRunning
+                                           : Str::BridgeEmptyHint);
+                // C5: follows the language
                 // batch34h: a full MAC table silently evicts the least active
                 // device, whose traffic then floods. Surface it instead of
                 // letting the operator wonder why one host keeps broadcasting.
