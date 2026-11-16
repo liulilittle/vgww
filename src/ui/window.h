@@ -172,6 +172,20 @@ namespace vgww {
             /// WndProc case is a thin wrapper over this) so a headless test can
             /// assert that an expanded popup is dismissed on focus loss.
             void HandleKillFocusForTest();
+            /// P140 B3 test seam: runs the exact WM_CAPTURECHANGED body (the
+            /// WndProc case is a thin wrapper over this) so a headless test can
+            /// assert that losing OS mouse capture aborts every in-flight drag.
+            void HandleCaptureChangedForTest();
+            /// P140 B2 test seam: runs the exact WM_EXITSIZEMOVE body so a
+            /// headless test can assert that moving the window by hand latches
+            /// user_moved_window_ (which stops DPI changes from snapping the
+            /// restored geometry back over the user's position).
+            void OnExitSizeMoveForTest() noexcept { user_moved_window_ = true; }
+            /// P140 B2 observation seam: whether the operator has moved/sized
+            /// the window by hand (WM_EXITSIZEMOVE). False until that message.
+            bool user_moved_window_for_test() const noexcept {
+                return user_moved_window_;
+            }
             /// batch27 P0-3 test seam: the exact WM_MOUSEWHEEL body.
             bool HandleWheelForTest(Point logical, int wheel_delta) {
                 return RouteClientPointer(WM_MOUSEWHEEL, logical, wheel_delta);

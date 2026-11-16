@@ -809,6 +809,17 @@ namespace vgww {
             Invalidate();
         }
 
+        void VgwwWindow::HandleCaptureChangedForTest() {
+            // P140 B3: the OS reported that mouse capture moved away (the
+            // matching WM_LBUTTONUP will not reach us). Drop the logical
+            // capture and abort every in-flight drag so later hovers cannot
+            // keep resizing a column / extending a selection. Mirrors the
+            // WM_KILLFOCUS abort without the focus/popup side effects.
+            mouse_capture_ = nullptr;
+            CancelDragsIn(root_);
+            Invalidate();
+        }
+
         void VgwwWindow::HandleCloseRequest() {
             if (!tray_active_) {
                 RequestExit();  // no tray icon: hiding would strand us
@@ -2528,6 +2539,16 @@ namespace vgww {
             if (focused_ != nullptr && !ElementInTree(root_, focused_)) {
                 focused_ = nullptr;
             }
+            // P140 B4: the pointer may survive in the tree under a HIDDEN page
+            // host (Router::Navigate only flips the hosts' visible flag; the
+            // old page's subtree stays mounted). ElementInTree alone cannot
+            // see that, so Enter/Space kept firing the hidden page's control.
+            // OverlayVisibleChain checks self + every ancestor: drop focus and
+            // refuse the key the moment the focused element is not visible.
+            if (focused_ != nullptr && !OverlayVisibleChain(focused_)) {
+                focused_ = nullptr;
+                return false;
+            }
             // batch24 P0-3 (IME): VK_PROCESSKEY (0xE5) marks a key the IME is
             // currently processing. It must never reach the editor as a normal
             // key (the WM_IME_COMPOSITION messages carry the real edit); return
@@ -3176,6 +3197,16 @@ namespace vgww {
                     if (focus_target) {
                         SetFocusElement(focus_target);
                     }
+                    // P140 B3: capture the mouse for the drag. Without OS
+                    // capture a user dragging out of the window released over
+                    // another window: our WM_LBUTTONUP never arrived, so
+                    // mouse_capture_/resizing_/dragging_ stayed latched and
+                    // later hovers kept applying the drag. SetCapture makes the
+                    // release (and the moves) keep coming here even outside the
+                    // client area.
+                    if (hwnd_ != nullptr) {
+                        ::SetCapture(hwnd_);
+                    }
                     // batch37n: Shift+click extends the text selection from
                     // the existing anchor (OS Edit).
                     const bool shift_click =
@@ -3209,6 +3240,11 @@ namespace vgww {
                 mouse_capture_ = nullptr;
                 if (target) {
                     target->OnMouseUp(logical);
+                }
+                // P140 B3: the drag ended; hand mouse capture back to the OS
+                // (SetCapture acquired it on the press).
+                if (hwnd_ != nullptr && ::GetCapture() == hwnd_) {
+                    ::ReleaseCapture();
                 }
                 // batch332 P1: a release that reaches us must end EVERY
                 // in-flight drag, not just the captured element's. When the
@@ -3764,6 +3800,23 @@ namespace vgww {
                     return 0;
                 case WM_MOVE:
                     CaptureNormalRect();
+                    return 0;
+                case WM_EXITSIZEMOVE:
+                    // batch28: the operator moved/resized the window by hand.
+                    // Latch it so a LATER DPI change stops re-applying the
+                    // saved restored geometry over the user's new position.
+                    OnExitSizeMoveForTest();
+                    return 0;
+                case WM_CAPTURECHANGED:
+                    // P140 B3: the OS released (or stole) mouse capture while
+                    // a button was held -> the matching WM_LBUTTONUP will not
+                    // reach this window. Abort the in-flight drag exactly like
+                    // WM_KILLFOCUS. Skip our own SetCapture handoff (the
+                    // window gaining capture is this hwnd) so a press-then-
+                    // drag is not aborted by the capture we just acquired.
+                    if (reinterpret_cast<HWND>(lparam) != hwnd) {
+                        HandleCaptureChangedForTest();
+                    }
                     return 0;
                 case WM_ERASEBKGND:
                     return 1;  // D2D clears the frame

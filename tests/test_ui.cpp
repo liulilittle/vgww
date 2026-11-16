@@ -1106,6 +1106,44 @@ static void TestScrollClamp() {
     CHECK(small->offset() == 0.0f);
 }
 
+// P140 B1: ScrollIntoView double-counts the current offset. ArrangeCore lays
+// the content at (viewport.y - offset_), so after the user scrolled the
+// content->bounds().y ALREADY dropped by offset_; the target's offset inside
+// the content plane IS the absolute new scroll position. The old
+// `SetOffset(offset_ + target_top)` added offset_ a second time and scrolled
+// PAST the target (clamped deeper). ScrollIntoView must land exactly on the
+// target's content-plane y.
+static void TestScrollIntoViewAfterOffset() {
+    using namespace vgww::ui;
+    FixTextMetrics();
+    auto content = std::make_unique<StackPanel>(Orientation::Vertical, 0.0f);
+    for (int i = 0; i < 5; ++i) {
+        content->Add(std::make_unique<FixedBox>(120.0f, 100.0f));
+    }
+    Element* target = content->children()[2].get();  // content-plane y = 200
+    auto scroll = std::make_unique<ScrollView>(std::move(content));
+    scroll->Arrange({0.0f, 0.0f, 300.0f, 200.0f});
+    CHECK(scroll->content_height() == 500.0f);
+    CHECK(scroll->view_height() == 200.0f);
+
+    // Scroll DOWN 50 px first: the user has travelled, so content->bounds().y
+    // is now -50. The target's offset within the content is still 200.
+    scroll->SetOffset(50.0f);
+    CHECK(scroll->offset() == 50.0f);
+    scroll->ScrollIntoView(target);
+    // The fix sets the offset to the target's content-plane y (200), so the
+    // target sits exactly at the viewport top. The old code added offset_
+    // again (50 + 200 = 250) and scrolled 50 px past the target.
+    CHECK(scroll->offset() == 200.0f);
+    scroll->Arrange({0.0f, 0.0f, 300.0f, 200.0f});
+    CHECK(std::fabs(target->bounds().y - scroll->bounds().y) < 0.5f);
+
+    // Everything below the target must still clamp to the content end.
+    scroll->SetOffset(260.0f);  // page further
+    scroll->ScrollIntoView(target);
+    CHECK(scroll->offset() == 200.0f);
+}
+
 static void TestTableVisibleRows() {
     using namespace vgww::ui;
     FixTextMetrics();
@@ -12176,6 +12214,64 @@ static void TestRouteKeyInvalidation() {
     CHECK(window.key_invalidations() == before_select_all + 1);
 }
 
+// P140 B4: a page switch hides the OUTGOING page's host (visible=false), but
+// the window's focused_ still pointed at a button inside it. The stale-guard
+// in RouteKey only checks ElementInTree(root_), which succeeds (the host tree
+// is retained, just hidden), so Enter/Space kept triggering the hidden page's
+// control. RouteKey must also drop focus whose visible-chain (self + every
+// ancestor) is broken.
+static void TestB4HiddenSubtreeFocusIsDroppedOnKey() {
+    using namespace vgww::ui;
+    FixTextMetrics();
+
+    // Two "pages": both mounted under the root, exactly like the router keeps
+    // hidden hosts live in the tree. Only one host is visible at a time.
+    StackPanel root(Orientation::Vertical, 0.0f);
+    auto* page_a = static_cast<StackPanel*>(
+        root.Add(std::make_unique<StackPanel>(Orientation::Vertical, 0.0f)));
+    page_a->id = "page.a";
+    auto* page_b = static_cast<StackPanel*>(
+        root.Add(std::make_unique<StackPanel>(Orientation::Vertical, 0.0f)));
+    page_b->id = "page.b";
+
+    int a_clicks = 0;
+    int b_clicks = 0;
+    auto* a_button = static_cast<Button*>(
+        page_a->Add(std::make_unique<Button>(L"A", ButtonStyle::Primary)));
+    a_button->id = "a.btn";
+    a_button->on_click = [&a_clicks] { ++a_clicks; };
+    auto* b_button = static_cast<Button*>(
+        page_b->Add(std::make_unique<Button>(L"B", ButtonStyle::Primary)));
+    b_button->id = "b.btn";
+    b_button->on_click = [&b_clicks] { ++b_clicks; };
+    root.Arrange({0.0f, 0.0f, 400.0f, 300.0f});
+
+    page_b->visible = false;  // page B is the inactive host, like after Navigate
+    root.Arrange({0.0f, 0.0f, 400.0f, 300.0f});
+
+    VgwwWindow window;
+    window.SetRoot(&root);
+
+    // Focus the visible page-A button: Space fires it.
+    window.SetFocusForTest(a_button);
+    CHECK(window.RouteKeyForTest(WM_KEYDOWN, 0x20));  // VK_SPACE
+    CHECK(a_clicks == 1);
+
+    // A page switch hides A's host and shows B. B's button is now the visible
+    // control, but the window still holds a_button (still in the tree, just
+    // under a hidden ancestor).
+    page_a->visible = false;
+    page_b->visible = true;
+    root.Arrange({0.0f, 0.0f, 400.0f, 300.0f});
+    // No focus move happened - the stale guard has nothing to see yet.
+    CHECK(window.FocusedForTest() == a_button);
+    // Space must NOT reach the hidden page-A button...
+    CHECK(!window.RouteKeyForTest(WM_KEYDOWN, 0x20));
+    CHECK(a_clicks == 1);
+    // ...and the stale pointer must have been dropped.
+    CHECK(window.FocusedForTest() == nullptr);
+}
+
 // T7 I1 (red first, then green): Esc closes a modal dialog through RouteKey.
 // The close
 // sets DialogHost visible=false (and tears down its card), so the old
@@ -22352,6 +22448,48 @@ static void TestB24LanguagePickerInlineSearch() {
     I18n::Instance().SetLang(Lang::ZhCN);
 }
 
+// P140 B5: opening a collapsed LanguagePicker with the SPACE key must NOT
+// leak that same keypress into the in-popup search field. VK_SPACE opens the
+// popup (SetExpanded), then Windows translates the key into a WM_CHAR(0x20)
+// which RouteKey forwards to the picker's OnChar -> the private editor's
+// InsertSpace, unless the keydown marked the paired char as consumed (the
+// same space_from_keydown_ one-shot the editor itself uses).
+static void TestB5SpaceOpenPickerDoesNotInsertSpace() {
+    using namespace vgww::ui;
+    FixTextMetrics();
+    I18n::Instance().SetLang(Lang::ZhCN);
+
+    auto root = std::make_unique<StackPanel>(Orientation::Vertical, 0.0f);
+    auto* picker = static_cast<LanguagePicker*>(
+        root->Add(std::make_unique<LanguagePicker>()));
+    picker->SetLanguages({{L"English", "en"}, {L"Chinese", "zh-CN"}},
+                         "zh-CN");
+    root->Arrange({0.0f, 0.0f, 320.0f, 160.0f});
+    CHECK(!picker->expanded());
+
+    VgwwWindow window;
+    window.SetRoot(root.get());
+    window.SetFocusForTest(picker);
+    CHECK(window.FocusedForTest() == picker);
+
+    // VK_SPACE keydown opens the collapsed picker...
+    CHECK(window.RouteKeyForTest(WM_KEYDOWN, 0x20));
+    CHECK(picker->expanded());
+    // ...and the paired WM_CHAR(0x20) must be swallowed, not inserted.
+    CHECK(window.RouteKeyForTest(WM_CHAR, L' '));
+    CHECK(picker->filter().empty());
+
+    // The direct (non-window) path behaves the same: Space opens without
+    // injecting a character into the search box.
+    picker->SetExpanded(false);
+    CHECK(!picker->expanded());
+    CHECK(picker->OnKeyDown(0x20));
+    CHECK(picker->expanded());
+    CHECK(picker->OnChar(L' '));
+    CHECK(picker->filter().empty());
+    I18n::Instance().SetLang(Lang::ZhCN);
+}
+
 // ============================================================================
 // batch24 P1-5: device-pixel alignment for strokes. At 125% a 1 px logical
 // border is 1.25 physical px; the old geometry split it across two device rows
@@ -27556,6 +27694,21 @@ static void TestB28WindowGeometryMemory() {
         CHECK(!window.has_pending_restore());  // red: used the tiny size
         ui_state::SetStatePathForTest(L"");
     }
+}
+
+// P140 B2: WIN-EXITSIZEMOVE must latch that the operator moved/sized the
+// window by hand. The restored-geometry DPI logic only re-applies the saved
+// position/size while `!user_moved_window_`; the flag was declared (window.h)
+// but never set, so a DPI change snapped the window back even after the user
+// had moved it. The WndProc handler is the only writer.
+static void TestB2ExitSizeMoveLatchesUserMoved() {
+    using namespace vgww::ui;
+    VgwwWindow window;
+    // Fresh window: the operator has not moved anything yet.
+    CHECK(!window.user_moved_window_for_test());
+    // The WM_EXITSIZEMOVE body runs exactly like the WndProc case.
+    window.OnExitSizeMoveForTest();
+    CHECK(window.user_moved_window_for_test());
 }
 
 /// D5: every advanced field explains what changes (Small + TextDim + wrapped).
@@ -36894,6 +37047,63 @@ static void TestB332CancelDragOnKillFocus() {
 }
 
 // ============================================================================
+// P140 B3: a drag whose capture is lost must not stay in-flight.
+//
+// The window never called SetCapture, so when the operator pressed a column
+// boundary and dragged OUT of the window, the WM_LBUTTONUP went to the window
+// under the cursor - resizing_ stayed true and every later WM_MOUSEMOVE kept
+// resizing the column. With OS capture, dragging out still delivers the
+// release; and WM_CAPTURECHANGED (the OS telling us capture went elsewhere,
+// e.g. an Alt+Tab mid-drag) must abort every in-flight drag exactly like
+// WM_KILLFOCUS does.
+// ============================================================================
+static void TestB3CaptureChangedAbortsInFlightDrag() {
+    using namespace vgww::ui;
+    FixTextMetrics();
+    VgwwWindow window;
+    auto table = std::make_unique<TableElement>();
+    TableColumn c0;
+    c0.id = "a"; c0.header = Str::ColIp; c0.width = 100.0f; c0.align = Align::Start;
+    TableColumn c1;
+    c1.id = "b"; c1.header = Str::ColMac; c1.width = 100.0f; c1.align = Align::Start;
+    table->SetColumns({c0, c1});
+    table->SetRows({{"r0", {L"A0", L"B0"}, false}});
+    TableElement* tbl = table.get();
+    auto root = std::make_unique<StackPanel>(Orientation::Vertical, 4.0f);
+    root->Add(std::move(table));
+    window.SetRoot(root.get());
+    window.ResizeForTest(400.0f, 300.0f);
+
+    const Rect tb = tbl->bounds();
+    CHECK(tb.w > 0.0f && tb.h > 0.0f);
+    const float body_y = tb.y + 44.0f;
+    const float boundary_x = tb.x + tbl->resolved_widths()[0];
+    const float header_y = tb.y + 8.0f;
+    const float width_before = tbl->resolved_widths()[0];
+
+    // Press on the column boundary, then move: the drag is live.
+    CHECK(window.RouteMouseForTest(WM_LBUTTONDOWN,
+                                   Point{boundary_x, header_y}));
+    CHECK(window.RouteMouseForTest(WM_MOUSEMOVE,
+                                   Point{boundary_x + 15.0f, body_y}));
+    CHECK(std::fabs(tbl->resolved_widths()[0] - width_before) > 1.0f);
+
+    // The OS reports the capture went to another window (drag ended outside us
+    // / Alt+Tab): the in-flight resize must be aborted.
+    window.HandleCaptureChangedForTest();
+    const float width_after_capture_change = tbl->resolved_widths()[0];
+    // A later move must NOT keep resizing the column...
+    window.RouteMouseForTest(WM_MOUSEMOVE,
+                             Point{boundary_x + 60.0f, body_y});
+    CHECK(std::fabs(tbl->resolved_widths()[0] - width_after_capture_change) <
+          1e-4f);
+    // ...and the resize cursor must be gone.
+    CHECK(window.CursorHintForTest(Point{boundary_x + 60.0f, body_y}) !=
+          CursorKind::SizeWE);
+    window.SetRoot(nullptr);
+}
+
+// ============================================================================
 // batch332 P2: SelectElement arrow keys with NO current selection.
 //
 // `index = 0` doubled as both "first option" and "not found", so Down from an
@@ -37166,6 +37376,7 @@ static void TestB333PortmapLiveSummaryRendersBothCounters() {
 int main() {
 
     TestB332CancelDragOnKillFocus();
+    TestB3CaptureChangedAbortsInFlightDrag();
     TestB332SelectArrowWithoutSelection();
     TestB332PickerRowBoundaryBelongsToSearch();
     TestB333RatelimitEditVanishedRuleOpensNoForm();
@@ -37205,6 +37416,7 @@ int main() {
     TestSegmentedContainerLanguage();
     TestBeginRecordResetsAlpha();
     TestScrollClamp(); TestTableVisibleRows(); TestTableSetRowsShortCircuit();
+    TestScrollIntoViewAfterOffset();
     TestTextPaintCacheSkipsOnlyCleanKeys();
     TestTextInputEditing();
     TestCaretBlink(); TestWindowForegroundGuard();
@@ -37333,6 +37545,7 @@ int main() {
     TestInputRoundedCorners();
     TestSelectOnFocusClears();
     TestRouteKeyInvalidation();
+    TestB4HiddenSubtreeFocusIsDroppedOnKey();
     TestTableResizeLocalInvalidation();
     TestPageHeaderTitleToken();
     TestB229DpiFallbackClampsToWorkArea();
@@ -37549,6 +37762,7 @@ int main() {
     TestB24SettingsScrollViewportFits();
     TestB24SelectPopupFlipsUp();
     TestB24LanguagePickerInlineSearch();
+    TestB5SpaceOpenPickerDoesNotInsertSpace();
     TestB24StrokeDevicePixelSnap();
     TestB24ConsoleScrollSemantics();
     TestLanguagePickerSearchEditorImeCaretAndBounds();
@@ -37623,6 +37837,7 @@ int main() {
     TestB28EmptyStateHints();
     TestB28TrayServiceToggle();
     TestB28WindowGeometryMemory();
+    TestB2ExitSizeMoveLatchesUserMoved();
     TestB28AdvancedHints();
     TestB28SinglePrimaryPerPage();
     TestB28RatelimitBridgeColumns();

@@ -1122,6 +1122,12 @@ namespace vgww {
             void SetMaxChars(std::size_t max_chars) noexcept { max_chars_ = max_chars; }
             std::size_t max_chars() const noexcept { return max_chars_; }
             std::size_t caret_index() const noexcept { return caret_; }
+            /// P140 B5: mark the next WM_CHAR(0x20) as already handled by the
+            /// keyboard event that produced it. A host control (the
+            /// LanguagePicker opening with VK_SPACE) that forwards printable
+            /// input into this editor must call this so the paired WM_CHAR
+            /// does not double-insert the space.
+            void NoteSpaceFromKeyDown() noexcept { space_from_keydown_ = true; }
 
             bool focusable() const override { return true; }
             /// W11 batch6 G-4: the editor requests the I-beam cursor; the

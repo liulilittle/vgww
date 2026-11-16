@@ -1441,6 +1441,14 @@ namespace vgww {
             }
             if (!expanded_) {
                 if (vk == 0x0D || vk == 0x20) {  // Enter / Space open
+                    if (vk == 0x20 && search_ != nullptr) {
+                        // P140 B5: Space also arrives as a WM_CHAR(0x20) after
+                        // the keydown. Opening the popup turns that char into a
+                        // forward to the search editor; without the one-shot
+                        // mark the freshly opened search box would start with a
+                        // stray space.
+                        search_->NoteSpaceFromKeyDown();
+                    }
                     SetExpanded(true);
                     return true;
                 }
@@ -1853,7 +1861,12 @@ namespace vgww {
             // IS the scroll position that puts it at the viewport top. SetOffset
             // clamps into [0, content_h - view_h].
             const float target_top = target->bounds().y - content->bounds().y;
-            SetOffset(offset_ + target_top);
+            // P140 B1: target_top is already in content-intrinsic coordinates,
+            // while content->bounds().y already encodes the CURRENT offset_
+            // (Arrange places it at viewport.y - offset_). Adding offset_ again
+            // scrolled PAST the target whenever the user had travelled; the
+            // absolute target_top is the required new offset on its own.
+            SetOffset(target_top);
         }
 
         Size ScrollView::MeasureCore(Size available) {
