@@ -28,10 +28,14 @@ namespace vgww {
         /// an unchecked ihl of 0 pointed them at the IPv4 header itself.
         inline constexpr size_t kIpv4HeaderLenMax = 60;
 
-        /// Stack reply-buffer size, matching Dataplane::AppendDown's send cap
-        /// (src/runtime/dataplane.cpp:3668). Replies larger than this are
-        /// dropped by AppendDown anyway, so a fixed stack buffer suffices and
-        /// removes the per-frame heap allocation.
+        /// Stack reply-buffer and builder ceiling. The SEND cap is decided by
+        /// Dataplane::AppendDown (src/runtime/dataplane.cpp:3748): 1514 driver
+        /// bytes, minus the 4-byte 802.1Q tag when the access VLAN is enabled
+        /// (so 1510 there). A reply larger than the effective cap is refused
+        /// by the caller (counted as icmp_too_big) instead of being built,
+        /// handed to AppendDown and silently dropped. Keeping this buffer at
+        /// the untagged maximum is safe: the caller budgets against the
+        /// effective cap before sending.
         inline constexpr size_t kMaxEchoReplyFrameBytes = 1514;
 
         /// True when `ihl` (already multiplied to bytes) is a legal IPv4

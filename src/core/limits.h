@@ -30,7 +30,46 @@ namespace vgww::core::limits {
     // cannot drift apart.
     constexpr size_t kMaxHostnameBytes = 253;
     // DHCPv6 (RFC 8415) caps; same numeric discipline as the v4 ones.
-    constexpr size_t kMaxLeases6Bytes = 2 * 1024 * 1024;  // 2MiB
+    // This is an ALIAS of kMaxLeasesBytes, not a second literal: both lease
+    // stores enforce the same document-size policy, so tying the values keeps
+    // "raise the cap" a single edit. The v4 and v6 read AND write paths each
+    // name their own constant (dhcp.cpp uses kMaxLeasesBytes, dhcp6.cpp uses
+    // kMaxLeases6Bytes), which is what keeps the two protocols' write cap and
+    // read cap identical - the P145-V6 "never publish a file we cannot load"
+    // invariant depends on that. COST of the alias: v6 cannot be tuned
+    // independently; if a v6-specific cap is ever needed, turn this line back
+    // into an independent literal (no other change is required, since all
+    // three v6 uses - dump guard, stat cap and streamoff cap - already read
+    // this name).
+    constexpr size_t kMaxLeases6Bytes = kMaxLeasesBytes;
+    // Bounds on the lease TABLE, single-sourced so the v4 and the v6 server
+    // enforce identical numbers (same-shape discipline). Note that the
+    // SERVING path is naturally bounded and needs no policy cap: a dynamic
+    // lease must hold a unique in-pool address (so <= pool_size) and, after
+    // the static DUID dedup, a static lease must correspond to a configured
+    // binding (so <= kMaxStaticBindings / unique DUIDs). Only LOADING from
+    // disk can inject records that are outside any pool (a legitimately
+    // persisted lease survives a pool re-range), so the file loader is the
+    // one place a ceiling is required.
+    //
+    // kMaxLoadedLeases - how many records a LEASE FILE may inject. Sized so
+    // that the ceiling is REACHABLE inside the 2 MiB document cap: the
+    // shortest well-formed v6 entry (DUID + IAID + address) is about 100
+    // bytes, so 16384 records fit in ~1.6 MiB and a test can prove the gate
+    // bites. It is also 4x the default DHCPv6 pool (4096). This is NOT a
+    // service-capacity limit: Acquire never consults it, so a /16 serving
+    // load is unaffected.
+    constexpr size_t kMaxLoadedLeases = 16384;
+    // kMaxLeaseTableHardCap - purely defensive hard ceiling for the serving
+    // path. It covers every ordinary deployment (a v4 /16 pool is 65534
+    // addresses and the v6 default pool is 4096, both far below it) and is
+    // never reached by them. KNOWN LIMITATION: a mask shorter than /16 is
+    // accepted by the config validator (it only requires a contiguous
+    // prefix), so a /8-sized v4 pool can exceed this number; such a client
+    // is then refused and reported through pool_exhausted rather than
+    // growing the table without bound. The value exists so no future code
+    // path can grow the table indefinitely.
+    constexpr size_t kMaxLeaseTableHardCap = 262144;
     constexpr size_t kMaxStaticBindings6 = 1024;
     // RFC 8415 section 11.1: a DUID is 1..128 octets. Single-sourced because
     // THREE layers enforce it - the wire parser (proto), the store/Web parser

@@ -141,6 +141,9 @@ namespace vgww {
                 // batch34a: the 14th field, previously dropped on the floor.
                 out.portmap_send_dropped =
                     stats.portmap_send_dropped.load(std::memory_order_relaxed);
+                // P145-D: see Counters::icmp_too_big.
+                out.icmp_too_big =
+                    stats.icmp_too_big.load(std::memory_order_relaxed);
             }
 
             // --- command bodies (validation first, then mutate) -----------

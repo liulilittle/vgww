@@ -332,6 +332,23 @@ namespace vgww {
             bool ReservedByStatic(const std::vector<uint8_t>& duid,
                                   const std::array<uint8_t, 16>& ip) const;
 
+            /// P145-B1: true when one more lease record may be inserted.
+            /// Caller holds mutex_. At core::limits::kMaxDynamicLeases the
+            /// EXPIRED dynamic records are evicted first (recycling); when
+            /// none is evictable the insert is refused and the caller reports
+            /// it through the pool-exhaustion channel. Static records are
+            /// never evicted - they belong to a configured client.
+            bool EnsureLeaseSlot(std::chrono::steady_clock::time_point now);
+
+            /// P145-B2: the static branches must not create a record per
+            /// client-chosen IAID. Static records are is_static (Sweep never
+            /// reclaims them), so a bound DUID + N IAIDs grew leases_ by N
+            /// entries forever. Returns the single record a given DUID owns,
+            /// collapsing any others (a DUID is what a static binding binds).
+            /// P145-B1: nullptr when the table is at the cap and no expired
+            /// record can be recycled (the caller reports pool exhaustion).
+            Lease* StaticLeaseFor(const Key& key,
+                                  std::chrono::steady_clock::time_point now);
             core::Config config_;
             std::vector<uint8_t> server_duid_;
             std::array<uint8_t, 16> pool_prefix_{};

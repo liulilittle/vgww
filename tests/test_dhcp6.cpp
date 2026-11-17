@@ -2091,8 +2091,11 @@ static void TestB81DumpLeasesDoesNotStallLockHolders() {
     Dhcp6Server server(config);
     const auto now = std::chrono::steady_clock::now();
     // Long hostnames make the JSON build substantial - that build is exactly
-    // the work that used to run under the lock.
-    const std::string filler(2048, 'h');
+    // the work that used to run under the lock. Clamped to the 253-byte
+    // option ceiling: a longer name is refused by ReplaceBinding, and 4096
+    // rows must also stay under kMaxLeasesBytes so the dump is ACCEPTED here
+    // (P145-V6 refuses an unreadable document by design).
+    const std::string filler(250, 'h');
     for (uint32_t i = 0; i < 4096; ++i) {
         const std::vector<uint8_t> duid = {
             0x00, 0x03, 0x00, 0x01, static_cast<uint8_t>(i >> 24),
@@ -2828,6 +2831,713 @@ static void TestB81DumpLeasesDoesNotStallLockHolders() {
         CHECK(ratio <= 50.0);
     }
 
+    // P145-A (v6): same defect class as the v4 loader - an entry that is not
+    // an object, or a field whose JSON type is wrong, used to escape as an
+    // nlohmann type_error before corrupt() ran, so the bad document was kept
+    // on disk and never flagged. Every entry refusal must be contained.
+    void TestP145Leases6EntryTypeErrorsAreContained() {
+        Config config = MakeConfig();
+
+        const auto run_case = [&config](const char* leaf, const char* document) {
+            const std::string path = ScratchFile(leaf);
+            std::error_code rm_a;
+            std::filesystem::remove(path, rm_a);
+            std::error_code rm_b;
+            std::filesystem::remove(path + ".corrupt", rm_b);
+            {
+                std::ofstream out(path);
+                out << document;
+            }
+            Dhcp6Server server(config);
+            size_t dropped = 0;
+            size_t thrown = 0;
+            Dhcp6Server::LoadOutcome outcome =
+                Dhcp6Server::LoadOutcome::kRestored;
+            try {
+                outcome = server.LoadLeases(path, std::chrono::steady_clock::now(),
+                                            &dropped);
+            } catch (...) {
+                ++thrown;
+            }
+            CHECK(0 == thrown);
+            CHECK(Dhcp6Server::LoadOutcome::kCorrupt == outcome ||
+                  (Dhcp6Server::LoadOutcome::kRestored == outcome &&
+                   dropped > 0));
+            if (Dhcp6Server::LoadOutcome::kRestored == outcome) {
+                CHECK(server.DroppedLeaseCount() > 0);
+            } else {
+                CHECK(server.LeaseFileCorrupt());
+                std::ifstream aside(path + ".corrupt");
+                CHECK(aside.good());
+            }
+            std::error_code rm_c;
+            std::filesystem::remove(path, rm_c);
+            std::error_code rm_d;
+            std::filesystem::remove(path + ".corrupt", rm_d);
+        };
+
+        // (1) non-object entry.
+        run_case("p145_leases6_non_object.json",
+                 "{\"version\":1,\"leases\":[\"not-an-object\"]}");
+        // (2) "duid" is a number (type_error.302 on item.value("duid", "")).
+        run_case("p145_leases6_bad_duid_type.json",
+                 "{\"version\":1,\"leases\":[{\"duid\":123,\"iaid\":1,"
+                 "\"ip\":\"fd00:1122:3344:5566:0000:0000:0000:1000\"}]}");
+        // (3) "iaid" is a string (type_error.302 on item.value("iaid", 0u)).
+        run_case("p145_leases6_bad_iaid_type.json",
+                 "{\"version\":1,\"leases\":[{\"duid\":\"00:03:00:01:AA:BB:CC:"
+                 "DD:EE:01\",\"iaid\":\"seven\",\"ip\":\"fd00:1122:3344:5566:"
+                 "0000:0000:0000:1000\"}]}");
+        // (4) "ip" is a number.
+        run_case("p145_leases6_bad_ip_type.json",
+                 "{\"version\":1,\"leases\":[{\"duid\":\"00:03:00:01:AA:BB:CC:"
+                 "DD:EE:01\",\"iaid\":1,\"ip\":7}]}");
+
+        // (5) a good entry survives next to a refused one.
+        {
+            const std::string path =
+                ScratchFile("p145_leases6_mixed.json");
+            std::error_code rm_e;
+            std::filesystem::remove(path, rm_e);
+            std::error_code rm_f;
+            std::filesystem::remove(path + ".corrupt", rm_f);
+            {
+                std::ofstream out(path);
+                out << "{\"version\":1,\"leases\":["
+                       "{\"duid\":\"00:03:00:01:AA:BB:CC:DD:EE:01\","
+                       "\"iaid\":1,\"ip\":\"fd00:1122:3344:5566:0000:0000:"
+                       "0000:1000\",\"expires_in_s\":3600,"
+                       "\"hostname\":\"good\"},"
+                       "{\"duid\":123,\"iaid\":2,\"ip\":\"fd00:1122:3344:5566:"
+                       "0000:0000:0000:1001\"}]}";
+            }
+            Dhcp6Server server(config);
+            size_t dropped = 0;
+            size_t thrown = 0;
+            Dhcp6Server::LoadOutcome outcome =
+                Dhcp6Server::LoadOutcome::kRestored;
+            try {
+                outcome = server.LoadLeases(path, std::chrono::steady_clock::now(),
+                                            &dropped);
+            } catch (...) {
+                ++thrown;
+            }
+            CHECK(0 == thrown);
+            CHECK(Dhcp6Server::LoadOutcome::kRestored == outcome);
+            CHECK(1 == server.LeaseCount());
+            CHECK(1 == dropped);
+            std::error_code rm_g;
+            std::filesystem::remove(path, rm_g);
+        }
+    }
+
+    // P145-E (v6): a persisted expires_in_s is an attacker/editor controlled
+    // number with no ceiling; ~136 years of pinning one address starves the
+    // pool forever. The loader must clamp it to
+    // config.ipv6.dhcpv6.lease_seconds. (Pool membership is deliberately NOT
+    // validated - a legitimately persisted lease survives a pool re-range,
+    // see TestLeases6RoundTrip and the v4 sibling dhcp.cpp:1403-1409.)
+    void TestP145Leases6ExpiresIsClampedToLeaseSeconds() {
+        Config config = MakeConfig();
+        Dhcp6Server server(config);
+
+        const std::string path =
+            ScratchFile("p145_leases6_expires_huge.json");
+        std::error_code rm_h;
+        std::filesystem::remove(path, rm_h);
+        {
+            std::ofstream out(path);
+            out << "{\"version\":1,\"leases\":["
+                   "{\"duid\":\"00:03:00:01:AA:BB:CC:DD:EE:01\",\"iaid\":1,"
+                   "\"ip\":\"fd00:1122:3344:5566:0000:0000:0000:1000\","
+                   "\"expires_in_s\":4294967295,\"hostname\":\"pinned\"}]}";
+        }
+        const auto t0 = std::chrono::steady_clock::now();
+        size_t dropped = 0;
+        CHECK(server.LoadLeases(path, t0, &dropped) ==
+              Dhcp6Server::LoadOutcome::kRestored);
+        CHECK(1 == server.LeaseCount());
+        const auto leases = server.Leases(t0);
+        CHECK(1 == leases.size());
+        if (!leases.empty()) {
+            CHECK(leases[0].expires_in_s <=
+                  config.ipv6.dhcpv6.lease_seconds);
+        }
+        std::error_code rm_i;
+        std::filesystem::remove(path, rm_i);
+    }
+
+    // P145-V3 (v6): the serving path has no policy ceiling, and pool
+    // exhaustion is only reported when the ADDRESS space is gone.
+    void TestP145V3Lease6ServesBeyondLegacyCap() {
+        Config config = MakeConfig();
+        config.ipv6.dhcpv6.pool_end[14] = 0xFF;
+        config.ipv6.dhcpv6.pool_end[15] = 0xFF;
+        Dhcp6Server server(config);
+        const auto now = std::chrono::steady_clock::now();
+
+        constexpr size_t kLegacyCap = 8192;
+        size_t granted = 0;
+        for (size_t i = 0; i < kLegacyCap + 1; ++i) {
+            std::vector<uint8_t> duid{0x00, 0x03, 0x00, 0x01,
+                                      0xCC,
+                                      static_cast<uint8_t>((i >> 16) & 0xFF),
+                                      static_cast<uint8_t>((i >> 8) & 0xFF),
+                                      static_cast<uint8_t>(i & 0xFF)};
+            if (!IsZeroAddr(server.Acquire(duid, 1, now,
+                                           Dhcp6Server::OfferStage::kAck))) {
+                ++granted;
+            }
+        }
+        CHECK(kLegacyCap + 1 == granted);
+        CHECK(server.LeaseCount() == kLegacyCap + 1);
+        CHECK(0 == server.PoolExhaustedCount());
+
+        // A brand-new client is still served (no sticky refusal).
+        const std::vector<uint8_t> extra{0x00, 0x03, 0x00, 0x01, 0xDD, 0x00,
+                                         0x00, 0x01};
+        CHECK(!IsZeroAddr(server.Acquire(extra, 1, now,
+                                            Dhcp6Server::OfferStage::kAck)));
+        CHECK(kLegacyCap + 2 == server.LeaseCount());
+        CHECK(0 == server.PoolExhaustedCount());
+    }
+
+    // P145-V2 (v6): the loader is the only path that can inject records no
+    // pool bounds, so it is the only path with a load ceiling.
+    void TestP145V2Leases6LoadIsBounded() {
+        Config config = MakeConfig();
+        const size_t limit = vgww::core::limits::kMaxLoadedLeases;
+        const size_t extra = 4;
+        const std::string path =
+            ScratchFile("p145_v2_leases6_oversized_entries.json");
+        std::error_code rm_a;
+        std::filesystem::remove(path, rm_a);
+        {
+            std::ofstream out(path);
+            out << "{\"version\":1,\"leases\":[";
+            for (size_t i = 0; i < limit + extra; ++i) {
+                if (i > 0) {
+                    out << ",";
+                }
+                // Shortest legitimate entry, inside the ULA prefix and with a
+                // UNIQUE address per record: only the load ceiling may refuse.
+                char entry[96];
+                std::snprintf(
+                    entry, sizeof(entry),
+                    "{\"duid\":\"00:03:00:01:AA:%02X:%02X:%02X\","
+                    "\"iaid\":1,\"ip\":\"fd00:1122:3344:5566:0:%X:%X:%X\"}",
+                    static_cast<unsigned>((i >> 16) & 0xFF),
+                    static_cast<unsigned>((i >> 8) & 0xFF),
+                    static_cast<unsigned>(i & 0xFF),
+                    static_cast<unsigned>(((i >> 28) & 0xF)),
+                    static_cast<unsigned>(((i >> 12) & 0xFFFF)),
+                    static_cast<unsigned>((i & 0xFFF)));
+                out << entry;
+            }
+            out << "]}";
+        }
+
+        Dhcp6Server server(config);
+        size_t dropped = 0;
+        size_t thrown = 0;
+        Dhcp6Server::LoadOutcome outcome = Dhcp6Server::LoadOutcome::kRestored;
+        try {
+            outcome = server.LoadLeases(path, std::chrono::steady_clock::now(),
+                                        &dropped);
+        } catch (...) {
+            ++thrown;
+        }
+        CHECK(0 == thrown);
+        CHECK(Dhcp6Server::LoadOutcome::kRestored == outcome);
+        CHECK(server.LeaseCount() <= limit);
+        CHECK(dropped >= extra);
+
+        // The serving path still works for a new client.
+        const std::vector<uint8_t> fresh{0x00, 0x03, 0x00, 0x01, 0x7A, 0x00,
+                                         0x00, 0x01};
+        CHECK(!IsZeroAddr(server.Acquire(fresh, 1,
+                                          std::chrono::steady_clock::now(),
+                                          Dhcp6Server::OfferStage::kAck)));
+        std::error_code rm_b;
+        std::filesystem::remove(path, rm_b);
+    }
+
+    // P145-V1 (v6 sibling): a partially damaged document leaves evidence.
+    // P145-V6 (v6 sibling): the reader refuses a document larger than
+    // kMaxLeasesBytes, so the writer must never publish one. Otherwise a
+    // large but legal table writes a file this build cannot restore, and
+    // every restart discards every lease as corrupt.
+    void TestP145V6Leases6DumpNeverWritesUnreadableFile() {
+        Config config = MakeConfig();
+        config.ipv6.dhcpv6.pool_start = kPrefix;
+        config.ipv6.dhcpv6.pool_start[14] = 0x00;
+        config.ipv6.dhcpv6.pool_start[15] = 0x00;
+        config.ipv6.dhcpv6.pool_end = kPrefix;
+        config.ipv6.dhcpv6.pool_end[14] = 0xFF;
+        config.ipv6.dhcpv6.pool_end[15] = 0xFF;
+        Dhcp6Server server(config);
+        const auto now = std::chrono::steady_clock::now();
+
+        const std::string path =
+            ScratchFile("p145_v6_leases6_oversized.json");
+        std::error_code rm_a;
+        std::filesystem::remove(path, rm_a);
+        std::error_code rm_b;
+        std::filesystem::remove(path + ".corrupt", rm_b);
+
+        // A small table first: this snapshot must survive the refused dump.
+        const std::vector<uint8_t> first{0x00, 0x03, 0x00, 0x01, 0x02, 0x00,
+                                         0x00, 0x00, 0x00, 0x01};
+        CHECK(!IsZeroAddr(server.Acquire(first, 1, now,
+                                         Dhcp6Server::OfferStage::kAck)));
+        CHECK(server.DumpLeases(path, now));
+        std::string before;
+        {
+            std::ifstream in(path, std::ios::binary);
+            CHECK(in.good());
+            before.assign((std::istreambuf_iterator<char>(in)),
+                          std::istreambuf_iterator<char>());
+        }
+        CHECK(!before.empty());
+        const uint64_t failures_before = server.PersistFailureCount();
+
+        // Grow past the reader's byte cap. A v6 row is ~120 bytes; the table
+        // cap itself is far larger, so only the byte cap can stop this.
+        const size_t rows = vgww::core::limits::kMaxLeasesBytes / 100 + 1;
+        size_t granted = 0;
+        for (size_t i = 0; i < rows; ++i) {
+            const std::vector<uint8_t> duid{
+                0x00, 0x03, 0x00, 0x01, 0x02, 0x20,
+                static_cast<uint8_t>((i >> 16) & 0xFF),
+                static_cast<uint8_t>((i >> 8) & 0xFF),
+                static_cast<uint8_t>(i & 0xFF),
+                static_cast<uint8_t>((i >> 24) & 0xFF)};
+            if (!IsZeroAddr(server.Acquire(duid, 1, now,
+                                           Dhcp6Server::OfferStage::kAck))) {
+                ++granted;
+            }
+        }
+        CHECK(granted == rows);
+
+        // The dump must be REFUSED rather than publishing an unreadable file.
+        CHECK(!server.DumpLeases(path, now));
+        CHECK(server.PersistFailureCount() > failures_before);
+
+        // The previous good snapshot is untouched.
+        std::string after;
+        {
+            std::ifstream in(path, std::ios::binary);
+            CHECK(in.good());
+            after.assign((std::istreambuf_iterator<char>(in)),
+                         std::istreambuf_iterator<char>());
+        }
+        CHECK(after == before);
+
+        // Core invariant: a file we kept on disk is one we can read back.
+        Dhcp6Server reloaded(config);
+        size_t dropped = 0;
+        const auto outcome = reloaded.LoadLeases(path, now, &dropped);
+        CHECK(Dhcp6Server::LoadOutcome::kRestored == outcome);
+        CHECK(!reloaded.LeaseFileCorrupt());
+        CHECK(reloaded.LeaseCount() >= 1);
+
+        std::error_code rm_c;
+        std::filesystem::remove(path, rm_c);
+        std::error_code rm_d;
+        std::filesystem::remove(path + ".corrupt", rm_d);
+    }
+
+    // P145-B2 (loader-side): a lease file may legally hold SEVERAL records
+    // for one DUID (a v6 client owns one record per IAID, and the dump
+    // writes them all). Loading such a file must keep every record: the
+    // static path collapses them on demand, so the loader must NOT drop
+    // them up front (that would silently lose a client's other IAIDs).
+    void TestP145B2MultiIaidRecordsSurviveLoad() {
+        Config config = MakeConfig();
+        const std::string path =
+            ScratchFile("p145_b2_multi_iaid_load.json");
+        std::error_code rm_a;
+        std::filesystem::remove(path, rm_a);
+        {
+            std::ofstream out(path);
+            out << "{\"version\":1,\"leases\":["
+                   "{\"duid\":\"00:03:00:01:AA:BB:CC:DD:EE:01\",\"iaid\":1,"
+                   "\"ip\":\"fd00:1122:3344:5566:0000:0000:0000:1000\","
+                   "\"expires_in_s\":3600,\"hostname\":\"one\"},"
+                   "{\"duid\":\"00:03:00:01:AA:BB:CC:DD:EE:01\",\"iaid\":2,"
+                   "\"ip\":\"fd00:1122:3344:5566:0000:0000:0000:1001\","
+                   "\"expires_in_s\":3600,\"hostname\":\"two\"}]}";
+        }
+        Dhcp6Server server(config);
+        size_t dropped = 0;
+        CHECK(Dhcp6Server::LoadOutcome::kRestored ==
+              server.LoadLeases(path, std::chrono::steady_clock::now(),
+                                &dropped));
+        CHECK(2 == server.LeaseCount());
+        CHECK(0 == dropped);
+        const auto leases = server.Leases(std::chrono::steady_clock::now());
+        CHECK(2 == leases.size());
+        std::error_code rm_b;
+        std::filesystem::remove(path, rm_b);
+    }
+
+    // P145-B2 (static collapse, whole-table walk): with several records for
+    // one DUID already in the table, a static Acquire must leave exactly ONE
+    // record - a static record is never swept, so leftovers occupy slots
+    // forever. Stopping the walk at the first match left the rest behind.
+    void TestP145B2StaticCollapsesStrayDuidRecords() {
+        Config config = MakeConfig();
+        Dhcp6StaticBinding cfg;
+        cfg.duid = kStaticDuid;
+        cfg.ip = kPrefix;
+        cfg.ip[15] = 0x42;
+        cfg.hostname = "fixed-printer";
+        config.ipv6.dhcpv6.static_bindings.push_back(cfg);
+        Dhcp6Server server(config);
+        const auto now = std::chrono::steady_clock::now();
+
+        // Seed two DYNAMIC records for the bound DUID through the loader -
+        // the real injection path (Acquire would take the static branch and
+        // only ever create one record). The loader dedupes by address, not
+        // by DUID, so both survive.
+        const std::string path =
+            ScratchFile("p145_b2_stray_duid_records.json");
+        std::error_code rm_a;
+        std::filesystem::remove(path, rm_a);
+        {
+            std::ofstream out(path);
+            out << "{\"version\":1,\"leases\":["
+                   "{\"duid\":\"00:03:00:01:11:22:33:44:55:66\","
+                   "\"iaid\":1,\"ip\":\"fd00:1122:3344:5566:0000:0000:0000:"
+                   "1000\",\"expires_in_s\":3600},"
+                   "{\"duid\":\"00:03:00:01:11:22:33:44:55:66\","
+                   "\"iaid\":2,\"ip\":\"fd00:1122:3344:5566:0000:0000:0000:"
+                   "1001\",\"expires_in_s\":3600}]}";
+        }
+        size_t dropped = 0;
+        CHECK(Dhcp6Server::LoadOutcome::kRestored ==
+              server.LoadLeases(path, now, &dropped));
+        CHECK(2 == server.LeaseCount());
+
+        // The static branch must collapse both into ONE record on the
+        // caller's key and return the bound address.
+        CHECK(server.Acquire(kStaticDuid, 3, now,
+                             Dhcp6Server::OfferStage::kAck) == cfg.ip);
+        CHECK(1 == server.LeaseCount());
+
+        // The surviving record is the static one, not a stale dynamic entry.
+        const auto leases = server.Leases(now);
+        CHECK(1 == leases.size());
+        if (!leases.empty()) {
+            CHECK(leases[0].is_static);
+            CHECK(leases[0].ip == cfg.ip);
+        }
+        std::error_code rm_b;
+        std::filesystem::remove(path, rm_b);
+    }
+
+    // P145-B2a: the exact-key fast path must not bypass the collapse. The
+    // sibling test above calls Acquire with iaid=3, which matches NO loaded
+    // record, so it only ever exercised the scan branch and let this defect
+    // through. Here the caller's IAID is EXACTLY one of the loaded records:
+    // `leases_.find(key)` hits, and an early return there left the other
+    // same-DUID records behind - violating the function's own contract that
+    // exactly ONE record may exist per DUID.
+    void TestP145B2aExactIaidStillCollapsesStrays() {
+        Config config = MakeConfig();
+        Dhcp6StaticBinding cfg;
+        cfg.duid = kStaticDuid;
+        cfg.ip = kPrefix;
+        cfg.ip[15] = 0x42;
+        cfg.hostname = "fixed-printer";
+        config.ipv6.dhcpv6.static_bindings.push_back(cfg);
+        Dhcp6Server server(config);
+        const auto now = std::chrono::steady_clock::now();
+
+        const std::string path =
+            ScratchFile("p145_b2a_exact_iaid_records.json");
+        std::error_code rm_a;
+        std::filesystem::remove(path, rm_a);
+        {
+            std::ofstream out(path);
+            out << "{\"version\":1,\"leases\":["
+                   "{\"duid\":\"00:03:00:01:11:22:33:44:55:66\","
+                   "\"iaid\":1,\"ip\":\"fd00:1122:3344:5566:0000:0000:0000:"
+                   "1000\",\"expires_in_s\":3600,\"hostname\":\"first\"},"
+                   "{\"duid\":\"00:03:00:01:11:22:33:44:55:66\","
+                   "\"iaid\":2,\"ip\":\"fd00:1122:3344:5566:0000:0000:0000:"
+                   "1001\",\"expires_in_s\":3600,\"hostname\":\"second\"}]}";
+        }
+        size_t dropped = 0;
+        CHECK(Dhcp6Server::LoadOutcome::kRestored ==
+              server.LoadLeases(path, now, &dropped));
+        CHECK(2 == server.LeaseCount());
+
+        // IAID 2 matches the SECOND loaded record exactly.
+        CHECK(server.Acquire(kStaticDuid, 2, now,
+                             Dhcp6Server::OfferStage::kAck) == cfg.ip);
+        CHECK(1 == server.LeaseCount());
+
+        const auto leases = server.Leases(now);
+        CHECK(1 == leases.size());
+        if (!leases.empty()) {
+            CHECK(leases[0].is_static);
+            CHECK(leases[0].ip == cfg.ip);
+        }
+        std::error_code rm_b;
+        std::filesystem::remove(path, rm_b);
+    }
+
+    // P145-B2a (carrier priority, RUNTIME binding, ORDER-INDEPENDENT MATRIX):
+    // the sibling test above uses a CONFIG binding, whose branch always
+    // rewrites the hostname (its else arm installs the configured one), so it
+    // cannot observe which record the collapse carried. The RUNTIME branch
+    // rewrites the hostname ONLY when the client reported one
+    // (dhcp6.cpp:652-654, no else arm), and an empty hostname is the normal
+    // DHCPv6 case (HandleFrame passes std::string(), dhcp6.cpp:1840/1858), so
+    // the carrier's name survives and the CHOICE of carrier is observable.
+    //
+    // WHY A FOUR-ROW MATRIX AND NOT ONE CALL: leases_ is an unordered_map, so
+    // its iteration order is UNSPECIFIED and "the first/last record" is not
+    // predictable. A single call can therefore pass by luck - a broken
+    // carrier choice ("take the last one visited") coincides with "take the
+    // caller's own record" whenever that record happens to be visited last.
+    // Probing EVERY iaid 1..4 on a FRESH server makes the two behaviours
+    // distinguishable for ANY bucket order: a correct implementation pins the
+    // caller's record 4/4 times, while last-wins pins the SAME record for all
+    // four probes and so can match at most ONE of them.
+    void TestP145B2aCarrierPinsCallerIaid() {
+        const auto now = std::chrono::steady_clock::now();
+        std::array<uint8_t, 16> bound_ip = kPrefix;
+        bound_ip[14] = 0xF0;
+        bound_ip[15] = 0xFF;
+
+        constexpr uint32_t kRows = 4;
+        size_t rows_pinned = 0;
+        for (uint32_t iaid = 1; iaid <= kRows; ++iaid) {
+            // A FRESH server per row: the first Acquire collapses the table,
+            // so reusing one instance would leave nothing to collapse for the
+            // later rows and the matrix would degenerate into the single-call
+            // test this one replaced.
+            Config config = MakeConfig();
+            Dhcp6Server server(config);
+
+            // Runtime binding only: the config list stays empty so the
+            // runtime branch (the one WITHOUT a hostname else-arm) is taken.
+            if (!server.UpsertBinding(kStaticDuid, bound_ip, "")) {
+                continue;
+            }
+
+            char leaf[64];
+            std::snprintf(leaf, sizeof(leaf), "p145_b2a_carrier_iaid%u.json",
+                          static_cast<unsigned>(iaid));
+            const std::string path = ScratchFile(leaf);
+            std::error_code rm_a;
+            std::filesystem::remove(path, rm_a);
+            {
+                std::ofstream out(path);
+                out << "{\"version\":1,\"leases\":[";
+                for (uint32_t row = 1; row <= kRows; ++row) {
+                    if (row > 1) {
+                        out << ",";
+                    }
+                    char entry[192];
+                    std::snprintf(
+                        entry, sizeof(entry),
+                        "{\"duid\":\"00:03:00:01:11:22:33:44:55:66\","
+                        "\"iaid\":%u,\"ip\":\"fd00:1122:3344:5566:0000:0000:"
+                        "0000:%04X\",\"expires_in_s\":3600,"
+                        "\"hostname\":\"HOST-iaid%u\"}",
+                        static_cast<unsigned>(row),
+                        static_cast<unsigned>(0x1000 + row),
+                        static_cast<unsigned>(row));
+                    out << entry;
+                }
+                out << "]}";
+            }
+            size_t dropped = 0;
+            CHECK(Dhcp6Server::LoadOutcome::kRestored ==
+                  server.LoadLeases(path, now, &dropped));
+            CHECK(kRows == server.LeaseCount());
+
+            // The EMPTY client hostname is the key input: the runtime branch
+            // then leaves lease.hostname untouched, so the carrier's name is
+            // what the assertion below observes.
+            CHECK(server.Acquire(kStaticDuid, iaid, now,
+                                 Dhcp6Server::OfferStage::kAck,
+                                 std::string()) == bound_ip);
+            CHECK(1 == server.LeaseCount());
+
+            const auto leases = server.Leases(now);
+            CHECK(1 == leases.size());
+            if (!leases.empty()) {
+                char want[32];
+                std::snprintf(want, sizeof(want), "HOST-iaid%u",
+                              static_cast<unsigned>(iaid));
+                CHECK(leases[0].is_static);
+                CHECK(leases[0].ip == bound_ip);
+                // The caller's OWN record must be the carrier.
+                CHECK(leases[0].hostname == want);
+                if (leases[0].hostname == want) {
+                    ++rows_pinned;
+                }
+            }
+            std::error_code rm_b;
+            std::filesystem::remove(path, rm_b);
+        }
+        // Report the matrix result so a partial match cannot be missed: a
+        // correct implementation pins 4/4, a last-wins carrier at most 1/4.
+        std::fprintf(stderr, "P145-B2a carrier matrix: rows pinned %zu/%u\n",
+                     rows_pinned, static_cast<unsigned>(kRows));
+        CHECK(rows_pinned == kRows);
+    }
+
+    void TestP145V1Leases6PartialCorruptionLeavesEvidence() {
+        Config config = MakeConfig();
+        const std::string path =
+            ScratchFile("p145_v1_leases6_partial.json");
+        std::error_code rm_a;
+        std::filesystem::remove(path, rm_a);
+        std::error_code rm_b;
+        std::filesystem::remove(path + ".corrupt", rm_b);
+        {
+            std::ofstream out(path);
+            out << "{\"version\":1,\"leases\":["
+                   "{\"duid\":\"00:03:00:01:AA:BB:CC:DD:EE:01\",\"iaid\":1,"
+                   "\"ip\":\"fd00:1122:3344:5566:0000:0000:0000:1000\","
+                   "\"expires_in_s\":3600,\"hostname\":\"good\"},"
+                   "{\"duid\":123,\"iaid\":2,"
+                   "\"ip\":\"fd00:1122:3344:5566:0000:0000:0000:1001\"}]}";
+        }
+        Dhcp6Server server(config);
+        size_t dropped = 0;
+        const auto outcome = server.LoadLeases(
+            path, std::chrono::steady_clock::now(), &dropped);
+        CHECK(Dhcp6Server::LoadOutcome::kRestored == outcome);
+        CHECK(1 == server.LeaseCount());
+        CHECK(dropped >= 1);
+        CHECK(server.LeaseFileCorrupt());
+        {
+            std::ifstream aside(path + ".corrupt", std::ios::binary);
+            CHECK(aside.good());
+            const std::string raw((std::istreambuf_iterator<char>(aside)),
+                                  std::istreambuf_iterator<char>());
+            CHECK(raw.find("\"duid\":123") != std::string::npos);
+        }
+        std::error_code rm_c;
+        std::filesystem::remove(path, rm_c);
+        std::error_code rm_d;
+        std::filesystem::remove(path + ".corrupt", rm_d);
+    }
+
+
+    // P145-B2 (v6): the static branches inserted leases_[{duid, iaid}] with
+    // an arbitrary client-chosen IAID and returned the bound address. The
+    // entries are is_static, so Sweep never reclaims them: one static DUID
+    // plus N IAIDs grew the table by N entries without limit. A static
+    // binding is a property of the DUID, so it must own exactly ONE record.
+    void TestP145StaticBindingOwnsOneLeasePerDuid() {
+        Config config = MakeConfig();
+        Dhcp6StaticBinding cfg;
+        cfg.duid = kStaticDuid;
+        cfg.ip = kPrefix;
+        cfg.ip[15] = 0x42;
+        cfg.hostname = "fixed-printer";
+        config.ipv6.dhcpv6.static_bindings.push_back(cfg);
+        Dhcp6Server server(config);
+        const auto now = std::chrono::steady_clock::now();
+
+        // Same DUID, 64 different IAIDs, plus the SAME address every time.
+        std::array<uint8_t, 16> first{};
+        for (uint32_t iaid = 1; iaid <= 64; ++iaid) {
+            const std::array<uint8_t, 16> got = server.Acquire(
+                kStaticDuid, iaid, now, Dhcp6Server::OfferStage::kAck);
+            CHECK(got == cfg.ip);
+            if (1 == iaid) {
+                first = got;
+            } else {
+                CHECK(got == first);
+            }
+        }
+        CHECK(1 == server.LeaseCount());
+
+        // A runtime (WebUI) binding behaves the same way.
+        Dhcp6Server rt_server(config);
+        std::array<uint8_t, 16> rt_ip = kPrefix;
+        rt_ip[15] = 0x43;
+        CHECK(rt_server.UpsertBinding(kOtherDuid, rt_ip, ""));
+        for (uint32_t iaid = 7; iaid < 20; ++iaid) {
+            CHECK(rt_server.Acquire(kOtherDuid, iaid, now,
+                                    Dhcp6Server::OfferStage::kAck) == rt_ip);
+        }
+        CHECK(1 == rt_server.LeaseCount());
+
+        // P145-B1/B2 on the STATIC path: a static record is never swept, so
+        // the ONLY unbounded-growth shape would be one record per client IAID.
+        // After the DUID dedup a static binding owns exactly one record, and
+        // the serving path has no policy ceiling (V3). This block pins that a
+        // bound client renewing under many IAIDs never grows the table, and
+        // that its bound address is still served (no spurious exhaustion).
+        {
+            Config cap_cfg = MakeConfig();
+            cap_cfg.ipv6.dhcpv6.pool_end[14] = 0xFF;
+            cap_cfg.ipv6.dhcpv6.pool_end[15] = 0xFF;
+            Dhcp6StaticBinding late;
+            late.duid = kStaticDuid;
+            late.ip = kPrefix;
+            late.ip[15] = 0x77;
+            cap_cfg.ipv6.dhcpv6.static_bindings.push_back(late);
+            Dhcp6Server cap_server(cap_cfg);
+            for (uint32_t iaid = 1; iaid <= 256; ++iaid) {
+                CHECK(cap_server.Acquire(kStaticDuid, iaid, now,
+                                         Dhcp6Server::OfferStage::kAck) ==
+                      late.ip);
+            }
+            CHECK(1 == cap_server.LeaseCount());
+            CHECK(0 == cap_server.PoolExhaustedCount());
+        }
+
+        // P145-B3 explicit assertion: a static binding INSIDE the dynamic pool
+        // reserves its address for its owner even before the owner asks. The
+        // per-candidate ReservedByStatic scan was replaced with one pre-built
+        // index set, so this pins that the set is complete (config AND runtime
+        // sources) and that a competing client never receives those addresses.
+        {
+            Config pool_cfg = MakeConfig();
+            Dhcp6StaticBinding in_pool;
+            in_pool.duid = kStaticDuid;
+            in_pool.ip = kPoolStart;  // first pool address
+            in_pool.hostname = "in-pool-static";
+            pool_cfg.ipv6.dhcpv6.static_bindings.push_back(in_pool);
+            Dhcp6Server pool_server(pool_cfg);
+
+            std::array<uint8_t, 16> rt_in_pool = kPoolStart;
+            rt_in_pool[15] = 0x01;  // second pool address
+            CHECK(pool_server.UpsertBinding(kOtherDuid, rt_in_pool, ""));
+
+            const std::vector<uint8_t> third{0x00, 0x03, 0x00, 0x01, 0xEE,
+                                             0x00, 0x00, 0x01};
+            for (uint32_t iaid = 1; iaid <= 8; ++iaid) {
+                const auto got = pool_server.Acquire(
+                    third, iaid, now, Dhcp6Server::OfferStage::kAck);
+                CHECK(!IsZeroAddr(got));
+                CHECK(got != in_pool.ip);    // config binding reserved
+                CHECK(got != rt_in_pool);    // runtime binding reserved
+                CHECK(pool_server.Acquire(kStaticDuid, 1, now,
+                                          Dhcp6Server::OfferStage::kAck) ==
+                      in_pool.ip);
+            }
+        }
+
+        // The static entry is still visible and still static.
+        const auto leases = server.Leases(now);
+        CHECK(1 == leases.size());
+        if (!leases.empty()) {
+            CHECK(leases[0].is_static);
+            CHECK(leases[0].ip == cfg.ip);
+        }
+    }
+
 int main() {
     TestParseDhcp6Malformed();
     TestBuildReplyLayout();
@@ -2860,6 +3570,17 @@ int main() {
     TestB122ParseRejects6AreCounted();
     TestLeases6LoadSkipsIllegal();
     TestLegacyLeaseMissingExpiresRestored6();
+    TestP145Leases6EntryTypeErrorsAreContained();
+    TestP145Leases6ExpiresIsClampedToLeaseSeconds();
+    TestP145V3Lease6ServesBeyondLegacyCap();
+    TestP145V2Leases6LoadIsBounded();
+    TestP145V1Leases6PartialCorruptionLeavesEvidence();
+    TestP145V6Leases6DumpNeverWritesUnreadableFile();
+    TestP145B2MultiIaidRecordsSurviveLoad();
+    TestP145B2StaticCollapsesStrayDuidRecords();
+    TestP145B2aExactIaidStillCollapsesStrays();
+    TestP145B2aCarrierPinsCallerIaid();
+    TestP145StaticBindingOwnsOneLeasePerDuid();
     TestLeases6RoundTrip();
     TestLease6DumpFlushFailureKeepsPreviousSnapshot();
     TestCorruptLease6FilePreserved();

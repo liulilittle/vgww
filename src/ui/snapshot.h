@@ -61,6 +61,10 @@ namespace vgww {
             uint64_t tx_vlan_frames = 0;
             /// batch34a: WAN->LAN queue over its hard cap (port-map relay).
             uint64_t portmap_send_dropped = 0;
+            /// P145-D: echo replies refused because the frame cannot fit the
+            /// effective AppendDown cap (VLAN-tagged). Never counted as
+            /// answered (icmp_replies stays truthful).
+            uint64_t icmp_too_big = 0;
         };
 
         /// Immutable copy of the effective configuration (formatted strings).

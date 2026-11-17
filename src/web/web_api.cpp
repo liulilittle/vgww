@@ -2368,6 +2368,12 @@ namespace vgww {
                                   << stats.rx_vlan_frames.load()
                                   << ",\"tx_vlan_frames\":"
                                   << stats.tx_vlan_frames.load()
+                                  // P145-D: echo replies refused because the
+                                  // frame cannot fit the effective send cap
+                                  // (VLAN-tagged). Distinct from
+                                  // icmp_replies, which stays truthful.
+                                  << ",\"icmp_too_big\":"
+                                  << stats.icmp_too_big.load()
                                   // batch128: capacity-boundary faults the
                                   // native UI surfaces (bridge page) but the
                                   // WebUI status poll never carried.

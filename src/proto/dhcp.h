@@ -255,6 +255,12 @@ namespace vgww {
             std::vector<StaticView> StaticBindings() const;
 
         private:
+            /// P145-B1: true when the lease table can accept one more entry.
+            /// Callers hold mutex_. At the cap an EXPIRED dynamic entry is
+            /// evicted first (recycling); when nothing is evictable the insert
+            /// is refused and the caller reports pool exhaustion. Never lets
+            /// leases_ grow past core::limits::kMaxDynamicLeases.
+            bool EnsureLeaseSlot(std::chrono::steady_clock::time_point now);
             /// A COPY of the config, not a reference: RemoveBinding must be
             /// able to drop a config-managed static binding from the live
             /// view, and the caller's config object is const. Mirrors the

@@ -225,6 +225,11 @@ namespace vgww {
                 /// Distinct from thread_errors: these never reached a thread.
                 std::atomic<uint64_t> handler_errors{0};
                 std::atomic<uint64_t> icmp_tag_exhausted{0}; ///< relay tag pool full
+                /// Echo replies refused because the built frame cannot fit
+                /// AppendDown's send cap (1514, minus the 4-byte 802.1Q tag
+                /// when the access VLAN is enabled). Kept separate from
+                /// icmp_replies so "answered" never counts a dropped frame.
+                std::atomic<uint64_t> icmp_too_big{0};
                 std::atomic<uint64_t> tx_vlan_frames{0};   ///< downlink frames re-tagged
                 std::atomic<uint64_t> portmap_send_dropped{0}; ///< WAN->LAN queue over its hard cap (C5)
                 /// batch94: source MACs refused by the per-window rate table

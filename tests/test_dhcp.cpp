@@ -5,6 +5,7 @@
 // binding priority, pool exhaustion, release.
 // ============================================================================
 #include "proto/dhcp.h"
+#include "core/text.h"
 
 #include <atomic>
 #include <cstdio>
@@ -916,6 +917,360 @@ void TestStaticBindingReservesPoolAddress() {
         CHECK(offered_c != offered_a);  // A is ACKed and still protected
     }
 
+    // P145-A (v4): a lease document with a malformed ENTRY (non-object item,
+    // or a field whose JSON type is wrong) used to escape LoadLeases as an
+    // nlohmann type_error (302/306). The exception left the loader before
+    // corrupt() ran, so the file was NOT preserved as .corrupt, the
+    // lease_file_corrupt_ / persist_blocked_ flags stayed clear and the bad
+    // document was silently kept on disk for every future restart - the
+    // opposite of the batch82/batch120 "a corrupt document is evidence,
+    // preserve it and flag the loss" contract. Every refusal inside the
+    // entry loop must be counted (dropped) or routed through corrupt(),
+    // never thrown at the caller.
+    void TestP145LeaseEntryTypeErrorsAreContained() {
+        vgww::core::Config config;
+        bool ok = false;
+        config.gateway.ipv4 = vgww::core::ParseIpv4("192.168.0.40", ok);
+        CHECK(ok);
+        config.gateway.mask = vgww::core::ParseIpv4("255.255.255.0", ok);
+        CHECK(ok);
+        config.dhcp.pool_start = vgww::core::ParseIpv4("192.168.0.100", ok);
+        CHECK(ok);
+        config.dhcp.pool_end = vgww::core::ParseIpv4("192.168.0.110", ok);
+        CHECK(ok);
+        config.dhcp.lease_seconds = 3600;
+
+        // (1) an entry that is not an object at all.
+        {
+            const std::string path =
+                ScratchFile("p145_dhcp_leases_non_object.json");
+            std::error_code rm_ec_a;
+            std::filesystem::remove(path, rm_ec_a);
+            std::error_code rm_ec_b;
+            std::filesystem::remove(path + ".corrupt", rm_ec_b);
+            {
+                std::ofstream out(path);
+                out << "{\"version\":1,\"leases\":[\"not-an-object\"]}";
+            }
+            DhcpServer server(config);
+            size_t dropped = 0;
+            size_t thrown = 0;
+            DhcpServer::LoadOutcome outcome =
+                DhcpServer::LoadOutcome::kRestored;
+            try {
+                outcome = server.LoadLeases(path, std::chrono::steady_clock::now(),
+                                            &dropped);
+            } catch (...) {
+                ++thrown;
+            }
+            CHECK(0 == thrown);  // never escapes to the caller
+            CHECK(DhcpServer::LoadOutcome::kCorrupt == outcome ||
+                  (DhcpServer::LoadOutcome::kRestored == outcome &&
+                   dropped > 0));
+            if (DhcpServer::LoadOutcome::kRestored == outcome) {
+                CHECK(server.DroppedLeaseCount() > 0);
+            } else {
+                CHECK(server.LeaseFileCorrupt());
+                std::ifstream aside(path + ".corrupt");
+                CHECK(aside.good());  // evidence preserved
+            }
+            std::error_code rm_ec_c;
+            std::filesystem::remove(path, rm_ec_c);
+            std::error_code rm_ec_d;
+            std::filesystem::remove(path + ".corrupt", rm_ec_d);
+        }
+
+        // (2) a field with the wrong JSON type ("mac" is a number). The old
+        // code hit nlohmann type_error.302 on item.value("mac", "").
+        {
+            const std::string path =
+                ScratchFile("p145_dhcp_leases_bad_mac_type.json");
+            std::error_code rm_ec_e;
+            std::filesystem::remove(path, rm_ec_e);
+            std::error_code rm_ec_f;
+            std::filesystem::remove(path + ".corrupt", rm_ec_f);
+            {
+                std::ofstream out(path);
+                out << "{\"version\":1,\"leases\":[{\"mac\":123,"
+                       "\"ip\":\"192.168.0.100\"}]}";
+            }
+            DhcpServer server(config);
+            size_t dropped = 0;
+            size_t thrown = 0;
+            DhcpServer::LoadOutcome outcome =
+                DhcpServer::LoadOutcome::kRestored;
+            try {
+                outcome = server.LoadLeases(path, std::chrono::steady_clock::now(),
+                                            &dropped);
+            } catch (...) {
+                ++thrown;
+            }
+            CHECK(0 == thrown);
+            CHECK(DhcpServer::LoadOutcome::kCorrupt == outcome ||
+                  (DhcpServer::LoadOutcome::kRestored == outcome &&
+                   dropped > 0));
+            if (DhcpServer::LoadOutcome::kRestored == outcome) {
+                CHECK(server.DroppedLeaseCount() > 0);
+            } else {
+                CHECK(server.LeaseFileCorrupt());
+                std::ifstream aside(path + ".corrupt");
+                CHECK(aside.good());
+            }
+            std::error_code rm_ec_g;
+            std::filesystem::remove(path, rm_ec_g);
+            std::error_code rm_ec_h;
+            std::filesystem::remove(path + ".corrupt", rm_ec_h);
+        }
+
+        // (3) same shape for "ip" (a number instead of a dotted string).
+        {
+            const std::string path =
+                ScratchFile("p145_dhcp_leases_bad_ip_type.json");
+            std::error_code rm_ec_i;
+            std::filesystem::remove(path, rm_ec_i);
+            std::error_code rm_ec_j;
+            std::filesystem::remove(path + ".corrupt", rm_ec_j);
+            {
+                std::ofstream out(path);
+                out << "{\"version\":1,\"leases\":[{\"mac\":"
+                       "\"AA:BB:CC:DD:EE:01\",\"ip\":7}]}";
+            }
+            DhcpServer server(config);
+            size_t dropped = 0;
+            size_t thrown = 0;
+            DhcpServer::LoadOutcome outcome =
+                DhcpServer::LoadOutcome::kRestored;
+            try {
+                outcome = server.LoadLeases(path, std::chrono::steady_clock::now(),
+                                            &dropped);
+            } catch (...) {
+                ++thrown;
+            }
+            CHECK(0 == thrown);
+            CHECK(DhcpServer::LoadOutcome::kCorrupt == outcome ||
+                  (DhcpServer::LoadOutcome::kRestored == outcome &&
+                   dropped > 0));
+            std::error_code rm_ec_k;
+            std::filesystem::remove(path, rm_ec_k);
+            std::error_code rm_ec_l;
+            std::filesystem::remove(path + ".corrupt", rm_ec_l);
+        }
+
+        // (4) a good entry stays accepted even when a later one is refused,
+        // so the containment is per entry, not a blanket reject.
+        {
+            const std::string path =
+                ScratchFile("p145_dhcp_leases_mixed.json");
+            std::error_code rm_ec_m;
+            std::filesystem::remove(path, rm_ec_m);
+            std::error_code rm_ec_n;
+            std::filesystem::remove(path + ".corrupt", rm_ec_n);
+            {
+                std::ofstream out(path);
+                out << "{\"version\":1,\"leases\":["
+                       "{\"mac\":\"AA:BB:CC:DD:EE:01\","
+                       "\"ip\":\"192.168.0.100\",\"hostname\":\"good\","
+                       "\"expires_in_s\":3600},"
+                       "{\"mac\":123,\"ip\":\"192.168.0.101\"}]}";
+            }
+            DhcpServer server(config);
+            size_t dropped = 0;
+            size_t thrown = 0;
+            DhcpServer::LoadOutcome outcome =
+                DhcpServer::LoadOutcome::kRestored;
+            try {
+                outcome = server.LoadLeases(path, std::chrono::steady_clock::now(),
+                                            &dropped);
+            } catch (...) {
+                ++thrown;
+            }
+            CHECK(0 == thrown);
+            CHECK(DhcpServer::LoadOutcome::kRestored == outcome);
+            CHECK(1 == server.LeaseCount());
+            CHECK(1 == dropped);
+            std::error_code rm_ec_o;
+            std::filesystem::remove(path, rm_ec_o);
+        }
+    }
+
+    // P145-E (v4 same-shape sibling of the v6 expires_in_s bound): a
+    // persisted expires_in_s is just a number. Without a ceiling a
+    // hand-edited (or corrupted) document pins an address for ~136 years.
+    // The loader must clamp it to config.dhcp.lease_seconds.
+    void TestP145LeaseExpiresIsClampedToLeaseSeconds() {
+        vgww::core::Config config;
+        bool ok = false;
+        config.gateway.ipv4 = vgww::core::ParseIpv4("192.168.0.40", ok);
+        CHECK(ok);
+        config.gateway.mask = vgww::core::ParseIpv4("255.255.255.0", ok);
+        CHECK(ok);
+        config.dhcp.pool_start = vgww::core::ParseIpv4("192.168.0.100", ok);
+        CHECK(ok);
+        config.dhcp.pool_end = vgww::core::ParseIpv4("192.168.0.110", ok);
+        CHECK(ok);
+        config.dhcp.lease_seconds = 3600;
+
+        const std::string path =
+            ScratchFile("p145_dhcp_leases_expires_huge.json");
+        std::error_code rm_ec_p;
+        std::filesystem::remove(path, rm_ec_p);
+        {
+            std::ofstream out(path);
+            out << "{\"version\":1,\"leases\":["
+                   "{\"mac\":\"AA:BB:CC:DD:EE:01\","
+                   "\"ip\":\"192.168.0.100\",\"hostname\":\"pinned\","
+                   "\"expires_in_s\":4294967295}]}";
+        }
+        DhcpServer server(config);
+        const auto t0 = std::chrono::steady_clock::now();
+        size_t dropped = 0;
+        CHECK(server.LoadLeases(path, t0, &dropped) ==
+              DhcpServer::LoadOutcome::kRestored);
+        CHECK(1 == server.LeaseCount());
+        auto leases = server.Leases(t0);
+        CHECK(1 == leases.size());
+        if (!leases.empty()) {
+            CHECK(leases[0].expires_in_s <= config.dhcp.lease_seconds);
+        }
+        std::error_code rm_ec_q;
+        std::filesystem::remove(path, rm_ec_q);
+    }
+
+    // P145-V3: the SERVING path has no policy cap. A /16 pool can serve all
+    // 65534 usable addresses; the legacy 8192 ceiling refused client 8193
+    // while 57k addresses were still free (a regression, not a defence).
+    // The only table ceiling left on this path is the defensive hard cap,
+    // which no legal pool can reach, and pool_exhausted_ must stay at zero
+    // for as long as addresses remain.
+    void TestP145V3LargePoolServesBeyondLegacyCap() {
+        vgww::core::Config config;
+        config.gateway.ipv4 = kGatewayIp;
+        // A /16 LAN: 65534 usable addresses, far past the legacy 8192 cap.
+        bool ok = false;
+        config.gateway.mask = vgww::core::ParseIpv4("255.255.0.0", ok);
+        CHECK(ok);
+        config.dhcp.pool_start = vgww::core::ParseIpv4("10.0.0.1", ok);
+        CHECK(ok);
+        config.dhcp.pool_end = vgww::core::ParseIpv4("10.0.255.254", ok);
+        CHECK(ok);
+        config.dhcp.lease_seconds = 3600;
+        DhcpServer server(config);
+        const auto now = std::chrono::steady_clock::now();
+
+        constexpr size_t kLegacyCap = 8192;
+        size_t granted = 0;
+        for (size_t i = 0; i < kLegacyCap + 1; ++i) {
+            WireMac mac{0xAB, 0xCD, 0x00,
+                        static_cast<uint8_t>((i >> 16) & 0xFF),
+                        static_cast<uint8_t>((i >> 8) & 0xFF),
+                        static_cast<uint8_t>(i & 0xFF)};
+            if (server.Acquire(mac, now, DhcpServer::OfferStage::kAck) != 0) {
+                ++granted;
+            }
+        }
+        // Client #8193 must be served: the pool still has ~57k free
+        // addresses and the serving path has no policy ceiling.
+        CHECK(kLegacyCap + 1 == granted);
+        CHECK(server.LeaseCount() == kLegacyCap + 1);
+        // No address was exhausted, so the pool-exhaustion channel stays
+        // silent (it must not be used to report a table ceiling).
+        CHECK(0 == server.PoolExhaustedCount());
+
+        // A much later client is still served (no sticky refusal).
+        const WireMac extra{0xDE, 0xAD, 0xBE, 0xEF, 0x00, 0x99};
+        CHECK(server.Acquire(extra, now, DhcpServer::OfferStage::kAck) != 0);
+        CHECK(kLegacyCap + 2 == server.LeaseCount());
+        CHECK(0 == server.PoolExhaustedCount());
+    }
+
+    // P145-F: option 12 (hostname) is clamped to 253 bytes so its TLV length
+    // octet stays in range. A raw BYTE truncation can cut a multi-byte UTF-8
+    // sequence in half, so the client is handed an ill-formed option value.
+    // The clamp must land on a code-point boundary and the emitted bytes must
+    // be valid UTF-8.
+    void TestP145HostnameClampKeepsUtf8Whole() {
+        // 84 three-byte characters = 252 bytes, then one 4-byte character =
+        // 256 bytes. A hard cut at 253 splits the 4-byte sequence at 1/4.
+        std::string host;
+        for (int i = 0; i < 84; ++i) {
+            host += "\xE4\xB8\xAD";  // U+4E2D
+        }
+        host += "\xF0\x9F\x98\x80";  // U+1F600
+        CHECK(host.size() == 256);
+
+        std::vector<uint8_t> f;
+        BuildDhcpReplyFrame(kDhcpMsgAck, 1, kGatewayMac, kClientMac, kPoolStart,
+                            kGatewayIp, 0xFFFFFF00u, 600, {}, host, f);
+        const auto view = FindOptionView(f, kDhcpOptionHostname);
+        CHECK(!view.empty());
+        CHECK(view.size() <= 253);
+        // Whole code points only: the emitted blob must be well-formed UTF-8.
+        const std::string emitted(view.begin(), view.end());
+        CHECK(vgww::core::IsValidUtf8(emitted));
+        // ... and it must not have lost the whole prefix either.
+        CHECK(emitted.size() >= 252);
+
+        // Positive control: an all-ASCII name of the same length still fills
+        // the option to the 253-byte ceiling (no over-eager trimming).
+        const std::string ascii(300, 'H');
+        std::vector<uint8_t> g;
+        BuildDhcpReplyFrame(kDhcpMsgAck, 1, kGatewayMac, kClientMac, kPoolStart,
+                            kGatewayIp, 0xFFFFFF00u, 600, {}, ascii, g);
+        CHECK(FindOptionView(g, kDhcpOptionHostname).size() == 253);
+    }
+
+    // P145-B2/B1 on the v4 STATIC paths: a static lease is never swept, so a
+    // static client must never be able to create MORE THAN ONE record (that
+    // is the only unbounded-growth shape here: the binding count is capped by
+    // kMaxStaticBindings and, unlike the dynamic pool, a static record is not
+    // bounded by pool size). Both static branches must therefore reuse the
+    // MAC-keyed record instead of inserting a new one. V3 note: the SERVING
+    // path has no policy ceiling, so this checks record identity, not a cap.
+    void TestP145StaticLeaseReusesOneRecord() {
+        vgww::core::Config config;
+        config.gateway.ipv4 = kGatewayIp;
+        bool ok = false;
+        config.gateway.mask = vgww::core::ParseIpv4("255.255.0.0", ok);
+        CHECK(ok);
+        config.dhcp.pool_start = vgww::core::ParseIpv4("10.0.0.1", ok);
+        CHECK(ok);
+        config.dhcp.pool_end = vgww::core::ParseIpv4("10.0.255.254", ok);
+        CHECK(ok);
+        config.dhcp.lease_seconds = 3600;
+        StaticBinding late;
+        late.mac = WireMac{0x5A, 0x5A, 0x5A, 0x5A, 0x5A, 0x01};
+        late.ip = vgww::core::ParseIpv4("10.0.99.99", ok);
+        CHECK(ok);
+        config.dhcp.static_bindings.push_back(late);
+
+        DhcpServer server(config);
+        const auto now = std::chrono::steady_clock::now();
+        // The bound client may renew any number of times: exactly one record.
+        for (int i = 0; i < 64; ++i) {
+            CHECK(server.Acquire(late.mac, now,
+                                 DhcpServer::OfferStage::kAck) == late.ip);
+        }
+        CHECK(1 == server.LeaseCount());
+
+        // Same for the RUNTIME (WebUI) branch, a separate insert point.
+        vgww::core::Config rt_cfg = config;
+        // Placement rules (ReplaceBinding) require the bound address to sit
+        // inside the gateway subnet, so move the gateway with the test pool.
+        rt_cfg.gateway.ipv4 = vgww::core::ParseIpv4("10.0.0.1", ok);
+        CHECK(ok);
+        rt_cfg.dhcp.static_bindings.clear();
+        DhcpServer rt_server(rt_cfg);
+        WireMac rt_mac{};
+        const std::array<uint8_t, 6> rt_raw{0x5B, 0x5B, 0x5B, 0x5B, 0x5B, 0x02};
+        std::memcpy(rt_mac.data(), rt_raw.data(), 6);
+        CHECK(rt_server.UpsertBinding(rt_mac, late.ip, ""));
+        for (int i = 0; i < 64; ++i) {
+            CHECK(rt_server.Acquire(rt_mac, now,
+                                    DhcpServer::OfferStage::kAck) == late.ip);
+        }
+        CHECK(1 == rt_server.LeaseCount());
+    }
+
     void TestLeaseRoundTrip() {
         vgww::core::Config config;
         config.gateway.ipv4 = kGatewayIp;
@@ -932,6 +1287,7 @@ void TestStaticBindingReservesPoolAddress() {
 
         const std::string path = ScratchFile("lease-roundtrip-tmp.json");
         CHECK(server.DumpLeases(path, std::chrono::steady_clock::now()));
+
 
         vgww::core::Config config2;
         config2.gateway.ipv4 = kGatewayIp;
@@ -950,12 +1306,250 @@ void TestStaticBindingReservesPoolAddress() {
         std::filesystem::remove(path, rm_ec_9);
     }
 
+    // P145-V2: LoadLeases is the ONE place that can inject records which no
+    // pool bounds (a legitimately persisted lease survives a pool re-range,
+    // so pool membership is deliberately not validated). Without a load-side
+    // ceiling a 2 MiB document pins an arbitrary number of them forever.
+    // Two properties must hold together: the load honours kMaxLoadedLeases,
+    // and the SERVING path keeps working afterwards (the loaded records are
+    // outside the pool, so a new client must still be served from the pool).
+    void TestP145V2LoadLeasesIsBounded() {
+        vgww::core::Config config;
+        bool ok = false;
+        (void)ok;
+        // The generated addresses must sit INSIDE the gateway subnet, or the
+        // loader's out-of-LAN gate would drop them and the assertions below
+        // would measure the wrong refusal (that made an earlier version of
+        // this test pass with the ceiling removed).
+        config.gateway.ipv4 = vgww::core::ParseIpv4("10.0.0.1", ok);
+        CHECK(ok);
+        // A /16 LAN so every generated address is inside the subnet (the
+        // loader drops out-of-LAN entries, and those must not be what the
+        // assertions below measure).
+        config.gateway.mask = vgww::core::ParseIpv4("255.255.0.0", ok);
+        CHECK(ok);
+        config.dhcp.pool_start = vgww::core::ParseIpv4("10.0.0.100", ok);
+        CHECK(ok);
+        config.dhcp.pool_end = vgww::core::ParseIpv4("10.0.0.110", ok);
+        CHECK(ok);
+        config.dhcp.lease_seconds = 3600;
+
+        const size_t limit = vgww::core::limits::kMaxLoadedLeases;
+        const size_t extra = 8;
+        const std::string path =
+            ScratchFile("p145_v2_leases_oversized_entries.json");
+        {
+            std::ofstream out(path);
+            out << "{\"version\":1,\"leases\":[";
+            // Shortest legitimate entry per record so the generated document
+            // stays under the 2 MiB file cap while still exceeding the entry
+            // ceiling. Addresses are inside the /16 LAN but START well past the
+            // test pool (10.0.0.100-110), so the loaded records cannot occupy
+            // the pool the final "still serving" assertion depends on.
+            for (size_t i = 0; i < limit + extra; ++i) {
+                if (i > 0) {
+                    out << ",";
+                }
+                char entry[64];
+                // 10.0.(1 + i/256).(i%256): strictly UNIQUE per index and
+                // outside the test pool 10.0.0.100-110 (a duplicate address
+                // would be dropped by the loader's one-owner gate and the
+                // ceiling assertion would never be exercised).
+                std::snprintf(entry, sizeof(entry),
+                              "{\"mac\":\"02:00:%02X:%02X:%02X:%02X\","
+                              "\"ip\":\"10.0.%u.%u\"}",
+                              static_cast<unsigned>((i >> 24) & 0xFF),
+                              static_cast<unsigned>((i >> 16) & 0xFF),
+                              static_cast<unsigned>((i >> 8) & 0xFF),
+                              static_cast<unsigned>(i & 0xFF),
+                              static_cast<unsigned>(1 + ((i / 256) & 0xFF)),
+                              static_cast<unsigned>(i & 0xFF));
+                out << entry;
+            }
+            out << "]}";
+        }
+
+        DhcpServer server(config);
+        size_t dropped = 0;
+        size_t thrown = 0;
+        DhcpServer::LoadOutcome outcome = DhcpServer::LoadOutcome::kRestored;
+        try {
+            outcome = server.LoadLeases(path, std::chrono::steady_clock::now(),
+                                        &dropped);
+        } catch (...) {
+            ++thrown;
+        }
+        CHECK(0 == thrown);
+        CHECK(DhcpServer::LoadOutcome::kRestored == outcome);
+        // The document asked for limit+extra records; the ceiling holds.
+        CHECK(server.LeaseCount() <= limit);
+        CHECK(dropped >= extra);
+
+        // Not a permanent outage: a NEW client is still served from the pool
+        // (the loaded records are outside it), so the table ceiling must not
+        // leak into the serving path.
+        const WireMac fresh{0x7A, 0xA1, 0x00, 0x00, 0x00, 0x01};
+        CHECK(server.Acquire(fresh, std::chrono::steady_clock::now(),
+                             DhcpServer::OfferStage::kAck) != 0);
+
+        std::error_code rm_ec_v2b;
+        std::filesystem::remove(path, rm_ec_v2b);
+    }
+
+    // P145-V1: a partially damaged document must leave evidence. The
+    // per-entry containment (P145-A) keeps the good records, but the BAD
+    // bytes must not be silently overwritten by the next 60 s dump: the
+    // file is set aside as .corrupt and the corrupt flag is raised, while
+    // the return value stays kRestored (the good entries WERE restored).
+    void TestP145V1PartialCorruptionLeavesEvidence() {
+        vgww::core::Config config;
+        bool ok = false;
+        config.gateway.ipv4 = vgww::core::ParseIpv4("192.168.0.40", ok);
+        CHECK(ok);
+        config.gateway.mask = vgww::core::ParseIpv4("255.255.255.0", ok);
+        CHECK(ok);
+        config.dhcp.pool_start = vgww::core::ParseIpv4("192.168.0.100", ok);
+        CHECK(ok);
+        config.dhcp.pool_end = vgww::core::ParseIpv4("192.168.0.110", ok);
+        CHECK(ok);
+        config.dhcp.lease_seconds = 3600;
+
+        const std::string path = ScratchFile("p145_v1_leases_partial.json");
+        std::error_code rm_ec_v1a;
+        std::filesystem::remove(path, rm_ec_v1a);
+        std::error_code rm_ec_v1b;
+        std::filesystem::remove(path + ".corrupt", rm_ec_v1b);
+        {
+            std::ofstream out(path);
+            out << "{\"version\":1,\"leases\":["
+                   "{\"mac\":\"AA:BB:CC:DD:EE:01\","
+                   "\"ip\":\"192.168.0.100\",\"hostname\":\"good\","
+                   "\"expires_in_s\":3600},"
+                   "{\"mac\":123,\"ip\":\"192.168.0.101\"}]}";
+        }
+
+        DhcpServer server(config);
+        size_t dropped = 0;
+        const auto outcome = server.LoadLeases(
+            path, std::chrono::steady_clock::now(), &dropped);
+        CHECK(DhcpServer::LoadOutcome::kRestored == outcome);
+        CHECK(1 == server.LeaseCount());
+        CHECK(dropped >= 1);
+        // The loss is visible and the original bytes are preserved.
+        CHECK(server.LeaseFileCorrupt());
+        {
+            std::ifstream aside(path + ".corrupt", std::ios::binary);
+            CHECK(aside.good());
+        }
+
+        // A later dump must not have destroyed the evidence: the moved-aside
+        // copy still contains the original ill-typed field.
+        {
+            std::ifstream aside(path + ".corrupt", std::ios::binary);
+            const std::string raw((std::istreambuf_iterator<char>(aside)),
+                                  std::istreambuf_iterator<char>());
+            CHECK(raw.find("\"mac\":123") != std::string::npos);
+        }
+
+        std::error_code rm_ec_v1c;
+        std::filesystem::remove(path, rm_ec_v1c);
+        std::error_code rm_ec_v1d;
+        std::filesystem::remove(path + ".corrupt", rm_ec_v1d);
+    }
+
+    // P145-V6: the reader refuses a document larger than kMaxLeasesBytes, so
+    // the WRITER must never publish one. Otherwise a large but legal table
+    // produces a file this very build cannot restore: the next start calls it
+    // corrupt, moves it aside and every lease is lost - on every restart.
+    // The invariant is "a file we wrote is a file we can read".
+    void TestP145V6DumpNeverWritesUnreadableFile() {
+        vgww::core::Config config;
+        bool ok = false;
+        config.gateway.ipv4 = vgww::core::ParseIpv4("10.0.0.1", ok);
+        CHECK(ok);
+        config.gateway.mask = vgww::core::ParseIpv4("255.255.0.0", ok);
+        CHECK(ok);
+        config.dhcp.pool_start = vgww::core::ParseIpv4("10.0.1.1", ok);
+        CHECK(ok);
+        config.dhcp.pool_end = vgww::core::ParseIpv4("10.0.254.254", ok);
+        CHECK(ok);
+        config.dhcp.lease_seconds = 3600;
+
+        const std::string path = ScratchFile("p145_v6_leases_oversized.json");
+        std::error_code rm_a;
+        std::filesystem::remove(path, rm_a);
+        std::error_code rm_b;
+        std::filesystem::remove(path + ".corrupt", rm_b);
+
+        DhcpServer server(config);
+        const auto now = std::chrono::steady_clock::now();
+
+        // A small table first: this snapshot must survive the refused dump.
+        const WireMac first{0x02, 0x00, 0x00, 0x00, 0x00, 0x01};
+        CHECK(server.Acquire(first, now, DhcpServer::OfferStage::kAck) != 0);
+        CHECK(server.DumpLeases(path, now));
+        std::string before;
+        {
+            std::ifstream in(path, std::ios::binary);
+            CHECK(in.good());
+            before.assign((std::istreambuf_iterator<char>(in)),
+                          std::istreambuf_iterator<char>());
+        }
+        CHECK(!before.empty());
+        const uint64_t failures_before = server.PersistFailureCount();
+
+        // Now grow the table past what the reader accepts. A v4 row is ~77
+        // bytes (mac + dotted ip + term + empty hostname), so this count
+        // cannot fit in kMaxLeasesBytes.
+        const size_t rows =
+            vgww::core::limits::kMaxLeasesBytes / 70 + 1;
+        size_t granted = 0;
+        for (size_t i = 0; i < rows; ++i) {
+            const WireMac mac{0x02, 0x10,
+                              static_cast<uint8_t>((i >> 16) & 0xFF),
+                              static_cast<uint8_t>((i >> 8) & 0xFF),
+                              static_cast<uint8_t>(i & 0xFF),
+                              static_cast<uint8_t>((i >> 24) & 0xFF)};
+            if (server.Acquire(mac, now, DhcpServer::OfferStage::kAck) != 0) {
+                ++granted;
+            }
+        }
+        CHECK(granted == rows);
+
+        // The dump must be REFUSED (not written), and it must say so.
+        CHECK(!server.DumpLeases(path, now));
+        CHECK(server.PersistFailureCount() > failures_before);
+
+        // The previous good snapshot is still there, byte for byte.
+        std::string after;
+        {
+            std::ifstream in(path, std::ios::binary);
+            CHECK(in.good());
+            after.assign((std::istreambuf_iterator<char>(in)),
+                         std::istreambuf_iterator<char>());
+        }
+        CHECK(after == before);
+
+        // The core invariant: what we keep on disk is loadable, so a restart
+        // restores leases instead of discarding them as corrupt.
+        DhcpServer reloaded(config);
+        size_t dropped = 0;
+        const auto outcome = reloaded.LoadLeases(path, now, &dropped);
+        CHECK(DhcpServer::LoadOutcome::kRestored == outcome);
+        CHECK(!reloaded.LeaseFileCorrupt());
+        CHECK(reloaded.LeaseCount() >= 1);
+
+        std::error_code rm_c;
+        std::filesystem::remove(path, rm_c);
+        std::error_code rm_d;
+        std::filesystem::remove(path + ".corrupt", rm_d);
+    }
+
     void TestDeclineMarksAddressBad() {
         vgww::core::Config config;
         config.gateway.ipv4 = kGatewayIp;
         config.dhcp.pool_start = kPoolStart;
         config.dhcp.pool_end = kPoolStart;  // single-address pool
-
         const WireMac mac{0x31, 1, 1, 1, 1, 1};
         DhcpServer server(config);
         const auto t0 = std::chrono::steady_clock::now();
@@ -2992,6 +3586,14 @@ int main() {
     TestB112RuntimeBindingRejectsAddressHeldByLiveLease();
     TestB114AcquireWalkDoesNotScanLeasesPerCandidate();
     TestOfferShortHold();
+    TestP145LeaseEntryTypeErrorsAreContained();
+    TestP145LeaseExpiresIsClampedToLeaseSeconds();
+    TestP145V3LargePoolServesBeyondLegacyCap();
+    TestP145HostnameClampKeepsUtf8Whole();
+    TestP145StaticLeaseReusesOneRecord();
+    TestP145V2LoadLeasesIsBounded();
+    TestP145V1PartialCorruptionLeavesEvidence();
+    TestP145V6DumpNeverWritesUnreadableFile();
     TestLeaseRoundTrip();
     TestLeaseHostnameLearnt();
     TestLeaseRemainingTimeRoundTrip();

@@ -2449,12 +2449,13 @@ namespace vgww {
                                                                    config.gateway.mac,
                                                                    view.eth.src,
                                                                    reply);
-                                    if (reply_len > 0) {
+                                    if (reply_len > 0 &&
+                                        EchoReplyFits(reply_len)) {
                                         AppendDown(up.For(in_port), reply.data(),
                                                    reply_len);
+                                        ++stats->icmp_replies;
+                                        LatTraceIcmp(echo.sequence);
                                     }
-                                    ++stats->icmp_replies;
-                                    LatTraceIcmp(echo.sequence);
                                     neighbors.Learn(
                                         net::IpAddress::FromV4BigEndian(ip + 12),
                                         view.eth.src);
@@ -2578,12 +2579,12 @@ namespace vgww {
                             const size_t reply_len = proto::BuildEchoReplyFrame(
                                 ip, ip_len, config.gateway.mac,
                                 view.eth.src, reply);
-                            if (reply_len > 0) {
+                            if (reply_len > 0 && EchoReplyFits(reply_len)) {
                                 AppendDown(down.For(in_port), reply.data(),
                                            reply_len);
+                                ++stats->icmp_replies;
+                                LatTraceIcmp(echo.sequence);
                             }
-                            ++stats->icmp_replies;
-                            LatTraceIcmp(echo.sequence);
                             break;
                         }
                         if (proto::ParseIcmpEcho(ip, ip_len, echo) &&
@@ -2898,8 +2899,11 @@ namespace vgww {
                                 proto::BuildEchoReplyV6Frame(
                                     ip6, payload_len + 40, config.gateway.mac,
                                     view.eth.src, reply);
-                                AppendDown(down.For(in_port), reply.data(), reply.size());
-                                ++stats->icmp_replies;
+                                if (!reply.empty() && EchoReplyFits(reply.size())) {
+                                    AppendDown(down.For(in_port), reply.data(),
+                                               reply.size());
+                                    ++stats->icmp_replies;
+                                }
                                 break;
                             }
                             if (ours) {
@@ -3787,6 +3791,29 @@ namespace vgww {
                     ib.m_Length = static_cast<DWORD>(len);
                     std::memcpy(ib.m_IBuffer, frame, len);
                 }
+            }
+
+            /// P145-D: the effective send cap shared by every generated
+            /// frame (1514 driver bytes, minus the 4-byte 802.1Q tag when the
+            /// access VLAN is enabled). AppendDown applies it; the ICMP
+            /// responders must BUDGET against the same number before they
+            /// count a reply, otherwise a frame that AppendDown drops is still
+            /// reported as answered.
+            size_t DownFrameCap() const noexcept {
+                static constexpr size_t kMaxFrameBytes = 1514;
+                return config.vlan.enabled()
+                           ? kMaxFrameBytes - net::kVlanTagLen
+                           : kMaxFrameBytes;
+            }
+
+            /// True when an echo reply of `frame_len` bytes can actually be
+            /// sent. A refusal is counted as icmp_too_big and is NOT a reply.
+            bool EchoReplyFits(size_t frame_len) {
+                if (frame_len <= DownFrameCap()) {
+                    return true;
+                }
+                ++stats->icmp_too_big;
+                return false;
             }
 
             /// Appends a copy of an intercepted buffer to a batch.

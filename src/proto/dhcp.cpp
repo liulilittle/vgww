@@ -186,8 +186,24 @@ namespace vgww {
                 // bytes actually emitted. Writing the full value with a
                 // truncated length constant would desync the whole option
                 // stream in the client's parser.
-                const uint8_t len = static_cast<uint8_t>(
-                    std::min<size_t>(value.size(), ::vgww::core::limits::kMaxHostnameBytes));
+                size_t limit = std::min<size_t>(
+                    value.size(), ::vgww::core::limits::kMaxHostnameBytes);
+                // P145-F: a byte-wise cut can split a multi-byte UTF-8
+                // sequence, handing the client an ill-formed option value
+                // (and, for option 12, a name that no longer round-trips).
+                // Back off to the last code-point boundary at or below the
+                // limit. Only option 12 is text - the DNS list is 4-byte
+                // address data, not UTF-8, and must keep its full prefix.
+                if (kDhcpOptionHostname == code && limit < value.size()) {
+                    const auto* bytes =
+                        reinterpret_cast<const unsigned char*>(value.data());
+                    while (limit > 0 &&
+                           0 == vgww::core::text_detail::SequenceLength(
+                                    bytes, value.size(), limit)) {
+                        --limit;
+                    }
+                }
+                const uint8_t len = static_cast<uint8_t>(limit);
                 options.push_back(code);
                 options.push_back(len);
                 options.insert(options.end(), value.begin(),
@@ -354,6 +370,12 @@ namespace vgww {
             // 1. Static bindings always win: runtime (WebUI) first, then config.
             const auto runtime = runtime_bindings_.find(client_mac);
             if (runtime != runtime_bindings_.end()) {
+                // P145-B1: a static lease is never swept, so a NEW key also
+                // needs a slot (only an existing one may re-key for free).
+                if (leases_.end() == leases_.find(client_mac) &&
+                    !EnsureLeaseSlot(now)) {
+                    return 0;
+                }
                 Lease& lease = leases_[client_mac];
                 lease.ip = runtime->second.ip;
                 lease.is_static = true;
@@ -365,6 +387,11 @@ namespace vgww {
             }
             for (const auto& binding : config_.dhcp.static_bindings) {
                 if (binding.mac == client_mac) {
+                    // P145-B1: same cap check as the runtime branch above.
+                    if (leases_.end() == leases_.find(client_mac) &&
+                        !EnsureLeaseSlot(now)) {
+                        return 0;
+                    }
                     Lease& lease = leases_[client_mac];
                     lease.ip = binding.ip;
                     lease.is_static = true;
@@ -448,6 +475,16 @@ namespace vgww {
                         }
                     }
                 }
+                if (usable) {
+                    // P145-B1: a NEW key consumes a table slot. At the cap
+                    // with nothing expired to recycle the request falls
+                    // through to the pool-exhaustion report below (same
+                    // observable channel, RFC 2131 still silent on the wire).
+                    if (leases_.end() == leases_.find(client_mac) &&
+                        !EnsureLeaseSlot(now)) {
+                        usable = false;
+                    }
+                }
                 if (usable && (0 != reserved_hosts.count(req_host) ||
                                req_host == ToHost(config_.gateway.ipv4) ||
                                req_host == lan_host ||
@@ -503,6 +540,13 @@ namespace vgww {
                     candidate_host == lan_host ||
                     candidate_host == bcast_host) {
                     continue;
+                }
+                // P145-B1: same table cap as the requested-IP branch above.
+                // A brand-new key needs a slot; when none can be recycled the
+                // walk stops and the pool-exhaustion report below runs.
+                if (leases_.end() == leases_.find(client_mac) &&
+                    !EnsureLeaseSlot(now)) {
+                    break;
                 }
                 Lease& lease = leases_[client_mac];
                 lease.ip = ToNet(candidate_host);  // store in network order
@@ -625,6 +669,29 @@ namespace vgww {
             }
             ++win.count;
             return true;
+        }
+
+        bool DhcpServer::EnsureLeaseSlot(
+            std::chrono::steady_clock::time_point now) {
+            // Caller holds mutex_. P145-V3: this is a DEFENSIVE hard ceiling,
+            // not a service policy. The serving path is naturally bounded
+            // (a dynamic lease must own a unique in-pool address, a static
+            // lease a configured binding), so a legal /16 pool must never be
+            // refused a client - the ceiling is 4x the largest legal v4 pool.
+            if (leases_.size() < ::vgww::core::limits::kMaxLeaseTableHardCap) {
+                return true;
+            }
+            // At the ceiling: recycling beats refusing. Only EXPIRED dynamic
+            // entries are evictable - a static lease belongs to a client that
+            // is still configured to receive it.
+            for (auto it = leases_.begin(); it != leases_.end();) {
+                if (!it->second.is_static && it->second.expires < now) {
+                    it = leases_.erase(it);
+                } else {
+                    ++it;
+                }
+            }
+            return leases_.size() < ::vgww::core::limits::kMaxLeaseTableHardCap;
         }
 
         size_t DhcpServer::Sweep(std::chrono::steady_clock::time_point now) {
@@ -1152,6 +1219,22 @@ namespace vgww {
             // silently ignored here (S2) and there (C6/C9). Every failure
             // path is observable (counted and logged).
             const std::string data = json.str();
+            // P145-V6: the reader refuses any document larger than
+            // kMaxLeasesBytes (see the kLeaseCap gate in LoadLeases), so a
+            // dump that grows past it would write a file this very build
+            // cannot restore - the next start would call it corrupt, set it
+            // aside and drop EVERY lease. Never self-harm: keep the previous
+            // good snapshot instead of publishing an unreadable one.
+            if (data.size() > ::vgww::core::limits::kMaxLeasesBytes) {
+                ++persist_failures_;
+                std::fprintf(stderr,
+                             "[vgww] dhcp: lease dump refused (%zu bytes > "
+                             "%zu cap); keeping the previous snapshot\n",
+                             data.size(),
+                             static_cast<size_t>(
+                                 ::vgww::core::limits::kMaxLeasesBytes));
+                return false;
+            }
             std::string write_error;
             if (core::AtomicWriteOutcome::kOk !=
                 core::WriteFileAtomicDurable(path, data, write_error)) {
@@ -1370,7 +1453,12 @@ namespace vgww {
             // collisions, counting them like every other refusal.
             std::unordered_set<uint32_t> claimed_ips;
             claimed_ips.reserve(parsed.size());
+            // P145-V1: set when an entry was refused because its JSON shape was
+            // wrong (not merely stale). Such a document is damaged, not just old.
+            bool saw_type_error = false;
             for (const auto& item : parsed) {
+                try {
+                if (!item.is_object()) { ++dropped; continue; }
                 net::WireMac mac{};
                 if (!vgww::core::ParseMac(item.value("mac", ""), mac)) { ++dropped; continue; }
                 Lease lease;
@@ -1419,6 +1507,15 @@ namespace vgww {
                     expires_in_s = config_.dhcp.lease_seconds;
                 } else if (ei->is_number_unsigned()) {
                     expires_in_s = ei->get<uint32_t>();
+                    // P145-E: the persisted value is editor controlled. A
+                    // huge one (4294967295 s = ~136 years) pins the address
+                    // forever and shrinks the pool on every restart. Clamp to
+                    // the configured term - the same ceiling a fresh Acquire
+                    // is granted (the v6 loader does the same thing, so the
+                    // two stay single-sourced).
+                    if (expires_in_s > config_.dhcp.lease_seconds) {
+                        expires_in_s = config_.dhcp.lease_seconds;
+                    }
                 }
                 if (0 == expires_in_s || 0 == net_ip ||
                     net_ip == config_.gateway.ipv4) {
@@ -1450,7 +1547,46 @@ namespace vgww {
                 lease.is_static = false;
                 lease.expires = now + std::chrono::seconds(expires_in_s);
                 lease.hostname = item.value("hostname", "");
+                // P145-V2: the loader is the ONLY path that can inject records
+                // that no pool bounds (a persisted lease deliberately survives
+                // a pool re-range), so it is the only path with a load ceiling.
+                // Acquire never consults it, so a full load cannot lock the
+                // server out for new clients.
+                if (leases_.size() >= ::vgww::core::limits::kMaxLoadedLeases) {
+                    ++dropped;
+                    continue;
+                }
                 leases_[mac] = lease;
+                } catch (const nlohmann::json::exception&) {
+                    // P145-V1: the raw bytes of the ill-typed entry must not be
+                    // silently overwritten by the next dump. Mark the document
+                    // and set it aside below, once the surviving entries are in.
+                    saw_type_error = true;
+                    // P145-A: a field of the wrong JSON type makes
+                    // item.value() throw (type_error.302/306). The try is
+                    // per ENTRY, so one malformed record cannot abort the
+                    // whole load (the good records before and after it are
+                    // still restored) and the exception never escapes into
+                    // Dataplane::StartAll. The refusal is counted like every
+                    // other, which is exactly the "data loss is observable"
+                    // contract batch119/batch120 established for this file.
+                    ++dropped;
+                    continue;
+                }
+            }
+            // P145-V1: a partially damaged document leaves evidence. The good
+            // entries ARE restored (so the outcome stays kRestored), but the
+            // file is preserved aside and the corrupt flag is raised: otherwise
+            // the next 60 s dump would overwrite the only record of the damage.
+            // A failed preserve pauses persistence exactly like corrupt().
+            if (saw_type_error) {
+                lease_file_corrupt_.store(true, std::memory_order_relaxed);
+                if (!core::SetAsideFile(path, ".corrupt")) {
+                    persist_blocked_.store(true, std::memory_order_relaxed);
+                    std::fprintf(stderr,
+                                 "[vgww] dhcp: partially corrupt lease file "
+                                 "could not be preserved; persistence paused\n");
+                }
             }
             if (dropped_out != nullptr) {
                 *dropped_out = dropped;

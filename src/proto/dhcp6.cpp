@@ -537,6 +537,80 @@ namespace vgww {
             return false;
         }
 
+        bool Dhcp6Server::EnsureLeaseSlot(
+            std::chrono::steady_clock::time_point now) {
+            // Caller holds mutex_. Same shape as the v4 sibling: a DEFENSIVE
+            // ceiling only. The v6 pool is the natural bound (a dynamic lease
+            // must own a unique in-pool IID, a static one a configured DUID),
+            // so no legal pool configuration can reach this number.
+            if (leases_.size() < ::vgww::core::limits::kMaxLeaseTableHardCap) {
+                return true;
+            }
+            for (auto it = leases_.begin(); it != leases_.end();) {
+                if (!it->second.is_static && it->second.expires < now) {
+                    it = leases_.erase(it);
+                } else {
+                    ++it;
+                }
+            }
+            return leases_.size() < ::vgww::core::limits::kMaxLeaseTableHardCap;
+        }
+
+        Lease* Dhcp6Server::StaticLeaseFor(
+            const Key& key, std::chrono::steady_clock::time_point now) {
+            // Caller holds mutex_. P145-B2: a static binding is a property of
+            // the DUID, so exactly ONE record may exist per DUID. The first
+            // call for a DUID lands on `key`; any later call with a different
+            // IAID from the same client retargets that same record (and drops
+            // the stray ones) instead of growing the table.
+            // P145-B2: the WHOLE table must be scanned. A lease file can
+            // legitimately inject several records for one DUID (the loader
+            // dedupes by ADDRESS, not by DUID, and a client may hold one
+            // record per IAID), so stopping at the first match left the
+            // strays behind - and a static record is never swept, so they
+            // occupied table slots forever. Carry the caller's OWN record
+            // when it already exists (otherwise a different IAID's address
+            // and hostname would be imported), else the first one seen;
+            // erase every other record of this DUID, then land the single
+            // record on the caller's key.
+            //
+            // P145-B2a: the caller's own record is only COPIED here - the
+            // early `return` that used to sit at this point bypassed the
+            // collapse entirely whenever the requested IAID already existed
+            // (the sibling test called Acquire with an unmatched IAID, which
+            // is why that branch was never exercised). The copy happens
+            // before any erase, so the iterator is never dereferenced after
+            // invalidation.
+            Lease carried{};
+            bool found = false;
+            const auto exact = leases_.find(key);
+            if (exact != leases_.end()) {
+                carried = exact->second;
+                found = true;
+            }
+            for (auto it = leases_.begin(); it != leases_.end();) {
+                if (it->first.duid == key.duid) {
+                    if (!found) {
+                        carried = it->second;
+                        found = true;
+                    }
+                    it = leases_.erase(it);
+                } else {
+                    ++it;
+                }
+            }
+            if (found) {
+                return &leases_.emplace(key, std::move(carried)).first->second;
+            }
+            // P145-B1: a BRAND-NEW static record still occupies a table slot,
+            // and a static record is never swept - so the same cap and the
+            // same pool-exhaustion report apply as on the dynamic path.
+            if (!EnsureLeaseSlot(now)) {
+                return nullptr;
+            }
+            return &leases_[key];
+        }
+
         std::array<uint8_t, 16> Dhcp6Server::Acquire(
             const std::vector<uint8_t>& duid, uint32_t iaid,
             std::chrono::steady_clock::time_point now, OfferStage stage,
@@ -559,9 +633,19 @@ namespace vgww {
             const Key key{duid, iaid};
 
             // 1. Static bindings always win: runtime (WebUI) first, config.
+            // P145-B2: both branches go through StaticLeaseFor, which pins the
+            // record to ONE per DUID (the IAID is client controlled and is
+            // not part of a static binding).
             const auto runtime = runtime_bindings_.find(duid);
             if (runtime != runtime_bindings_.end()) {
-                Lease& lease = leases_[key];
+                Lease* pinned = StaticLeaseFor(key, now);
+                if (nullptr == pinned) {
+                    // Table at the cap with nothing recyclable: same
+                    // observable channel as the dynamic path (P145-B1).
+                    ++pool_exhausted_;
+                    return std::array<uint8_t, 16>{};
+                }
+                Lease& lease = *pinned;
                 lease.ip = runtime->second.ip;
                 lease.is_static = true;
                 lease.expires = now + term;
@@ -572,7 +656,12 @@ namespace vgww {
             }
             for (const auto& binding : config_.ipv6.dhcpv6.static_bindings) {
                 if (binding.duid == duid) {
-                    Lease& lease = leases_[key];
+                    Lease* pinned = StaticLeaseFor(key, now);
+                    if (nullptr == pinned) {
+                        ++pool_exhausted_;
+                        return std::array<uint8_t, 16>{};
+                    }
+                    Lease& lease = *pinned;
                     lease.ip = binding.ip;
                     lease.is_static = true;
                     lease.expires = now + term;
@@ -624,6 +713,16 @@ namespace vgww {
                         }
                     }
                     if (usable) {
+                        // P145-B1: a brand-new key needs a slot (the requested
+                        // branch inserts exactly like the walk does). Falls
+                        // through to the pool-exhaustion report when the table
+                        // is full with nothing expired to recycle.
+                        if (leases_.end() == leases_.find(key) &&
+                            !EnsureLeaseSlot(now)) {
+                            usable = false;
+                        }
+                    }
+                    if (usable) {
                         Lease& lease = leases_[key];
                         lease.ip = *requested;
                         lease.is_static = false;
@@ -651,12 +750,43 @@ namespace vgww {
                 // The candidate identity is its IID index (the same value the
                 // walk iterates), so the set is keyed on uint64_t instead of
                 // introducing a 16-byte hash.
+                //
+                // P145-B3: the static RESERVATION check moved out of the loop
+                // for the same reason (v4 shape, dhcp.cpp:407-418). Today the
+                // per-candidate call to ReservedByStatic scanned every config
+                // binding and every runtime binding, so the real cost was
+                // O(pool_size x bindings) and this comment was wrong. One
+                // pre-built index set makes the step O(leases + bindings +
+                // pool_size), which is what the comment always claimed.
                 std::unordered_set<uint64_t> occupied;
                 occupied.reserve(leases_.size());
                 for (const auto& pair : leases_) {
                     lease_scans_.fetch_add(1, std::memory_order_relaxed);
                     if (pair.second.expires > now) {
                         occupied.insert(IidIndex(pair.second.ip));
+                    }
+                }
+                // P145-B3 (v4 shape, dhcp.cpp:407-418): addresses pinned by a
+                // static binding - config OR runtime - are collected ONCE, in
+                // the same index space the walk iterates. ReservedByStatic
+                // rescans both binding lists, so calling it per candidate made
+                // the walk O(pool_size x bindings); this keeps the whole step
+                // O(leases + bindings + pool_size) as the batch114 comment
+                // above always claimed. Bindings owned by THIS client are not
+                // collected (they never compete with its own dynamic walk).
+                std::unordered_set<uint64_t> reserved;
+                reserved.reserve(
+                    config_.ipv6.dhcpv6.static_bindings.size() +
+                    runtime_bindings_.size());
+                for (const auto& binding :
+                     config_.ipv6.dhcpv6.static_bindings) {
+                    if (binding.duid != duid) {
+                        reserved.insert(IidIndex(binding.ip));
+                    }
+                }
+                for (const auto& binding : runtime_bindings_) {
+                    if (binding.first != duid) {
+                        reserved.insert(IidIndex(binding.second.ip));
                     }
                 }
                 for (uint64_t offset = 0; offset < pool_size; ++offset) {
@@ -680,8 +810,15 @@ namespace vgww {
                     // The network address (IID all-zero) and the all-ones IID
                     // are never handed out.
                     if (0 == index || ~0ULL == index || taken ||
-                        ReservedByStatic(duid, candidate)) {
+                        0 != reserved.count(index)) {
                         continue;
+                    }
+                    // P145-B1: a new key needs a slot; when none can be
+                    // recycled the walk stops and the pool-exhaustion report
+                    // below runs (the observable channel is unchanged).
+                    if (leases_.end() == leases_.find(key) &&
+                        !EnsureLeaseSlot(now)) {
+                        break;
                     }
                     Lease& lease = leases_[key];
                     lease.ip = candidate;
@@ -960,6 +1097,24 @@ namespace vgww {
             // temp name and no publish retry (C6/C9). Failures stay observable
             // (counted + logged).
             const std::string data = json.str();
+            // P145-V6 (v6 sibling of the v4 guard): the reader refuses a
+            // document larger than kMaxLeases6Bytes, so publishing one would
+            // leave a file this build cannot restore - the next start calls
+            // it corrupt, sets it aside and drops every lease. Keep the
+            // previous good snapshot instead. P145-V8: this writer must use
+            // the v6 constant; both are 2 MiB today, but sharing the v4 name
+            // meant that raising the v6 read cap alone would leave the v6
+            // writer refusing at the old size forever.
+            if (data.size() > ::vgww::core::limits::kMaxLeases6Bytes) {
+                ++persist_failures_;
+                std::fprintf(stderr,
+                             "[vgww] dhcp6: lease dump refused (%zu bytes > "
+                             "%zu cap); keeping the previous snapshot\n",
+                             data.size(),
+                             static_cast<size_t>(
+                                 ::vgww::core::limits::kMaxLeases6Bytes));
+                return false;
+            }
             std::string write_error;
             if (core::AtomicWriteOutcome::kOk !=
                 core::WriteFileAtomicDurable(path, data, write_error)) {
@@ -1157,7 +1312,15 @@ namespace vgww {
             // introducing a new 16-byte hash type.
             std::unordered_set<uint64_t> claimed_ips;
             claimed_ips.reserve(parsed.size());
+            // P145-V1: set when an entry was refused because its JSON shape was
+            // wrong (not merely stale). Such a document is damaged, not just old.
+            bool saw_type_error = false;
             for (const auto& item : parsed) {
+                try {
+                if (!item.is_object()) {
+                    ++dropped;
+                    continue;
+                }
                 Key key;
                 if (!ParseDuidText(item.value("duid", ""), key.duid)) {
                     ++dropped;
@@ -1181,6 +1344,14 @@ namespace vgww {
                     expires_in_s = config_.ipv6.dhcpv6.lease_seconds;
                 } else if (ei->is_number_unsigned()) {
                     expires_in_s = ei->get<uint32_t>();
+                    // P145-E: the persisted value is editor controlled. A
+                    // huge one (4294967295 s = ~136 years) pins the address
+                    // forever and shrinks the pool on every restart. Clamp to
+                    // the configured term - the same ceiling a fresh Acquire
+                    // is granted (the v4 loader does the same, single source).
+                    if (expires_in_s > config_.ipv6.dhcpv6.lease_seconds) {
+                        expires_in_s = config_.ipv6.dhcpv6.lease_seconds;
+                    }
                 }
                 // State-consistency gate: no remaining time, an address
                 // outside the ULA prefix, or an address reserved by a config
@@ -1220,7 +1391,41 @@ namespace vgww {
                 lease.is_static = false;
                 lease.expires = now + std::chrono::seconds(expires_in_s);
                 lease.hostname = item.value("hostname", "");
+                // P145-V2 (v6 sibling of the v4 gate): the loader is the only
+                // path that can inject records no pool bounds.
+                if (leases_.size() >= ::vgww::core::limits::kMaxLoadedLeases) {
+                    ++dropped;
+                    continue;
+                }
                 leases_[key] = lease;
+                } catch (const nlohmann::json::exception&) {
+                    // P145-V1 (v6 sibling): remember that the document was
+                    // damaged (not merely stale) so the bytes are preserved.
+                    saw_type_error = true;
+                    // P145-A (v6 sibling of the v4 fix): a wrongly typed
+                    // field makes item.value() throw (type_error.302/306).
+                    // The try is per ENTRY, so one malformed record cannot
+                    // abort the load (records before and after it are still
+                    // restored) and no exception escapes into
+                    // Dataplane::StartAll. Counted like every other refusal,
+                    // which keeps the batch119/batch120 "loss is observable"
+                    // contract for this document.
+                    ++dropped;
+                    continue;
+                }
+            }
+            // P145-V1: a partially damaged document leaves evidence. The good
+            // entries ARE restored (outcome stays kRestored), but the file is
+            // preserved aside and the corrupt flag is raised so the next dump
+            // cannot erase the only record of the damage.
+            if (saw_type_error) {
+                lease_file_corrupt_.store(true, std::memory_order_relaxed);
+                if (!core::SetAsideFile(path, ".corrupt")) {
+                    persist_blocked_.store(true, std::memory_order_relaxed);
+                    std::fprintf(stderr,
+                                 "[vgww] dhcp6: partially corrupt lease file "
+                                 "could not be preserved; persistence paused\n");
+                }
             }
             if (dropped_out != nullptr) {
                 *dropped_out = dropped;

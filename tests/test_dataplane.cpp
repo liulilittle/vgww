@@ -42,6 +42,7 @@
 #include <set>
 #include <stdexcept>
 #include <thread>
+#include <tuple>
 
 #ifndef _WIN32
     #error "vgww tests target Windows only"
@@ -1900,6 +1901,197 @@ namespace {
         std::fprintf(stderr, "[vlan] tagged rx/tx and cross-VLAN isolation OK\n");
     }
 
+    // P145-D: the echo-reply builder admits frames up to 1514 bytes
+    // (kMaxEchoReplyFrameBytes, icmp.h), but AppendDown's send cap is 1514
+    // minus the 4-byte 802.1Q tag when the access VLAN is enabled. A reply
+    // sized in that 1465..1514 window was therefore built, handed to
+    // AppendDown, silently dropped there, and STILL counted as icmp_replies
+    // ("answered"). Callers must budget the effective cap, count the refusal
+    // as icmp_too_big, and never claim a reply that was not sent.
+    void RunIcmpReplySizeIsAccountedScenario() {
+        const auto run_once = [](bool vlan_enabled, size_t payload) {
+            vgww::core::Config cfg;
+            cfg.adapter = "TestNIC";
+            cfg.gateway.ipv4 = kGatewayIp;
+            cfg.gateway.mask = (0u) | (0u << 8) | (255u << 16) | (255u << 24);
+            cfg.gateway.mac = kGatewayMac;
+            cfg.perf.workers = 2;
+            cfg.perf.ring_capacity = 256;
+            cfg.perf.max_conns = 64;
+            cfg.perf.dial_timeout_ms = 400;
+            if (vlan_enabled) {
+                cfg.vlan.id = 100;
+            }
+            auto fake = std::make_unique<TestDriverClient>();
+            TestDriverClient* raw = fake.get();
+            vgww::runtime::Dataplane dataplane(cfg);
+            dataplane.SetDriverClient(std::move(fake));
+            std::string error;
+            CHECK(dataplane.Start(error));
+            const uint64_t replies_before =
+                dataplane.GetStats().icmp_replies.load();
+            const uint64_t big_before =
+                dataplane.GetStats().icmp_too_big.load();
+            // The request is injected UNTAGGED in both cases: a tagged frame
+            // of this size would exceed the RX-side MAX_ETHER_FRAME bound
+            // before the ICMP branch runs, so the frame under test is the
+            // plain one whose reply the VLAN re-tag makes too big.
+            raw->InjectNow(BuildEchoRequest(payload));
+            // Give the RX thread time to process the frame and settle.
+            for (int waited = 0; waited < 300; ++waited) {
+                if (dataplane.GetStats().icmp_replies.load() != replies_before ||
+                    dataplane.GetStats().icmp_too_big.load() != big_before) {
+                    break;
+                }
+                std::this_thread::sleep_for(std::chrono::milliseconds(10));
+            }
+            std::this_thread::sleep_for(std::chrono::milliseconds(150));
+            const uint64_t replies =
+                dataplane.GetStats().icmp_replies.load() - replies_before;
+            const uint64_t too_big =
+                dataplane.GetStats().icmp_too_big.load() - big_before;
+            const bool saw_reply =
+                vlan_enabled
+                    ? ContainsVlanReply(raw->SentDown(), 100, kClientMac)
+                    : ContainsIcmpEchoReply(raw->SentDown());
+            dataplane.Stop();
+            return std::make_tuple(replies, too_big, saw_reply);
+        };
+
+        // 1472-byte payload: IPv4 frame = 14 + 20 + 8 + 1472 = 1514. Legal
+        // untagged; with the 4-byte tag it is 1518 > the driver's 1514, so
+        // the tagged form cannot be sent.
+        {
+            const auto [replies, too_big, saw_reply] = run_once(false, 1472);
+            std::fprintf(stderr,
+                         "[icmp-size] plain 1514: replies=%llu too_big=%llu "
+                         "frame=%d\n",
+                         static_cast<unsigned long long>(replies),
+                         static_cast<unsigned long long>(too_big),
+                         saw_reply ? 1 : 0);
+            CHECK(1 == replies);
+            CHECK(0 == too_big);
+            CHECK(saw_reply);
+        }
+        {
+            const auto [replies, too_big, saw_reply] = run_once(true, 1472);
+            std::fprintf(stderr,
+                         "[icmp-size] vlan 1514: replies=%llu too_big=%llu "
+                         "frame=%d\n",
+                         static_cast<unsigned long long>(replies),
+                         static_cast<unsigned long long>(too_big),
+                         saw_reply ? 1 : 0);
+            CHECK(0 == replies);     // never counted as answered
+            CHECK(1 == too_big);     // ... but the refusal is observable
+            CHECK(!saw_reply);       // and nothing reached the wire
+        }
+        // A 1500-byte tagged reply fits exactly (1510 cap): still answered.
+        {
+            const auto [replies, too_big, saw_reply] = run_once(true, 1458);
+            std::fprintf(stderr,
+                         "[icmp-size] vlan 1500: replies=%llu too_big=%llu "
+                         "frame=%d\n",
+                         static_cast<unsigned long long>(replies),
+                         static_cast<unsigned long long>(too_big),
+                         saw_reply ? 1 : 0);
+            CHECK(1 == replies);
+            CHECK(0 == too_big);
+            CHECK(saw_reply);
+        }
+    }
+
+    // P145-D (v6 sibling): the same cross-layer mismatch for ICMPv6, whose
+    // reply frame is 14 + 40 + (8 + payload). 1452 payload -> 1514 total.
+    void RunIcmp6ReplySizeIsAccountedScenario() {
+        const auto run_once = [](bool vlan_enabled, size_t payload) {
+            vgww::core::Config cfg;
+            cfg.adapter = "TestNIC";
+            cfg.gateway.ipv4 = kGatewayIp;
+            cfg.gateway.mask = (0u) | (0u << 8) | (255u << 16) | (255u << 24);
+            cfg.gateway.mac = kGatewayMac;
+            cfg.ipv6.enabled = true;
+            cfg.ipv6.ula_prefix = {0xFD, 0x00, 0x11, 0x22, 0x33, 0x44,
+                                   0x55, 0x66, 0, 0, 0, 0, 0, 0, 0, 0};
+            cfg.ipv6.prefix_len = 64;
+            cfg.perf.workers = 2;
+            cfg.perf.ring_capacity = 256;
+            cfg.perf.max_conns = 64;
+            cfg.perf.dial_timeout_ms = 400;
+            if (vlan_enabled) {
+                cfg.vlan.id = 100;
+            }
+            auto fake = std::make_unique<TestDriverClient>();
+            TestDriverClient* raw = fake.get();
+            vgww::runtime::Dataplane dataplane(cfg);
+            dataplane.SetDriverClient(std::move(fake));
+            std::string error;
+            CHECK(dataplane.Start(error));
+            const uint64_t replies_before =
+                dataplane.GetStats().icmp_replies.load();
+            const uint64_t big_before =
+                dataplane.GetStats().icmp_too_big.load();
+            // Untagged injection (see the v4 scenario): the tagged form of a
+            // 1514-byte frame would be refused by the RX length bound before
+            // the ICMPv6 branch is reached.
+            raw->InjectNow(BuildV6EchoRequest(payload));
+            for (int waited = 0; waited < 300; ++waited) {
+                if (dataplane.GetStats().icmp_replies.load() != replies_before ||
+                    dataplane.GetStats().icmp_too_big.load() != big_before) {
+                    break;
+                }
+                std::this_thread::sleep_for(std::chrono::milliseconds(10));
+            }
+            std::this_thread::sleep_for(std::chrono::milliseconds(150));
+            const uint64_t replies =
+                dataplane.GetStats().icmp_replies.load() - replies_before;
+            const uint64_t too_big =
+                dataplane.GetStats().icmp_too_big.load() - big_before;
+            const bool saw_reply =
+                vlan_enabled
+                    ? ContainsVlanReply(raw->SentDown(), 100, kClientMac)
+                    : ContainsV6EchoReply(raw->SentDown());
+            dataplane.Stop();
+            return std::make_tuple(replies, too_big, saw_reply);
+        };
+
+        {
+            const auto [replies, too_big, saw_reply] = run_once(false, 1452);
+            std::fprintf(stderr,
+                         "[icmp6-size] plain 1514: replies=%llu too_big=%llu "
+                         "frame=%d\n",
+                         static_cast<unsigned long long>(replies),
+                         static_cast<unsigned long long>(too_big),
+                         saw_reply ? 1 : 0);
+            CHECK(1 == replies);
+            CHECK(0 == too_big);
+            CHECK(saw_reply);
+        }
+        {
+            const auto [replies, too_big, saw_reply] = run_once(true, 1452);
+            std::fprintf(stderr,
+                         "[icmp6-size] vlan 1514: replies=%llu too_big=%llu "
+                         "frame=%d\n",
+                         static_cast<unsigned long long>(replies),
+                         static_cast<unsigned long long>(too_big),
+                         saw_reply ? 1 : 0);
+            CHECK(0 == replies);
+            CHECK(1 == too_big);
+            CHECK(!saw_reply);
+        }
+        {
+            const auto [replies, too_big, saw_reply] = run_once(true, 1448);
+            std::fprintf(stderr,
+                         "[icmp6-size] vlan 1510: replies=%llu too_big=%llu "
+                         "frame=%d\n",
+                         static_cast<unsigned long long>(replies),
+                         static_cast<unsigned long long>(too_big),
+                         saw_reply ? 1 : 0);
+            CHECK(1 == replies);
+            CHECK(0 == too_big);
+            CHECK(saw_reply);
+        }
+    }
+
     // batch205: the driver-reported m_Length is a DWORD with no bound. A
     // length past the fixed INTERMEDIATE_BUFFER array must be rejected (drop),
     // never used to index the frame, or the RX path reads out of bounds. The
@@ -2731,6 +2923,8 @@ int main() {
     RunAdapterDiagnosticsScenario();
     RunAdapterLinkDiagnosticsScenario();
     RunVlanScenarios();
+    RunIcmpReplySizeIsAccountedScenario();
+    RunIcmp6ReplySizeIsAccountedScenario();
     RunOverlongReportedLengthIsDroppedScenario();
     RunHostOriginatedScenario();
     RunRxRingOverflowCountedScenario();
