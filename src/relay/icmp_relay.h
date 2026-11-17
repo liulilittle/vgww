@@ -3,9 +3,10 @@
 //
 // Model (openppp2-proven): each worker owns one raw ICMP socket. Outbound
 // client pings get their 16-bit identifier rewritten to a GLOBALLY UNIQUE
-// 32-bit tag (unique across workers, so replies always find the right
-// worker/flow); inbound echo replies match by tag and are rebuilt toward the
-// client. Tags expire after 3 seconds (one retransmission window is plenty).
+// 16-bit tag in 1..65535 (unique across workers via the shared allocator, so
+// replies always find the right worker/flow); inbound echo replies match by
+// tag and are rebuilt toward the client. Tags expire after 3 seconds (one
+// retransmission window is plenty).
 //
 // The gateway answering its OWN pings happens earlier, inline in the RX
 // thread - this module only handles relayed pings.

@@ -1099,6 +1099,32 @@ namespace {
         return false;
     }
 
+    /// P144 P1: index of the first downstream frame that is a UDP reply FROM
+    /// `server_port` whose payload STARTS with `marker`; -1 when absent. Used
+    /// to assert the ORDER of replies in the captured stream (the TX-ring
+    /// drain must preserve push order inside a batch).
+    int FindUdpReplyPos(const std::vector<std::vector<uint8_t>>& frames,
+                        uint16_t server_port, const char* marker,
+                        size_t marker_len) {
+        for (size_t i = 0; i < frames.size(); ++i) {
+            const auto& f = frames[i];
+            if (f.size() <
+                kEthernetHeaderLen + kIpv4HeaderLenMin + 8 + marker_len) {
+                continue;
+            }
+            const uint8_t* ip = f.data() + kEthernetHeaderLen;
+            if (ip[9] != 17) continue;  // not UDP
+            const uint8_t* udp = ip + kIpv4HeaderLenMin;
+            const uint16_t sport =
+                static_cast<uint16_t>((udp[0] << 8) | udp[1]);
+            if (sport != server_port) continue;
+            if (0 == std::memcmp(udp + 8, marker, marker_len)) {
+                return static_cast<int>(i);
+            }
+        }
+        return -1;
+    }
+
     /// Single-fragment IPv4 UDP: a valid UDP header but an incomplete payload
     /// (MF set, offset 0). The relay must never forward this truncated.
     std::vector<uint8_t> BuildUdpFragment(uint16_t sport, uint16_t dport,
@@ -2474,7 +2500,132 @@ namespace {
         CHECK(dataplane.Stop(stop_error));
     }
 
-    /// batch34p: when the RX ring is full, the frame is DROPPED - and that
+    /// P144 P1: the worker TX ring drain must preserve FIFO inside a batch.
+    /// RxTxLoop used to pop one frame per `PopBatch(&frame, 1)` call; the
+    /// batch rewrite pops up to kTxBatchMax frames in one call and processes
+    /// them in pop order. Three UDP echo round-trips on the SAME flow (one
+    /// worker, one connected relay socket) must land downstream in push order:
+    /// the upstream socket is connected to a single fixed endpoint, so the
+    /// loopback echo server answers in send order and the worker pushes them
+    /// to the TX ring in that same order. The drain must not reorder the batch.
+    /// A mutation that reverses the within-batch index flips ORD1/ORD2/ORD3.
+    void RunTxRingOrderedBatchScenario() {
+        vgww::core::Config config;
+        config.adapter = "TestNIC";
+        config.gateway.ipv4 = kGatewayIp;
+        config.gateway.mask = (0u) | (0u << 8) | (255u << 16) | (255u << 24);
+        config.gateway.mac = kGatewayMac;
+        config.perf.workers = 1;  // ONE worker: all TX frames share ring 0
+        config.perf.ring_capacity = 256;
+        config.perf.max_conns = 64;
+        config.perf.dial_timeout_ms = 400;
+
+        const uint16_t kUdpPort = UniqueUdpPort(false);
+        CHECK(0 != kUdpPort);
+
+        std::atomic<bool> stop{false}, ready{false}, bound{false};
+        std::thread echo([&] {
+            RunUdpEchoServer(kUdpPort, stop, ready, bound);
+        });
+        while (!ready.load()) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(2));
+        }
+        CHECK(bound.load());
+
+        auto fake = std::make_unique<TestDriverClient>();
+        TestDriverClient* raw = fake.get();
+        vgww::runtime::Dataplane dataplane(config);
+        dataplane.SetDriverClient(std::move(fake));
+        std::string start_error;
+        CHECK(dataplane.Start(start_error));
+        if (!start_error.empty()) {
+            std::fprintf(stderr, "ordered-tx start error: %s\n",
+                         start_error.c_str());
+        }
+
+        // Prime the neighbor table: the UDP reply builder needs the client MAC
+        // (learned passively when the ARP request crosses the RX thread). The
+        // LEARN happens on the RX thread but the SNAPSHOT the worker reads is
+        // published by the control thread on its ~100ms tick. UDP is drop-not-
+        // grow (no retransmit), so repeatedly re-inject a WARM datagram until
+        // one reply lands: the first attempts may mac-miss (ProbeArpFor), the
+        // next lands once the snapshot is published. This is the same
+        // publish-delay discipline the main scenario's SYN retransmit uses.
+        raw->InjectNow(BuildArpRequest());
+        {
+            const char peace[] = "WARM";
+            bool warmed = false;
+            for (int attempt = 0; attempt < 50 && !warmed; ++attempt) {
+                raw->InjectNow(BuildUdpRequest(51061, kUdpPort, peace));
+                warmed = WaitFor(
+                    [&] {
+                        return ContainsUdpReply(raw->SentDown(), kUdpPort,
+                                                peace);
+                    },
+                    100);
+            }
+            CHECK(warmed);
+        }
+
+        // P144 P1: N datagrams on the SAME flow, injected back-to-back. With
+        // workers=1 every RX frame routes to worker 0, so the echo replies are
+        // serialized on one relay and pushed to ring 0 in send order. N=16
+        // makes the drain pull several frames in ONE batch (they accumulate
+        // faster than a single pop), which is exactly the path a reversal
+        // mutation would corrupt.
+        constexpr int kOrds = 16;
+        std::string markers[kOrds];
+        for (int m = 0; m < kOrds; ++m) {
+            char buf[8];
+            std::snprintf(buf, sizeof(buf), "O%02d", m);
+            markers[m] = buf;
+            raw->InjectNow(BuildUdpRequest(51060, kUdpPort, markers[m]));
+        }
+
+        // All replies must arrive (no batch may drop or duplicate).
+        const bool all_present = WaitFor(
+            [&] {
+                for (int m = 0; m < kOrds; ++m) {
+                    if (!ContainsUdpReply(raw->SentDown(), kUdpPort,
+                                          markers[m])) {
+                        return false;
+                    }
+                }
+                return true;
+            },
+            8000);
+        CHECK(all_present);
+        if (!all_present) {
+            std::fprintf(stderr, "[p144] ORD replies never all arrived\n");
+        }
+
+        // FIFO: reply m must sit strictly before reply m+1 in the captured
+        // stream. Only the markers' relative positions matter (earlier
+        // ARP/handshake frames may lead the stream).
+        int prev = -1;
+        bool ordered = true;
+        for (int m = 0; m < kOrds; ++m) {
+            const int pos =
+                FindUdpReplyPos(raw->SentDown(), kUdpPort, markers[m].data(),
+                                markers[m].size());
+            if (pos < 0 || pos <= prev) {
+                ordered = false;
+                std::fprintf(stderr, "[p144] O%02d @ %d (prev %d)\n", m, pos,
+                             prev);
+            }
+            prev = pos;
+        }
+        std::printf("P144tx-order kOrds=%d first=@%d last=@%d ordered=%d\n",
+                    kOrds, prev - (kOrds - 1), prev, ordered ? 1 : 0);
+        CHECK(ordered);
+
+        stop.store(true);
+        if (echo.joinable()) {
+            echo.join();
+        }
+        std::string stop_error;
+        CHECK(dataplane.Stop(stop_error));
+    }
     /// drop must be COUNTED. The TX path already does this
     /// (dataplane.cpp:1900-1904: Push() false -> ++stats->rx_dropped), but the
     /// four RX enqueue sites ignored the return value, so a full ring silently
@@ -2585,6 +2736,7 @@ int main() {
     RunRxRingOverflowCountedScenario();
     RunRateTableBoundedUnderForgedMacFloodScenario();
     RunClientLanFlagScenario();
+    RunTxRingOrderedBatchScenario();
     vgww::core::Config config;
     config.adapter = "TestNIC";
     config.gateway.ipv4 = kGatewayIp;

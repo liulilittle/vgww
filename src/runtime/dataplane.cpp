@@ -57,6 +57,16 @@ namespace vgww {
             /// Complete outbound frame handed from workers to the TX drainer.
             typedef std::vector<uint8_t> TxFrame;
 
+            /// P144 P1: maximum frames pulled from one worker TX ring per
+            /// PopBatch call. Matches the established rx-side batch default
+            /// (perf.rx_batch = 64). Stack footprint = 64 * sizeof(TxFrame)
+            /// = 1.5 KiB for the RxTxLoop pass; far cheaper than a per-frame
+            /// acquire/release index pair on the drain hot path. The inner
+            /// drain loop continues while frames remain, so a configured
+            /// rx_batch above 64 only means more PopBatch calls - never a
+            /// lost or reordered frame.
+            static constexpr size_t kTxBatchMax = 64;
+
             /// G-5 F4: UTF-8 rendering for diagnostics (never throws).
             std::string WideToUtf8(const std::wstring& in) {
                 if (in.empty()) {
@@ -2152,79 +2162,93 @@ namespace vgww {
                     }
 
                     // Drain every worker TX ring into the downstream batch.
-                    TxFrame frame;
+                    // P144 P1: one PopBatch pulls up to kTxBatchMax frames
+                    // (one acquire/release index pair instead of one per
+                    // frame), processed strictly in pop order - the exact
+                    // order the old per-frame PopBatch(&frame, 1) loop used.
+                    // A `continue` in the per-frame body now moves to the next
+                    // frame of the batch, with identical drop semantics.
+                    std::array<TxFrame, kTxBatchMax> tx_buf;
                     for (uint32_t i = 0; i < worker_count; ++i) {
-                        while (1 == tx_rings[i]->PopBatch(&frame, 1)) {
-                            // Downlink rate limit: cap bytes handed to each
-                            // client. Only fully-synthesized Ethernet frames
-                            // arrive here (dst MAC at [0..5]); a frame too
-                            // short to parse is forwarded untouched.
-                            if (frame.size() >= net::kMacAddrLen) {
-                                net::WireMac dst{};
-                                std::memcpy(dst.data(), frame.data(),
-                                            net::kMacAddrLen);
-                                if (!rate_limiter_.AllowDownlink(
-                                        dst, frame.size(),
-                                        std::chrono::steady_clock::now())) {
-                                    ++stats->rate_limited;
-                                    continue;  // drop: TCP retransmits as needed
-                                }
+                        while (true) {
+                            const size_t count = tx_rings[i]->PopBatch(
+                                tx_buf.data(), tx_buf.size());
+                            if (0 == count) {
+                                break;
                             }
-                            // Per-client down-rate accounting: every frame we
-                            // push toward the wire belongs to its destination
-                            // MAC (skipped for broadcast/group destinations).
-                            if (frame.size() >= net::kEthernetHeaderLen) {
-                                core::MacAddress dst;
-                                std::memcpy(dst.data(), frame.data(),
-                                            net::kMacAddrLen);
-                                if (!net::IsGroupAddress(dst)) {
-                                    // batch94: same cap as the uplink path.
-                                    // TX destinations are normally learned
-                                    // neighbours, but the guard keeps both
-                                    // insert sites identical so the table bound
-                                    // holds no matter which direction floods.
-                                    if (live_rates_.size() >=
-                                            ::vgww::core::limits::kMaxNeighbors &&
-                                        live_rates_.find(dst) ==
-                                            live_rates_.end()) {
-                                        ++stats->rate_table_dropped;
-                                    } else {
-                                        live_rates_[dst].down_bytes +=
-                                            frame.size();
+                            for (size_t b = 0; b < count; ++b) {
+                                TxFrame& frame = tx_buf[b];
+                                // Downlink rate limit: cap bytes handed to each
+                                // client. Only fully-synthesized Ethernet frames
+                                // arrive here (dst MAC at [0..5]); a frame too
+                                // short to parse is forwarded untouched.
+                                if (frame.size() >= net::kMacAddrLen) {
+                                    net::WireMac dst{};
+                                    std::memcpy(dst.data(), frame.data(),
+                                                net::kMacAddrLen);
+                                    if (!rate_limiter_.AllowDownlink(
+                                            dst, frame.size(),
+                                            std::chrono::steady_clock::now())) {
+                                        ++stats->rate_limited;
+                                        continue;  // drop: TCP retransmits as needed
                                     }
                                 }
-                            }
-                            // C8 data-plane return path: a bridged reply to a
-                            // client learned on the downstream port must leave
-                            // through that adapter. The worker TX ring carries
-                            // no port tag, so the egress is resolved from the
-                            // frame's destination MAC via the bridge MAC table.
-                            // Group MACs are never learned (nullopt) and a
-                            // non-bridge dataplane has an empty/inactive table,
-                            // so both fall back to the primary adapter
-                            // (byte-identical non-bridge behavior).
-                            // NOTE: bind by POINTER. A `PortBatch&` rebind via
-                            // assignment would copy-assign the struct, clobbering
-                            // down.primary's handle+items (never do that here).
-                            PortBatch* egress = &down.primary;
-                            if (bridge_active_.load() &&
-                                frame.size() >= net::kMacAddrLen) {
-                                net::WireMac dst{};
-                                std::memcpy(dst.data(), frame.data(),
-                                            net::kMacAddrLen);
-                                std::optional<uint32_t> learned;
-                                {
-                                    std::lock_guard<std::mutex> lock(
-                                        bridge_table_mutex_);
-                                    learned = bridge_table_.Lookup(dst);
+                                // Per-client down-rate accounting: every frame we
+                                // push toward the wire belongs to its destination
+                                // MAC (skipped for broadcast/group destinations).
+                                if (frame.size() >= net::kEthernetHeaderLen) {
+                                    core::MacAddress dst;
+                                    std::memcpy(dst.data(), frame.data(),
+                                                net::kMacAddrLen);
+                                    if (!net::IsGroupAddress(dst)) {
+                                        // batch94: same cap as the uplink path.
+                                        // TX destinations are normally learned
+                                        // neighbours, but the guard keeps both
+                                        // insert sites identical so the table bound
+                                        // holds no matter which direction floods.
+                                        if (live_rates_.size() >=
+                                                ::vgww::core::limits::kMaxNeighbors &&
+                                            live_rates_.find(dst) ==
+                                                live_rates_.end()) {
+                                            ++stats->rate_table_dropped;
+                                        } else {
+                                            live_rates_[dst].down_bytes +=
+                                                frame.size();
+                                        }
+                                    }
                                 }
-                                if (learned.has_value() &&
-                                    bridge::kBridgePortDown ==
-                                        learned.value()) {
-                                    egress = &down.downstream;
+                                // C8 data-plane return path: a bridged reply to a
+                                // client learned on the downstream port must leave
+                                // through that adapter. The worker TX ring carries
+                                // no port tag, so the egress is resolved from the
+                                // frame's destination MAC via the bridge MAC table.
+                                // Group MACs are never learned (nullopt) and a
+                                // non-bridge dataplane has an empty/inactive table,
+                                // so both fall back to the primary adapter
+                                // (byte-identical non-bridge behavior).
+                                // NOTE: bind by POINTER. A `PortBatch&` rebind via
+                                // assignment would copy-assign the struct, clobbering
+                                // down.primary's handle+items (never do that here).
+                                PortBatch* egress = &down.primary;
+                                if (bridge_active_.load() &&
+                                    frame.size() >= net::kMacAddrLen) {
+                                    net::WireMac dst{};
+                                    std::memcpy(dst.data(), frame.data(),
+                                                net::kMacAddrLen);
+                                    std::optional<uint32_t> learned;
+                                    {
+                                        std::lock_guard<std::mutex> lock(
+                                            bridge_table_mutex_);
+                                        learned = bridge_table_.Lookup(dst);
+                                    }
+                                    if (learned.has_value() &&
+                                        bridge::kBridgePortDown ==
+                                            learned.value()) {
+                                        egress = &down.downstream;
+                                    }
                                 }
+                                AppendDown(*egress, frame.data(), frame.size());
                             }
-                            AppendDown(*egress, frame.data(), frame.size());
                         }
                     }
                     FlushPortBatch(down.primary, true);

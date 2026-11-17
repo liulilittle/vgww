@@ -10,7 +10,11 @@
 // ============================================================================
 #include "dsp/spsc_ring.h"
 
+#include <algorithm>
+#include <array>
 #include <atomic>
+#include <chrono>
+#include <cstdint>
 #include <cstdio>
 #include <thread>
 #include <vector>
@@ -165,6 +169,141 @@ namespace {
         CHECK(Tracked::live.load() == 0);
     }
 
+    /// P144 P1: TX-ring drain micro-benchmark. The data plane drained each
+    /// worker TX ring with a per-frame `PopBatch(&frame, 1)` call, paying a
+    /// full acquire/release index pair per frame; batching (`PopBatch(out, N)`)
+    /// amortizes those two atomics across N frames. The ratio is measured in
+    /// one process with identical fill loops, so host timer jitter cancels
+    /// (same-repo method: ratio, not absolute ms).
+    ///
+    /// The PRIMARY element is a fixed-size frame struct: the ring index
+    /// acquire/release pair is the property batch changes, and a malloc-free
+    /// element isolates it (a std::vector element drags per-element allocator
+    /// churn into both shapes identically, hiding the ring's own cost). The
+    /// vector shape is measured too as a reality check on the real TxFrame
+    /// type; it is informational here because the change does not touch
+    /// allocation. Both measurements must show batch within 1.5x of per-frame
+    /// (never 1.5x slower), leaving CI-jitter headroom.
+    void TestBatchPopTiming() {
+        constexpr size_t kCapacity = 4096;
+        constexpr size_t kBatch = 64;
+        constexpr int kRounds = 128;  // 512K frames per shape
+
+        struct Frame {
+            std::array<uint8_t, 64> bytes{};
+            uint64_t tag = 0;
+            Frame() = default;
+            explicit Frame(uint64_t t) : tag(t) {}
+        };
+
+        const auto drain_all = [&](auto& ring, auto make_elem, auto checksum_of,
+                               bool batched) {
+            // Returns the wall time to refill and fully drain the ring once,
+            // using a sink whose lifetime matches the real drain site (the
+            // local TxFrame buffer lives for one drain pass, not one frame).
+            using Elem = std::decay_t<decltype(make_elem(size_t{}))>;
+            std::vector<Elem> sink(kBatch);
+            uint64_t checksum = 0;
+            const auto t0 = std::chrono::steady_clock::now();
+            for (int r = 0; r < kRounds; ++r) {
+                for (size_t i = 0; i < kCapacity; ++i) {
+                    ring->Push(make_elem(i));
+                }
+                if (batched) {
+                    while (true) {
+                        const size_t n =
+                            ring->PopBatch(sink.data(), sink.size());
+                        if (0 == n) {
+                            break;
+                        }
+                        checksum += checksum_of(sink[n - 1]);
+                    }
+                } else {
+                    while (1 == ring->PopBatch(sink.data(), 1)) {
+                        checksum += checksum_of(sink[0]);
+                    }
+                }
+            }
+            const auto t1 = std::chrono::steady_clock::now();
+            return std::pair<double, uint64_t>(
+                std::chrono::duration<double, std::milli>(t1 - t0).count(),
+                checksum);
+        };
+
+        // Primary: fixed-frame type, no allocation noise - the ring's cost.
+        {
+            auto ring = vgww::dsp::SpscRing<Frame>::Create(kCapacity);
+            CHECK(nullptr != ring);
+            const auto make_frame = [](size_t i) { return Frame(i); };
+            const auto tag_of = [](const Frame& f) {
+                return static_cast<uint64_t>(f.tag);
+            };
+            // Warm-up: both shapes once so cold pages/frequency ramps are not
+            // counted, then alternate 5 times and keep the MINIMUM per shape
+            // (robust against scheduler noise).
+            drain_all(ring, make_frame, tag_of, false);
+            drain_all(ring, make_frame, tag_of, true);
+            double per_frame = 1e300;
+            double batched = 1e300;
+            uint64_t checksum = 0;
+            for (int rep = 0; rep < 5; ++rep) {
+                auto [pf, ck1] = drain_all(ring, make_frame, tag_of, false);
+                auto [bc, ck2] = drain_all(ring, make_frame, tag_of, true);
+                per_frame = std::min(per_frame, pf);
+                batched = std::min(batched, bc);
+                checksum = ck1 + ck2;
+            }
+            const double ratio = per_frame > 0.0 ? batched / per_frame : 0.0;
+            std::printf(
+                "P144tx(frame) per-frame=%.2fms batch(64)=%.2fms "
+                "ratio=%.3f checksum=%llu\n",
+                per_frame, batched, ratio,
+                static_cast<unsigned long long>(checksum));
+            CHECK(checksum > 0);  // the loops actually moved data
+            CHECK(ratio > 0.0);
+            CHECK(ratio <= 1.5);  // batch never 1.5x slower than per-frame
+        }
+
+        // Reality check: the real TxFrame is std::vector<uint8_t>. Malloc
+        // churn dominates BOTH shapes equally, so this is not the ring signal,
+        // but it is what the hot path really moves; record it (a regression to
+        // >1.5x here plus a fixed-frame regression above would both be odd).
+        {
+            auto ring = vgww::dsp::SpscRing<std::vector<uint8_t>>::Create(
+                kCapacity);
+            CHECK(nullptr != ring);
+            const auto make_vec = [](size_t i) {
+                return std::vector<uint8_t>(64, static_cast<uint8_t>(i));
+            };
+            const auto size_of = [](const std::vector<uint8_t>& v) {
+                return static_cast<uint64_t>(v.size());
+            };
+            drain_all(ring, make_vec, size_of, false);
+            drain_all(ring, make_vec, size_of, true);
+            double per_frame = 1e300;
+            double batched = 1e300;
+            uint64_t checksum = 0;
+            for (int rep = 0; rep < 5; ++rep) {
+                auto [pf, ck1] = drain_all(ring, make_vec, size_of, false);
+                auto [bc, ck2] = drain_all(ring, make_vec, size_of, true);
+                per_frame = std::min(per_frame, pf);
+                batched = std::min(batched, bc);
+                checksum = ck1 + ck2;
+            }
+            const double ratio = per_frame > 0.0 ? batched / per_frame : 0.0;
+            std::printf(
+                "P144tx(vector) per-frame=%.2fms batch(64)=%.2fms "
+                "ratio=%.3f checksum=%llu (informational)\n",
+                per_frame, batched, ratio,
+                static_cast<unsigned long long>(checksum));
+            CHECK(checksum > 0);
+            CHECK(ratio > 0.0);
+            // Coarse ceiling for the allocation-noise shape: batch must not
+            // be >2x slower than per-frame even under malloc variance.
+            CHECK(ratio <= 2.0);
+        }
+    }
+
     void TestConcurrentStress() {
         static constexpr uint64_t kCount = 1u << 20;
         auto ring = vgww::dsp::SpscRing<uint64_t>::Create(1024);
@@ -218,6 +357,7 @@ int main() {
     TestSmallestCapacities();
     TestSizeApproxAndZeroPop();
     TestDestructorPairing();
+    TestBatchPopTiming();
     TestConcurrentStress();
     if (0 == g_failures) {
         std::puts("test_spsc_ring: ALL PASS");
