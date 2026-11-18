@@ -2225,7 +2225,8 @@ namespace vgww {
                      AuditLog audit_log,
                      ConfigApplier config_applier,
                      std::shared_ptr<ConfigApplyStatus> apply_status,
-                     ConsoleDroppedProvider console_dropped) {
+                     ConsoleDroppedProvider console_dropped,
+                     AutostartGetter autostart_getter) {
             // Persist rules next to the config so port-maps/bans/rate-limits
             // survive process restarts.
             {
@@ -2655,6 +2656,26 @@ namespace vgww {
                     }
                     audit("repair-driver requested");
                     return Response::Json("{\"requested\":true}");
+                });
+            // P146 D7: the console's "Start with Windows" checkbox had no way
+            // to learn the registry state - only POST existed, so a machine
+            // that already started VGWW at logon still showed an unchecked
+            // box. The read is a plain GET like every other read route (the
+            // page must be able to paint before a token is configured); it
+            // answers the value the OS holds, not a cached wish. It must NOT
+            // go through the setter: writing the current value to read it back
+            // would be a needless registry write (and, at `false`, would
+            // actually disable autostart).
+            server.Route(
+                "GET", "/api/autostart",
+                [autostart_getter](const Request& /*request*/) {
+                    if (!autostart_getter) {
+                        return Response::Error(503, "unavailable");
+                    }
+                    std::ostringstream out;
+                    out << "{\"enabled\":"
+                        << (autostart_getter() ? "true" : "false") << "}";
+                    return Response::Json(out.str());
                 });
             server.Route(
                 "POST", "/api/autostart",
@@ -4153,7 +4174,8 @@ namespace vgww {
                          AuditLog audit_log,
                          ConfigApplier config_applier,
                          std::shared_ptr<ConfigApplyStatus> apply_status,
-                         ConsoleDroppedProvider console_dropped) {
+                         ConsoleDroppedProvider console_dropped,
+                         AutostartGetter autostart_getter) {
             // Fixed-token compatibility overload: freeze the same effective
             // credential and configured bit the old implementation used.
             auto state = std::make_shared<AuthTokenState>();
@@ -4167,7 +4189,8 @@ namespace vgww {
                             std::move(audit_log),
                             std::move(config_applier),
                             std::move(apply_status),
-                            std::move(console_dropped));
+                            std::move(console_dropped),
+                            std::move(autostart_getter));
         }
 
     }  // namespace web

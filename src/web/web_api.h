@@ -527,6 +527,11 @@ namespace vgww {
         /// audit line to the console ring.
         using RepairRequester = std::function<bool()>;
         using AutostartSetter = std::function<bool(bool)>;
+        /// P146 D7: the READ half of the same registry value. Kept a separate
+        /// callback because reading must never be spelled as a write (the
+        /// setter's contract is "write, then read back", and passing `false`
+        /// to it would actually delete the Run key).
+        using AutostartGetter = std::function<bool()>;
         using AuditLog = std::function<void(const std::string&)>;
         /// batch126: cumulative console-ring lines evicted by the bound.
         using ConsoleDroppedProvider = std::function<uint64_t()>;
@@ -550,7 +555,8 @@ namespace vgww {
                          AuditLog audit_log = {},
                          ConfigApplier config_applier = {},
                          std::shared_ptr<ConfigApplyStatus> apply_status = {},
-                         ConsoleDroppedProvider console_dropped = {});
+                         ConsoleDroppedProvider console_dropped = {},
+                         AutostartGetter autostart_getter = {});
 
         /// batch37s: live-token variant used by the entry point so a settings
         /// save can rotate/clear the credential and restart the listener
@@ -566,7 +572,8 @@ namespace vgww {
                          AuditLog audit_log = {},
                          ConfigApplier config_applier = {},
                          std::shared_ptr<ConfigApplyStatus> apply_status = {},
-                         ConsoleDroppedProvider console_dropped = {});
+                         ConsoleDroppedProvider console_dropped = {},
+                         AutostartGetter autostart_getter = {});
 
         /// Extracts a string field from a flat JSON body. Handles the common
         /// escapes (\" \\ \n); returns false when the key is missing.

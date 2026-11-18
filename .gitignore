@@ -31,3 +31,6 @@ config.nic*.json
 .opencode/
 .superpowers/
 COMMITMSG.txt
+
+# Internal audit reports (agent working artifacts, not product docs)
+docs/audit/

@@ -398,10 +398,25 @@ const document = {
 };
 
 const store = new Map();
+// P146 D2/D9: a browser can refuse storage outright (private mode, a storage
+// policy, a full quota): every getItem/setItem call THROWS SecurityError /
+// QuotaExceededError rather than returning null or false. The stub used to be
+// the friendliest possible storage, so the page's unguarded calls were
+// invisible. `storageThrows` makes the real methods raise on demand.
+let storageThrows = false;
 const localStorage = {
-  getItem(k) { return store.has(k) ? store.get(k) : null; },
-  setItem(k, v) { store.set(k, String(v)); },
-  removeItem(k) { store.delete(k); },
+  getItem(k) {
+    if (storageThrows) throw new Error('SecurityError: storage is not available');
+    return store.has(k) ? store.get(k) : null;
+  },
+  setItem(k, v) {
+    if (storageThrows) throw new Error('QuotaExceededError');
+    store.set(k, String(v));
+  },
+  removeItem(k) {
+    if (storageThrows) throw new Error('SecurityError: storage is not available');
+    store.delete(k);
+  },
 };
 
 // ------------------------------------------------------------- fetch recording
@@ -446,6 +461,14 @@ let configPostReply = { ok: true };
 let configPostStatus = 200;
 let applyStatusReply = { attempt_id: 0, completed_id: 0, ok: true, error: '' };
 let applyStatusPolls = 0;
+// P146 D7: GET /api/autostart answers the state the registry actually holds.
+// The stub used to answer {} for every unmodelled GET, which is not a smaller
+// server: the page would read `r.enabled` as undefined and the checkbox would
+// be pinned off. Keep the value mutable so a case can flip it.
+let autostartEnabled = false;
+// P146 D12: how many times the (now deleted) WebView2 handshake called
+// postMessage. Nothing may write to window.chrome.webview any more.
+let postMessageCalls = 0;
 const deferredPaths = new Set();
 const deferredResponses = new Map(); // path -> [release]
 
@@ -471,6 +494,8 @@ function payloadFor(path) {
   if (path === '/api/dhcp6/bindings') return JSON.parse(JSON.stringify(bind6List));
   if (path === '/api/dhcp6/leases') return JSON.parse(JSON.stringify(lease6List));
   if (path === '/api/config') return JSON.parse(JSON.stringify(configPayload || {}));
+  // P146 D7: the read half of the autostart toggle.
+  if (path === '/api/autostart') return { enabled: autostartEnabled };
   return {};
 }
 
@@ -589,6 +614,14 @@ sandbox.window = sandbox;
 sandbox.globalThis = sandbox;
 sandbox.window.addEventListener = (type, fn) => recordWindowListener(type, fn);
 sandbox.window.matchMedia = undefined;
+// P146 D12: the WebView2 host is gone (README.md:31, src/main.cpp:5). A host
+// object is still installed here so a page that writes to it is OBSERVABLE
+// rather than silently passing: the deleted handshake must make zero calls.
+sandbox.chrome = {
+  webview: {
+    postMessage() { postMessageCalls++; },
+  },
+};
 
 // The language picker's list is markup, and the script snapshots it at load:
 // `const langOptions = Array.from(langsel.options).map(...)`. A stub whose
@@ -4262,13 +4295,17 @@ cases.push(['a client count is taken from a list, not from .length', async () =>
   await sandbox.loadRateLimits();
   ok(Array.isArray(vm.runInContext('window.__rlRules', context)),
      'the rate-limit cache must always be an array');
-  // Same for the port-map cache: loadPortMap() stores it and paintActionTable()
-  // maps over a guarded copy, so a non-list answer must not reach the cache.
+  // P146 D14: the port-map page no longer caches its list at all (window.__pmRules
+  // had no reader), so there is no cache to normalise. What still matters is that
+  // a non-list answer cannot break the paint: loadPortMap() guards with
+  // Array.isArray at the call site, and the table must render the empty state.
   portmapRules = { not: 'an array' };
   vm.runInContext('renderTicket.clear();', context);
   await sandbox.loadPortMap();
-  ok(Array.isArray(vm.runInContext('window.__pmRules', context)),
-     'the port-map cache must always be an array');
+  ok(typeof vm.runInContext('window.__pmRules', context) === 'undefined',
+     'the write-only port-map cache must stay gone');
+  eq(tableTextOf(nodeFor('#pm-table tbody')), 'No rules yet',
+     'a non-list port-map answer must paint the empty state, not a broken row');
   portmapRules = [];
   ratelimitRules = [];
 
@@ -5079,6 +5116,621 @@ cases.push(['the binding-cap refusal is a translated token', async () => {
   vm.runInContext('toasts.length = 0; renderToasts();', context);
 }]);
 
+// ===========================================================================
+// P146 W11: the fifteen defects the two-auditor review settled on
+// (docs/audit/P146_定案清单.md). Each case names its decision id (D1..D15).
+// ===========================================================================
+function clearToasts() {
+  vm.runInContext('toasts.length = 0; renderToasts();', context);
+}
+function toastTexts() {
+  return nodeFor('#toast').children.map((c) => c.textContent);
+}
+
+// D1 (P1) - the DHCP pool is ONE [start,end] pair. Clearing only the START
+// used to leave the END in the form and post pool:[null,"x"] (setByPath builds
+// a JS array, JSON.stringify turns the hole into null, JsonToIpv4(null) is
+// false) -> 400 "dhcp.pool malformed ipv4 entry". Clearing only the END
+// dropped the whole key and saved. The two directions disagree, and one of
+// them cannot be saved at all.
+cases.push(['D1: clearing either DHCP pool bound drops the whole pair', async () => {
+  for (const [start, end, what] of [['', '192.168.0.200', 'start cleared'],
+                                    ['192.168.0.100', '', 'end cleared']]) {
+    vm.runInContext('renderTicket.clear();', context);
+    configPayload = JSON.parse(JSON.stringify(SERVER_CONFIG));
+    resetSettingsForm();
+    await sandbox.loadSettings(true);
+    nodeFor('#set-dhcp-poolstart').value = start;
+    nodeFor('#set-dhcp-poolend').value = end;
+    configPostReply = { ok: true };
+    configPostStatus = 200;
+    applyStatusReply = { attempt_id: 0, completed_id: 0, ok: true, error: '' };
+    const before = requests.length;
+    await sandbox.saveSettings();
+    const posts = requests.slice(before).filter(r => r.method === 'POST' && r.path === '/api/config');
+    eq(posts.length, 1, `${what}: the save must still post once`);
+    const sent = JSON.parse(posts[0].body);
+    ok(!('pool' in (sent.dhcp || {})),
+       `${what}: a half-filled pool is not a value the loader takes - the key must be dropped, got: ` +
+       JSON.stringify((sent.dhcp || {}).pool));
+    ok(sent.perf.workers === 8,
+       `${what}: the rest of the form must still be submitted, got workers=` +
+       (sent.perf || {}).workers);
+  }
+  configPayload = null;
+  configPostReply = { ok: true };
+  vm.runInContext('renderTicket.clear();', context);
+}]);
+
+// D2 (P1) - localStorage can THROW. In a storage-denied context every getItem
+// raises SecurityError, and the three unguarded readers sat on the BOOT path
+// (authToken -> detectLang -> applyTheme), so the page never got to activate().
+cases.push(['D2: a storage layer that throws cannot break the boot chain', async () => {
+  const run = (expr) => vm.runInContext(expr, context);
+  const realStore = sandbox.localStorage;
+  const savedToken = realStore.getItem('vgww_token');
+  const savedLang = realStore.getItem('vgww_lang');
+  const savedTheme = realStore.getItem('vgww_theme');
+  clearToasts();
+
+  const throwing = {
+    getItem() { throw new Error('SecurityError: storage is not available'); },
+    setItem() { throw new Error('QuotaExceededError'); },
+    removeItem() { throw new Error('SecurityError: storage is not available'); },
+  };
+  sandbox.localStorage = throwing;
+  try {
+    // Each reader must answer a defensible default instead of raising.
+    eq(run('authToken()'), '', 'the token reader must fall back to an empty token');
+    clearToasts();
+    let langErr = null;
+    try { run('detectLang()'); } catch (e) { langErr = e; }
+    eq(langErr && langErr.message, null,
+       'detectLang must not raise when storage refuses a read: ' + (langErr && langErr.message));
+    const lang = run('detectLang()');
+    eq(typeof lang === 'string', true, 'detectLang must still answer a language code');
+    ok(!!run(`I18N[${JSON.stringify(lang)}]`), 'the answered language must exist in the table');
+    clearToasts();
+    let themeErr = null;
+    try { run('applyTheme()'); } catch (e) { themeErr = e; }
+    eq(themeErr && themeErr.message, null,
+       'applyTheme must not raise when storage refuses a read: ' + (themeErr && themeErr.message));
+    eq(run('document.documentElement.dataset.theme'), 'dark',
+       'a refused theme read falls back to the dark default');
+    // The boot chain, in order, as the page runs it.
+    let bootErr = null;
+    try {
+      run('document.getElementById("tk").value = authToken();');
+      run('currentLang = detectLang();');
+      run('applyTheme();');
+      run('document.getElementById("langsel").value = currentLang;');
+      run('applyI18n(false);');
+    } catch (e) { bootErr = e; }
+    eq(bootErr && bootErr.message, null,
+       'the boot chain must complete with storage denied: ' + (bootErr && bootErr.message));
+  } finally {
+    sandbox.localStorage = realStore;
+    if (savedToken !== null) realStore.setItem('vgww_token', savedToken); else realStore.removeItem('vgww_token');
+    if (savedLang !== null) realStore.setItem('vgww_lang', savedLang); else realStore.removeItem('vgww_lang');
+    if (savedTheme !== null) realStore.setItem('vgww_theme', savedTheme); else realStore.removeItem('vgww_theme');
+    run('currentLang = "en"; applyI18n(false);');
+  }
+  clearToasts();
+}]);
+
+// D3 (P1) - the device list can only ever hold LAN clients
+// (dataplane.cpp:4093-4099 skips non-LAN, web_api.cpp:2575 emits lan=true), so
+// a WAN filter is a control that can only ever show an empty table. Option (a):
+// the option is gone, the copy no longer promises WAN traffic, and the filter
+// predicate has no branch that no data can reach.
+cases.push(['D3: the device page offers no filter that can only be empty', async () => {
+  const markup = html
+    .replace(/<style\b[\s\S]*?<\/style\s*>/gi, (s) => ' '.repeat(s.length))
+    .replace(/<script\b[\s\S]*?<\/script\s*>/gi, (s) => ' '.repeat(s.length));
+  const scope = markup.match(/<select id="dev-scope"[\s\S]*?<\/select\s*>/i);
+  ok(scope, 'the device scope control must exist');
+  ok(!/value="wan"/i.test(scope[0]),
+     'a WAN option can only ever select an empty table; it must not be offered');
+  ok(/value="lan"/i.test(scope[0]), 'the LAN option must stay');
+  ok(/value="all"/i.test(scope[0]), 'the All option must stay');
+
+  // The predicate is the whole filter: every value the control can hold must
+  // select a subset that can actually be non-empty.
+  clientList = [
+    { ip: '10.0.0.1', mac: 'AA:AA:AA:AA:AA:01', up_bps: 1, down_bps: 1, last_seen_s: 1, lan: true },
+    { ip: '10.0.0.2', mac: 'AA:AA:AA:AA:AA:02', up_bps: 1, down_bps: 1, last_seen_s: 1, lan: false },
+  ];
+  eq(clientList.filter((c) => sandbox.devScopeOf(c, 'lan')).length, 1,
+     'the LAN scope must select LAN clients');
+  eq(clientList.filter((c) => sandbox.devScopeOf(c, 'all')).length, 2,
+     'the All scope must select everything');
+  // A stale/hand-written hash of a removed option must not resurrect a filter
+  // with no data behind it: an unknown scope falls back to "no filtering"
+  // rather than "show nothing".
+  eq(clientList.filter((c) => sandbox.devScopeOf(c, 'wan')).length, 2,
+     'a scope the control no longer offers must not filter everything out');
+  clientList = [];
+
+  // The subtitle must not promise WAN traffic: it appears once per language
+  // block and every copy is checked.
+  const subs = [...html.matchAll(/"dev\.sub":"((?:[^"\\]|\\.)*)"/g)].map((m) => m[1]);
+  ok(subs.length > 400, 'the dev.sub key must be present in the language table');
+  const promisesWan = subs.filter((s) => /\bWAN\b/i.test(s) || /外网|外網/.test(s));
+  eq(promisesWan.length, 0,
+     'no dev.sub translation may promise WAN traffic, got: ' + JSON.stringify(promisesWan.slice(0, 3)));
+  ok(subs.every((s) => /\bLAN\b|内网|內網|局域网|局域網/.test(s)),
+     'every dev.sub translation must still say the list is the LAN side');
+}]);
+
+// D4 (P2) - `.badge{display:inline-block}` is an author rule, and an author
+// rule beats the UA sheet's `[hidden]{display:none}`, so the "unsaved changes"
+// badge was ALWAYS visible. A stylesheet cannot be computed in this stub, so
+// the case pins the two halves that make it work: the page ships an author
+// rule that wins, and syncDirty() drives the attribute.
+cases.push(['D4: the dirty badge is hidden while the form is clean', async () => {
+  const style = (html.match(/<style\b[^>]*>([\s\S]*?)<\/style\s*>/i) || [])[1] || '';
+  ok(/\[hidden\]\s*\{[^}]*display\s*:\s*none\s*!important/.test(style),
+     'the page must carry an author [hidden]{display:none!important} rule: ' +
+     'a UA rule loses to .badge{display:inline-block}');
+  const hiddenAt = style.search(/\[hidden\]\s*\{[^}]*display\s*:\s*none\s*!important/);
+  const badgeAt = style.search(/\.badge\s*\{/);
+  ok(hiddenAt >= 0 && badgeAt >= 0, 'both rules must be present');
+  // An author rule wins on !important, not on order... but keep the ordering
+  // irrelevant by asserting the important flag (done above). This one only
+  // records that the badge rule is still the inline-block one that loses.
+  ok(/\.badge\s*\{[^}]*display\s*:\s*inline-block/.test(style),
+     'the badge rule is expected to still be inline-block (that is what it must beat)');
+
+  vm.runInContext('renderTicket.clear();', context);
+  configPayload = JSON.parse(JSON.stringify(SERVER_CONFIG));
+  resetSettingsForm();
+  await sandbox.loadSettings(true);
+  const badge = nodeFor('#set-dirty');
+  eq(sandbox.syncDirty(), false, 'a freshly loaded form is clean');
+  eq(badge.hidden, true, 'a clean form must hide the badge');
+  nodeFor('#set-workers').value = '7';
+  eq(sandbox.syncDirty(), true, 'an edit is dirty');
+  eq(badge.hidden, false, 'a dirty form must show the badge');
+  // And a single change back to the server value hides it again.
+  nodeFor('#set-workers').value = '8';
+  eq(sandbox.syncDirty(), false, 'back to the server value is clean');
+  eq(badge.hidden, true, 'the badge must follow the state back');
+  configPayload = null;
+  vm.runInContext('renderTicket.clear();', context);
+}]);
+
+// D5 (P2) - an apply whose outcome cannot be observed is NOT "applied".
+// pollApplyStatus returns {state:"unreachable"} when the poll's request fails
+// with err.network, and saveSettings had no branch for it, so it fell through
+// to the success toast. The page's own batch181 comment says "no answer is not
+// applied".
+cases.push(['D5: an unobservable apply is reported as pending, not as applied', async () => {
+  vm.runInContext('renderTicket.clear();', context);
+  configPayload = JSON.parse(JSON.stringify(SERVER_CONFIG));
+  resetSettingsForm();
+  await sandbox.loadSettings(true);
+  nodeFor('#set-workers').value = '3';
+  configPostReply = { ok: true, note: 'applied', apply_id: 11 };
+  configPostStatus = 200;
+  applyStatusPolls = 0;
+  const realFetch = sandbox.fetch;
+  // The listener is gone: the apply-status read can never be answered.
+  sandbox.fetch = async (path, opt) => {
+    const p = String(path);
+    if (p === '/api/config/apply-status') throw new Error('offline');
+    return realFetch(p, opt);
+  };
+  clearToasts();
+  try {
+    await sandbox.saveSettings();
+  } finally {
+    sandbox.fetch = realFetch;
+  }
+  eq(applyStatusPolls, 0, 'the poll must go through the real transport (stub counts real GETs only)');
+  const texts = toastTexts();
+  const applied = vm.runInContext('t("set.saved.applied")', context);
+  const pending = vm.runInContext('t("set.saved.pending")', context);
+  ok(!texts.some((x) => x.startsWith(applied)),
+     'an apply nobody could observe must not be announced as applied, got: ' + JSON.stringify(texts));
+  ok(!texts.some((x) => x.startsWith(vm.runInContext('t("set.saved")', context))),
+     'nor as the plain "saved" note, which also implies it is in effect, got: ' + JSON.stringify(texts));
+  ok(texts.some((x) => x.startsWith(pending)),
+     'the honest state is "saved to the file, apply unconfirmed", got: ' + JSON.stringify(texts));
+  configPostReply = { ok: true };
+  applyStatusPolls = 0;
+  configPayload = null;
+  vm.runInContext('renderTicket.clear();', context);
+  clearToasts();
+}]);
+
+// D6 (P2) - the post-save reload is `loadSettings(true)`, which ADOPTS the
+// server's values. If the operator typed into the form while the save was in
+// flight, that reload overwrites the new draft with pre-save data. Keep the
+// draft; only adopt when nothing was typed since the submit.
+cases.push(['D6: typing during a save keeps the newer draft', async () => {
+  vm.runInContext('renderTicket.clear();', context);
+  configPayload = JSON.parse(JSON.stringify(SERVER_CONFIG));
+  resetSettingsForm();
+  await sandbox.loadSettings(true);
+  nodeFor('#set-workers').value = '4';
+  // The save is in flight: the config POST itself is held open (deferredPaths
+  // only models GETs - a held POST is the honest way to make the window in
+  // which the operator can type exist).
+  configPostReply = { ok: true };
+  configPostStatus = 200;
+  applyStatusReply = { attempt_id: 0, completed_id: 0, ok: true, error: '' };
+  const realFetch = sandbox.fetch;
+  let release = null;
+  let posts = 0;
+  sandbox.fetch = async (path, opt) => {
+    if (String(path) === '/api/config' && opt && opt.method === 'POST') {
+      posts++;
+      // Only the FIRST POST is held. A broken implementation that posts again
+      // must not hang the case.
+      if (posts === 1) await new Promise((res) => { release = res; });
+      return { ok: true, status: 200, async json() { return { ok: true }; }, async text() { return '{"ok":true}'; } };
+    }
+    return realFetch(path, opt);
+  };
+  const saving = sandbox.saveSettings();
+  await flush();
+  await flush();
+  ok(release !== null, 'the save must be in flight for this case');
+  nodeFor('#set-workers').value = 'typed-mid-save';
+  release();
+  try {
+    await saving;
+  } finally {
+    sandbox.fetch = realFetch;
+  }
+  await flush();
+  eq(nodeFor('#set-workers').value, 'typed-mid-save',
+     'a value typed while the save was in flight must survive the post-save reload');
+  eq(sandbox.syncDirty(), true,
+     'the form must still be reported as a draft (it differs from what was saved)');
+  configPayload = null;
+  vm.runInContext('renderTicket.clear();', context);
+  clearToasts();
+}]);
+
+// D7 (P2) - "Start with Windows" never echoed the registry. The page only had
+// POST /api/autostart; the checkbox reflected nothing and stayed unchecked on
+// a machine whose Run key was already set. Nothing on the page may now read it
+// from anywhere but the server: the read is the new GET /api/autostart.
+// D6b (P146 D6 regression, P146-W11 甲审): the D6 guard must be about a draft
+// typed DURING the POST, not about "the form differs from the last snapshot".
+// settingsSnapshot is the value the form had at the last load/save - so after
+// ANY edit that comparison is true, every ordinary save took the "keep the
+// draft" branch, the post-save reload never ran, and the dirty badge stayed lit
+// on a configuration that had just been stored. This is the opposite direction
+// of D6 and has to be asserted separately: no typing during the POST means the
+// server's normalised values MUST come back and the form MUST read clean.
+cases.push(['D6b: a normal save adopts the server values and clears the badge', async () => {
+  vm.runInContext('renderTicket.clear();', context);
+  configPayload = JSON.parse(JSON.stringify(SERVER_CONFIG));
+  resetSettingsForm();
+  await sandbox.loadSettings(true);
+  eq(sandbox.syncDirty(), false, 'a freshly loaded form is clean');
+
+  // The operator types a value the server will normalise (4 -> 8).
+  nodeFor('#set-workers').value = '4';
+  eq(sandbox.syncDirty(), true, 'editing must mark the form dirty');
+
+  // The POST succeeds with NO typing in flight. The server keeps its own value,
+  // which is what the post-save reload must adopt.
+  configPostReply = { ok: true };
+  configPostStatus = 200;
+  applyStatusReply = { attempt_id: 0, completed_id: 0, ok: true, error: '' };
+  const realFetch = sandbox.fetch;
+  let posted = 0;
+  sandbox.fetch = async (path, opt) => {
+    if (String(path) === '/api/config' && opt && opt.method === 'POST') {
+      posted++;
+      configPayload = JSON.parse(JSON.stringify(SERVER_CONFIG)); // normalised: workers 8
+      return { ok: true, status: 200, async json() { return { ok: true }; }, async text() { return '{"ok":true}'; } };
+    }
+    return realFetch(path, opt);
+  };
+  try {
+    await sandbox.saveSettings();
+  } finally {
+    sandbox.fetch = realFetch;
+  }
+  await flush();
+  eq(posted, 1, 'the save must have posted once');
+  eq(nodeFor('#set-workers').value, '8',
+     'a save with nothing typed in flight must adopt the server normalised value, got: ' +
+     nodeFor('#set-workers').value);
+  eq(sandbox.syncDirty(), false, 'a completed save must leave the form clean');
+  eq(nodeFor('#set-dirty').hidden, true,
+     'the "unsaved changes" badge must be hidden after a completed save');
+  configPostReply = { ok: true };
+  configPayload = null;
+  vm.runInContext('renderTicket.clear();', context);
+  clearToasts();
+}]);
+cases.push(['D7: the autostart checkbox echoes the stored state', async () => {
+  const cb = nodeFor('#maint-autostart');
+  // The page must ECHO the registry on load, not only after an operator action:
+  // a loader nobody calls at boot leaves the box blank forever.
+  ok(bootRequests.some((r) => r.method === 'GET' && r.path === '/api/autostart'),
+     'the boot chain must read the autostart state (loadAutostart at startup)');
+  const reads = () => requests.filter((r) => r.method === 'GET' && r.path === '/api/autostart').length;
+  for (const state of [true, false, true]) {
+    autostartEnabled = state;
+    cb.checked = !state;
+    const before = reads();
+    await sandbox.loadAutostart();
+    eq(reads(), before + 1, 'the box must be filled from GET /api/autostart, not from a guess');
+    eq(cb.checked, state,
+       'the checkbox must show the state the server reports (enabled=' + state + ')');
+  }
+  // A failed read must not silently claim "off": it leaves the box alone and
+  // says so.
+  autostartEnabled = false;
+  cb.checked = true;
+  clearToasts();
+  const realFetch = sandbox.fetch;
+  sandbox.fetch = async (path, opt) => {
+    if (String(path) === '/api/autostart') return jsonResponse({ error: 'unavailable' }, 503);
+    return realFetch(path, opt);
+  };
+  try {
+    await sandbox.loadAutostart();
+  } finally {
+    sandbox.fetch = realFetch;
+  }
+  eq(cb.checked, true, 'a failed read must not flip the box to a state nobody reported');
+  ok(toastTexts().length > 0, 'a failed read must be reported, got no toast');
+  autostartEnabled = false;
+  clearToasts();
+}]);
+
+// D8 (P2) - the "Save token" button had no in-flight guard. Two clicks while
+// the first verification is pending: the second reads the value the first just
+// stored, fails, and rolls back to THAT ("bad"), so the rejected token is what
+// persists and every later request answers 401.
+cases.push(['D8: a double-click cannot leave a rejected token in storage', async () => {
+  clearToasts();
+  vm.runInContext('warned401 = false;', context);
+  localStorage.removeItem('vgww_token');
+  localStorage.setItem('vgww_token', 'old-token');
+  nodeFor('#tk').value = 'bad-token';
+
+  // Both verifications are answered 401; the first is held open so the second
+  // click lands while it is in flight.
+  const realFetch = sandbox.fetch;
+  const holds = [];
+  sandbox.fetch = async (path, opt) => {
+    if (String(path) === '/api/auth/verify') {
+      return new Promise((resolve) => holds.push(resolve));
+    }
+    return realFetch(path, opt);
+  };
+  try {
+    const first = sandbox.setToken();
+    await flush();
+    eq(holds.length, 1, 'the first click must reach the server');
+    // The operator clicks again: the guard must drop it before it reads or
+    // writes anything.
+    const second = sandbox.setToken();
+    await flush();
+    eq(holds.length, 1, 'a second click while one is in flight must not reach the server');
+    for (const h of holds) h(jsonResponse({ error: 'unauthorized' }, 401));
+    await first;
+    await second;
+  } finally {
+    sandbox.fetch = realFetch;
+  }
+  eq(localStorage.getItem('vgww_token'), 'old-token',
+     'the working token must be restored, not the rejected candidate');
+  localStorage.removeItem('vgww_token');
+  vm.runInContext('warned401 = false;', context);
+  clearToasts();
+}]);
+
+// D9 (P2) - choosing a language wrote localStorage FIRST. When that write
+// throws, the handler aborted before `currentLang = ...`: the language did not
+// switch and nothing said why.
+cases.push(['D9: a refused language persist still switches this session', async () => {
+  const sel = nodeFor('#langsel');
+  clearToasts();
+  const realStore = sandbox.localStorage;
+  const throwing = {
+    getItem(k) { return realStore.getItem(k); },
+    setItem() { throw new Error('QuotaExceededError'); },
+    removeItem(k) { realStore.removeItem(k); },
+  };
+  sandbox.localStorage = throwing;
+  let escaped = null;
+  const realFetch = sandbox.fetch;
+  sandbox.fetch = async () => ({ ok: true, status: 200, async json() { return { ok: true }; }, async text() { return '{}'; } });
+  try {
+    await sel.__on['change'][0]({ target: { value: 'ja' } });
+    await flush();
+    await flush();
+    await flush();
+  } catch (e) {
+    escaped = e;
+  } finally {
+    sandbox.fetch = realFetch;
+    sandbox.localStorage = realStore;
+  }
+  eq(escaped, null, 'a refused persist must not escape the change handler: ' + (escaped && escaped.message));
+  eq(vm.runInContext('currentLang', context), 'ja',
+     'the language must still switch for THIS session');
+  eq(vm.runInContext('document.documentElement.lang', context), 'ja',
+     'applyI18n must have run, so the page is in the chosen language');
+  ok(toastTexts().length > 0,
+     'the operator must be told the choice will not be remembered, got no toast');
+  // A silent refusal is not enough: the page must still say the change is live.
+  setScriptLang('en');
+  sandbox.applyI18n(false);
+  clearToasts();
+}]);
+
+// D10 (P3) - the rate-limit fields capped at 1e9 while the backend stores a
+// uint32_t. Two UIs, two legal ranges: a 2 Gbps cap saves natively and is
+// refused by the console.
+cases.push(['D10: the rate-limit cap accepts the whole uint32 range', async () => {
+  nodeFor('#page-ratelimit').hidden = false;
+  nodeFor('#rl-mac').value = 'AA:BB:CC:DD:EE:99';
+  nodeFor('#rl-up').value = '4294967295';
+  nodeFor('#rl-down').value = '1000';
+  const before = requests.filter((r) => r.method === 'POST' && r.path === '/api/ratelimit').length;
+  await sandbox.addRateLimit();
+  eq(requests.filter((r) => r.method === 'POST' && r.path === '/api/ratelimit').length, before + 1,
+     'the largest uint32 cap must be accepted (web_api.cpp stores uint32_t)');
+  const body = JSON.parse(requests.filter((r) => r.method === 'POST' && r.path === '/api/ratelimit').pop().body);
+  eq(body.uplink_kbps, 4294967295, 'the value must reach the server unmangled');
+  // One past it is still out of range for the backend, and must be refused
+  // locally with the field named.
+  clearToasts();
+  nodeFor('#rl-up').value = '4294967296';
+  await sandbox.addRateLimit();
+  eq(requests.filter((r) => r.method === 'POST' && r.path === '/api/ratelimit').length, before + 1,
+     'a value the backend cannot store must be refused before it is sent');
+  const texts = toastTexts();
+  ok(texts.some((x) => x.indexOf(vm.runInContext('t("set.badrange")', context)) === 0),
+     'the refusal must say "out of range", got: ' + JSON.stringify(texts));
+  clearToasts();
+}]);
+
+// D11 (P2) - /api/status carries dataplane_running / dataplane_error and the
+// console ignored both. A --web-only run (README.md:64) has the dataplane OFF
+// as its NORMAL state, and the dashboard painted "RX 0 / TX 0" all the same.
+cases.push(['D11: a stopped dataplane is visible on the dashboard', async () => {
+  vm.runInContext('renderTicket.clear();', context);
+  clientList = [];
+  statusPayload = {
+    gateway: { ip: '192.168.0.1', ipv6: '' },
+    stats: { rx_frames: 0, tx_frames: 0, tcp_accepted: 0 },
+    bridge: {},
+    dataplane_running: false,
+    dataplane_error: 'adapter open failed',
+  };
+  await sandbox.refreshStatus();
+  const shown = tableText(nodeFor('#cards'));
+  ok(shown.indexOf('adapter open failed') >= 0,
+     'the dataplane failure the status endpoint reports must reach the dashboard, got: ' + shown);
+  // It is a STATE, not a transient: the next tick must keep saying it.
+  await sandbox.refreshStatus();
+  ok(tableText(nodeFor('#cards')).indexOf('adapter open failed') >= 0,
+     'the banner must survive the next poll');
+  // And a healthy plane must remove it again.
+  statusPayload.dataplane_running = true;
+  statusPayload.dataplane_error = '';
+  await sandbox.refreshStatus();
+  ok(tableText(nodeFor('#cards')).indexOf('adapter open failed') < 0,
+     'a running dataplane must clear the message, got: ' + tableText(nodeFor('#cards')));
+  statusPayload = {
+    gateway: { ip: '192.168.0.1', ipv6: '' },
+    stats: { rx_frames: 0, tx_frames: 0, tcp_accepted: 0 },
+    bridge: {},
+  };
+  vm.runInContext('renderTicket.clear();', context);
+}]);
+
+// D12 (P3) - the WebView2 handshake is dead code: the embedded shell is gone
+// (README.md:31, src/main.cpp:5) and no source hosts it. Nothing may post to
+// window.chrome.webview any more.
+cases.push(['D12: the page no longer posts a WebView2 handshake', async () => {
+  ok(postMessageCalls === 0,
+     'the deleted handshake must make no postMessage call, got ' + postMessageCalls);
+  const body = html.replace(/<style\b[\s\S]*?<\/style\s*>/gi, (s) => ' '.repeat(s.length));
+  ok(!/chrome\.webview|postMessage\s*\(\s*["']vgww-ui-ready/.test(body),
+     'no WebView2 handshake may remain in the page');
+}]);
+
+// D13 (P3) - formatter edges: fmt() has no unit above T, so 1e15 printed
+// "1000.00 T" (the same self-contradictory reading batch331 removed from G);
+// fmtRate() passed a negative through as "-1024 B/s".
+cases.push(['D13: no counter prints a number that belongs to a missing unit', async () => {
+  const fmt = (n) => String(vm.runInContext('fmt(' + n + ')', context));
+  eq(fmt(1e15), '1.00 P', 'a quadrillion is 1.00 P, got: ' + fmt(1e15));
+  eq(fmt(5e15), '5.00 P', 'five quadrillion is 5.00 P, got: ' + fmt(5e15));
+  // The boundary is where the T display itself rounds to 1000.00 T.
+  eq(fmt(999994999999999), '999.99 T',
+     'the value below the P boundary is still a legal T reading, got: ' + fmt(999994999999999));
+  eq(fmt(999995000000000), '1.00 P',
+     'the first value that rounds to 1000.00 T is 1.00 P, got: ' + fmt(999995000000000));
+  // The invariant: "1000" may never appear inside a scaled unit.
+  const offenders = [];
+  for (let v = 1e12; v <= 3e16; v += 1e12) {
+    const txt = fmt(v);
+    if (/^1000(\.0+)?\s*[KMGTP]$/.test(txt)) offenders.push(v + ' -> ' + txt);
+  }
+  eq(offenders.length, 0, 'no counter may print 1000 in a scaled unit: ' + offenders.slice(0, 4).join(', '));
+
+  // A rate is a magnitude: a negative cannot be a reading.
+  const render = (bps) => String(vm.runInContext('fmtRate(' + bps + ')', context));
+  const B = vm.runInContext('t("rate.b")', context);
+  eq(render(-1024), '0' + B, 'a negative rate reads as zero, got: ' + render(-1024));
+  eq(render(-1), '0' + B, 'a negative byte rate reads as zero, got: ' + render(-1));
+  // Positive values keep their meaning.
+  eq(render(1024), '1.0' + vm.runInContext('t("rate.kib")', context), 'a positive rate is unchanged');
+}]);
+
+// D14 (P3) - window.__pmRules was written and never read (dead state). Unlike
+// __rlRules (read by editRateLimit) and __clientList (read by paintDevices),
+// nothing consumed it: a "cache" no code path consults only misleads the next
+// reader into thinking a repaint-from-memory exists. The write is removed; the
+// table keeps loading from the server, which is the truth after a mutation.
+cases.push(['D14: the port-map table holds no write-only cache', async () => {
+  vm.runInContext('renderTicket.clear();', context);
+  ok(!/window\.__pmRules\s*=/.test(html),
+     'window.__pmRules had no reader; a write-only cache must not be assigned');
+  // The table itself must still work: load paints, and a mutation re-reads.
+  portmapRules = [
+    { id: 1, proto: 'tcp', wan_port: 1001, lan_ip: '10.9.9.1', lan_port: 80 },
+    { id: 2, proto: 'tcp', wan_port: 1002, lan_ip: '10.9.9.2', lan_port: 80 },
+  ];
+  await sandbox.loadPortMap();
+  const tbody = nodeFor('#pm-table tbody');
+  ok(tableTextOf(tbody).includes('10.9.9.1') && tableTextOf(tbody).includes('10.9.9.2'),
+     'the load must paint both rows, got: ' + tableTextOf(tbody));
+  // A delete reloads from the server (ids can be renumbered), so the repaint
+  // must never come from a stale local list.
+  portmapRules = [{ id: 2, proto: 'tcp', wan_port: 1002, lan_ip: '10.9.9.2', lan_port: 80 }];
+  const before = requests.filter((r) => r.method === 'GET' && r.path === '/api/portmap').length;
+  await sandbox.delMapping(1, 'tcp 1001');
+  await flush();
+  const after = requests.filter((r) => r.method === 'GET' && r.path === '/api/portmap').length;
+  ok(after > before, 'a delete must re-read the list from the server (ids are server-owned)');
+  ok(!tableTextOf(tbody).includes('10.9.9.1'),
+     'the deleted rule must be gone after the reload, got: ' + tableTextOf(tbody));
+  portmapRules = [];
+  vm.runInContext('renderTicket.clear();', context);
+  clearToasts();
+}]);
+
+// D15 (P3) - the DHCPv6 lease field pointed at the key "set.dhcp6.lease",
+// which no language block defines (the blocks say "set.dhcpv6.lease"), so an
+// out-of-range lease refused with the raw key in the toast. Every SET_FIELDS
+// label must be a key the table actually has - see check-i18n.mjs, which now
+// enforces that too.
+cases.push(['D15: every settings field label is a key the table defines', async () => {
+  const fields = vm.runInContext('SET_FIELDS', context);
+  ok(Array.isArray(fields) && fields.length > 20, 'SET_FIELDS must be readable');
+  const en = vm.runInContext('I18N["en"]', context);
+  const missing = fields.filter((f) => f.label && !(f.label in en));
+  eq(missing.map((f) => f.path + ' -> ' + f.label).join(', '), '',
+     'a label the table does not define renders as the raw key');
+  // The DHCPv6 lease field names itself, not its key.
+  const lease = fields.find((f) => f.path === 'ipv6.dhcpv6.lease_seconds');
+  ok(lease, 'the DHCPv6 lease field must still exist');
+  eq(lease.label, 'set.dhcpv6.lease', 'the DHCPv6 lease label must use the key the table defines');
+  const text = vm.runInContext('t("set.dhcpv6.lease")', context);
+  ok(text !== 'set.dhcpv6.lease', 't() must resolve it to real text, got the raw key');
+}]);
+
+// P146 D7: the boot chain runs loadAutostart() fire-and-forget. Let its
+// microtasks land, then snapshot what boot asked for - a function that exists
+// but is never called at boot is exactly the defect this pins.
+await flush();
+await flush();
+const bootRequests = requests.slice();
+
 for (const [name, fn] of cases) {
   await run(name, fn);
 }
@@ -5091,7 +5743,7 @@ for (const [name, fn] of cases) {
 //
 // The floor is raised whenever cases are added; removing a case without
 // lowering it fails loudly.
-const MIN_CASES = 88;
+const MIN_CASES = 104;
 if (cases.length < MIN_CASES) {
   console.error(`FAIL ${NAME}: only ${cases.length} case(s) are registered, but at least ${MIN_CASES} are required.`);
   console.error('  A case was deleted (or never registered). Restore it, or - if the deletion was');

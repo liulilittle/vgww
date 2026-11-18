@@ -546,6 +546,25 @@ const err401 = [];
   }
 }
 
+
+// ------------------------------------------------ settings field labels (P146 D15)
+// SET_FIELDS carries the i18n key each settings input names itself with when it
+// is refused ("out of range: Pool start"). Those keys were invisible to this
+// gate: the array is data, not a t("...") call site, so a typo like
+// "set.dhcp6.lease" (the blocks say "set.dhcpv6.lease") shipped and the toast
+// read out the raw key. Parse the array and require every label to exist in en.
+const setFieldsAt = script.indexOf('const SET_FIELDS = [');
+if (setFieldsAt < 0) fail('cannot find const SET_FIELDS = [ in the inline script');
+const setFieldsOpen = script.indexOf('[', setFieldsAt);
+let setFieldsClose = -1;
+try { setFieldsClose = skipBalanced(script, setFieldsOpen); } catch (e) { fail('cannot parse SET_FIELDS: ' + e.message); }
+const setFieldsBody = script.slice(setFieldsOpen, setFieldsClose);
+const fieldLabels = [...setFieldsBody.matchAll(/\blabel\s*:\s*"((?:[^"\\]|\\.)*)"/g)].map((m) => m[1]);
+if (fieldLabels.length < 10) {
+  fail('parsed ' + fieldLabels.length + ' SET_FIELDS label(s) - the extractor is broken, refusing to report OK');
+}
+const unknownFieldLabels = [...new Set(fieldLabels)].filter((k) => !enKeys.has(k)).sort();
+
 // ------------------------------------------------------------ allowlist stale
 const liveMissing = new Set(missingPairs);
 const liveExtra = new Set(extraPairs);
@@ -611,6 +630,10 @@ if (unlistedMissing.length) {
   failLines.push('key(s) missing vs en without allowlist entry:');
   for (const e of unlistedMissing) failLines.push(`  ${e}`);
 }
+if (unknownFieldLabels.length) {
+  failLines.push('SET_FIELDS label(s) with no key in en (a refused field would name itself with the raw key):');
+  for (const k of unknownFieldLabels) failLines.push('  ' + k);
+}
 if (unknownLiteral.length) {
   failLines.push(`literal key(s) used outside the table but absent from en:`);
   for (const k of unknownLiteral) failLines.push(`  ${k}`);
@@ -650,4 +673,4 @@ if (coreSameAsEn.length) {
   for (const e of coreSameAsEn) console.error(`  ${e}`);
   process.exit(1);
 }
-console.log(`OK ${NAME} (missing=${missingPairs.length} acknowledged, extra=${extraPairs.length}, rtl=${rtlCodes.length} covered, server_tokens=${serverTokens.size} localized)`);
+console.log(`OK ${NAME} (missing=${missingPairs.length} acknowledged, extra=${extraPairs.length}, rtl=${rtlCodes.length} covered, server_tokens=${serverTokens.size} localized, set_fields=${new Set(fieldLabels).size} labelled)`);

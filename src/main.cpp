@@ -999,7 +999,11 @@ namespace {
             config_apply_status,
             // batch126: the console ring's eviction counter is visible on
             // /api/console instead of being a silent loss.
-            [] { return vgww::ui::console_log::DroppedLineCount(); });
+            [] { return vgww::ui::console_log::DroppedLineCount(); },
+            // P146 D7: the read half of "Start with Windows". Reads the Run key
+            // the tray owns (tray.cpp:511 IsAutostartEnabled) so the console's
+            // checkbox can echo what the machine will actually do.
+            [] { return vgww::ui::tray::IsAutostartEnabled(); });
 
         // HttpServer is OPT-IN (--web / --web-only; S4.4 switched the default off).
         // It binds the configured web.bind (default 127.0.0.1) - never every

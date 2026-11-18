@@ -2763,6 +2763,87 @@ static void TestB4PrivilegedEndpoints() {
     std::remove(rules.c_str());
 }
 
+// P146 D7: the console had only POST /api/autostart, so its "Start with
+// Windows" checkbox could never echo the registry. GET is the read half:
+// a plain read route (no token, like every other GET), answering the state
+// the machine actually holds. The getter is a SEPARATE callback from the
+// setter: writing to read would be a needless registry write and, at
+// "false", would actually disable autostart.
+static void TestP146AutostartRead() {
+    using namespace vgww::core;
+    const std::string path = ScratchFile("p146-autostart.json");
+    const std::string rules = std::string(path) + ".rules.json";
+    std::remove(path.c_str());
+    std::remove(rules.c_str());
+    Config cfg;
+    cfg.web.port = static_cast<uint16_t>(UniquePort());
+    cfg.web.token = "tok";
+    bool ok = false;
+    cfg.gateway.ipv4 = ParseIpv4("192.168.0.47", ok);
+    cfg.gateway.mask = ParseIpv4("255.255.255.0", ok);
+    MacAddress mac{};
+    ParseMac("30:fc:68:88:b4:af", mac);
+    cfg.gateway.mac = mac;
+    std::string err;
+    CHECK(cfg.SaveToFile(path, err));
+
+    vgww::runtime::Dataplane dp(cfg);
+    HttpServer api;
+    bool registry_enabled = true;
+    int setter_calls = 0;
+    vgww::web::RegisterApi(
+        api, dp, cfg, path, "tok", {}, [] { return true; },
+        [&registry_enabled, &setter_calls](bool v) {
+            ++setter_calls;
+            registry_enabled = v;
+            return registry_enabled;
+        },
+        [](const std::string&) {},
+        /*config_applier=*/{},
+        /*apply_status=*/{},
+        /*console_dropped=*/{},
+        [&registry_enabled] { return registry_enabled; });
+    const uint16_t kPort = UniquePort();
+    std::string start_err;
+    CHECK(api.Start("127.0.0.1", kPort, start_err));
+
+    // Reads are open (the page must paint before a token is known).
+    std::string body;
+    CHECK(HttpGet("/api/autostart", kPort, body) == 200);
+    CHECK(body.find("\"enabled\":true") != std::string::npos);
+    // A read is not a write: the setter must not be called at all.
+    CHECK(setter_calls == 0);
+
+    registry_enabled = false;
+    CHECK(HttpGet("/api/autostart", kPort, body) == 200);
+    CHECK(body.find("\"enabled\":false") != std::string::npos);
+    CHECK(setter_calls == 0);
+    api.Stop();
+
+    // With no getter wired the GET answers 503 rather than inventing
+    // "false"; the POST keeps working.
+    {
+        vgww::runtime::Dataplane dp2(cfg);
+        HttpServer api2;
+        vgww::web::RegisterApi(api2, dp2, cfg, path, "tok", {}, {},
+                               [&registry_enabled](bool v) {
+                                   registry_enabled = v;
+                                   return registry_enabled;
+                               },
+                               [](const std::string&) {});
+        const uint16_t kPort2 = UniquePort();
+        std::string se2;
+        CHECK(api2.Start("127.0.0.1", kPort2, se2));
+        CHECK(HttpGet("/api/autostart", kPort2, body) == 503);
+        CHECK(HttpPost(kPort2, "/api/autostart", "tok", "{\"enabled\":true}",
+                       body) == 200);
+        api2.Stop();
+    }
+
+    std::remove(path.c_str());
+    std::remove(rules.c_str());
+}
+
 // P93: the autostart audit line used to record the DESIRED state (`want`)
 // while the response reports the ACTUAL state (`actual`). The production
 // setter (main.cpp) ignores SetAutostart's return value and reads the registry
@@ -10787,6 +10868,7 @@ int main(int argc, char** argv) {
     TestB122WebStatusReportsParseRejects6();
     TestB123PrivilegedChangesAreAudited();
     TestP92WebAuditLineCarriesPersistFailure();
+    TestP146AutostartRead();
     TestP93AutostartAuditCarriesActualState();
     TestP95ConfigSaveFailureIsAudited();
     TestP102WebBindingPersistFailureIsAudited();
