@@ -29,6 +29,7 @@
 #include <asio.hpp>
 
 #include <atomic>
+#include <chrono>
 #include <cstdint>
 #include <deque>
 #include <functional>
@@ -112,6 +113,16 @@ namespace vgww {
                 /// swallowed: the rule cannot re-arm (deaf until the rule set
                 /// changes), but the manager thread survives.
                 std::atomic<uint64_t> rearm_errors{0};
+                /// P147 P1-8: accepted WAN connections refused because
+                /// `relays_` already holds `portmap.max_relays` entries (the
+                /// xtcp connection budget is shared with every normal NAT
+                /// flow, so an unbounded accept side is a whole-gateway
+                /// outage). The WAN socket is closed immediately.
+                std::atomic<uint64_t> relay_cap_refused{0};
+                /// P147 P1-8: same refusal at the per-rule level.
+                std::atomic<uint64_t> rule_cap_refused{0};
+                /// P147 P1-7: relays reclaimed by the idle sweep.
+                std::atomic<uint64_t> idle_reaped{0};
             };
             const Stats& GetStats() const noexcept { return stats_; }
 
@@ -159,6 +170,14 @@ namespace vgww {
             /// proves an arm failure cannot crash the manager thread.
             void SetAcceptRearmProbeForTest(std::function<void()> probe) {
                 accept_rearm_probe_ = std::move(probe);
+            }
+
+            /// P147 P1-7/P1-8 telemetry: current number of live relays. The
+            /// map itself is manager-thread only, so the accept/erase paths
+            /// publish the size into an atomic (relay_count_) that any thread
+            /// may read.
+            size_t RelayCountForTest() const noexcept {
+                return relay_count_.load(std::memory_order_relaxed);
             }
 
             // ----- xtcp callbacks (worker threads, shard lock held) ----------
@@ -225,6 +244,18 @@ namespace vgww {
             struct Relay {
                 std::shared_ptr<asio::ip::tcp::socket> wan;
                 std::deque<core::PoolVector<uint8_t>> pending;  // lan -> wan
+                /// P147 P1-7: monotonic stamp of the last observed activity
+                /// (a WAN read that delivered bytes, or a LAN->WAN packet
+                /// accepted into `pending`). The idle sweep closes a relay whose
+                /// stamp has not moved for `idle_timeout_` seconds. Without it a
+                /// WAN peer that never sends FIN and a LAN service that never
+                /// closes pinned the relay - and its xtcp connection - alive for
+                /// the life of the process.
+                std::chrono::steady_clock::time_point last_io;
+                /// P147 P1-8: the "proto:wan_port" acceptor key this relay was
+                /// dialed for, so the per-rule cap can count siblings and a
+                /// removed rule can close its established connections.
+                std::string rule_key;
                 /// P1: bytes currently queued in `pending`. Kept incrementally
                 /// (emplace/pop paths only) so the bound check is O(1) rather
                 /// than summing the deque per packet.
@@ -249,6 +280,11 @@ namespace vgww {
             void PumpOne(uint64_t conn_id, Relay& relay);
             void ArmWanRead(uint64_t conn_id, Relay& relay);
             void CloseRelay(uint64_t conn_id, Relay& relay, bool graceful);
+            /// P147 P1-7: closes every relay whose last_io is older than
+            /// `idle_timeout_`. Manager thread only (relays_ is not shared).
+            void SweepIdleRelays();
+            /// P147 P1-8: number of live relays for one acceptor key.
+            size_t RelayCountForKey(const std::string& key) const;
 
             LanSender send_to_lan_;
             RelayTeardown teardown_;
@@ -315,6 +351,25 @@ namespace vgww {
             std::function<void()> accept_probe_;
             std::function<void()> loop_probe_;
             std::function<void()> accept_rearm_probe_;
+
+            /// P147 P1-7/P1-8: the effective accept-side bounds. Seeded from
+            /// `core::Config::portmap` in Start (dynamic configuration: a
+            /// config save restarts the manager, so a changed value takes
+            /// effect on the next Start). `idle_timeout_` of 0 disables the
+            /// sweep. Both caps are plain values written only by the manager
+            /// thread (Start runs before the thread is created) and read only
+            /// by it afterwards.
+            std::chrono::seconds idle_timeout_{300};
+            uint64_t max_relays_ = 4096;
+            uint64_t max_relays_per_rule_ = 1024;
+            /// RunLoop iterations between idle sweeps. The rule poll runs every
+            /// 20 iterations (~2 s at the 200 us pass sleep); the sweep shares
+            /// that cadence so a 5-minute threshold costs one map walk per
+            /// ~2 s at most.
+            static constexpr uint64_t kIdleSweepTicks = 20;
+            /// Published relay count (manager thread writes; the map itself is
+            /// thread-confined, so tests/UI cannot read relays_.size()).
+            std::atomic<size_t> relay_count_{0};
         };
 
     }  // namespace relay

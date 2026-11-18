@@ -519,6 +519,9 @@ namespace vgww {
                 /// even though nothing had been persisted. The command failure
                 /// broadcast releases the guard so a retry really posts again.
                 void OnCommandFailed() override;
+                /// P147 C-1: the confirmed-success counterpart of the arm done
+                /// in Save(). Stays silent for every unrelated success.
+                void OnCommandSucceeded(const CommandResult& result) override;
 
             private:
                 SettingsDraft ReadDraft() const;
@@ -626,6 +629,16 @@ namespace vgww {
                 TextInputElement* bridge_down_ = nullptr;
                 TextInputElement* bridge_table_size_ = nullptr;
                 SettingsDraft applied_;
+                /// P147 P2-7: `Save()` adopts the submitted draft as `applied_`
+                /// the moment the command is QUEUED, but the real save+apply is
+                /// asynchronous and can still fail. `save_pending_` marks that
+                /// adoption as unconfirmed and keeps what it replaced so a
+                /// failed apply can hand the operator's edits back instead of
+                /// leaving the form looking clean while the next tick mirrors
+                /// the rolled-back snapshot over them.
+                SettingsDraft pending_applied_;
+                SettingsDraft pending_draft_;
+                bool save_pending_ = false;
                 std::string config_path_;
                 bool initialized_ = false;
                 std::vector<std::pair<Str, Text*>> labels_;
@@ -1499,6 +1512,41 @@ void SettingsPage::RefreshDirty() {
                 // broadcast is exactly this moment: release the guard so the
                 // retry posts again.
                 save_guard_armed_ = false;
+                // P147 P2-7: the submit adopted the draft as the applied
+                // baseline before the async apply ran. Now that the command
+                // FAILED (the broadcast fires for every failed command) that
+                // adoption is a lie: ReadDraft() == applied_ makes the form look
+                // clean, so the next tick mirrors the rolled-back snapshot over
+                // the controls and the operator's edits are gone with no dirty
+                // badge. Put the pre-submit baseline back and re-fill the form
+                // with the draft the operator asked to save, so the edits stay
+                // on screen and a retry still resends them.
+                if (save_pending_) {
+                    save_pending_ = false;
+                    applied_ = pending_applied_;
+                    FillControls(pending_draft_);
+                    RefreshDirty();
+                }
+            }
+
+            void SettingsPage::OnCommandSucceeded(const CommandResult& result) {
+                // P147 C-1 (W11⑤): `save_pending_` was only ever cleared on the
+                // FAILURE path, so a SUCCESSFUL save left it armed forever and
+                // the next unrelated command failure (broadcast to every built
+                // page) restored the pre-save baseline and the save-time draft
+                // over values that had already been persisted. The adoption made
+                // in Save() is now confirmed - drop it.
+                //
+                // Gated on `result.save_config`: that flag is set by the
+                // executor for a NATIVE settings save (Save() is the only place
+                // that submits one with native_feedback=true, and
+                // `save_guard_armed_` keeps at most one such save in flight), so
+                // an unrelated success or a Web/first-run SaveConfigCmd (whose
+                // native_feedback is false, and which never armed the flag)
+                // leaves it untouched.
+                if (save_pending_ && result.save_config) {
+                    save_pending_ = false;
+                }
             }
 
             void SettingsPage::Update(const UiSnapshot& snapshot, I18n& i18n) {
@@ -1762,6 +1810,14 @@ void SettingsPage::RefreshDirty() {
                     save_guard_armed_ = false;
                     return false;
                 }
+                // P147 P2-7: remember both baselines the optimistic adoption is
+                // about to overwrite - the pre-submit `applied_` and the draft
+                // the operator actually asked to save. SubmitCommand only proves
+                // the command was QUEUED; if the async apply fails,
+                // OnCommandFailed restores these so the edits survive.
+                pending_applied_ = applied_;
+                pending_draft_ = draft;
+                save_pending_ = true;
                 applied_ = draft;
                 // batch269: the pending-clear flag is CONSUMED by this save.
                 // Leaving it set meant the next unrelated save wiped whatever

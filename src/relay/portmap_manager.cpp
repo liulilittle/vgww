@@ -63,6 +63,12 @@ namespace vgww {
             // A restart must rebuild the acceptors even when the rule set
             // did not change: Stop() dropped them all (batch312).
             have_applied_rules_ = false;
+            // P147 P1-7/P1-8: the accept-side bounds are dynamic configuration;
+            // they are read here so a saved `portmap` section takes effect on
+            // the next Start (the same restart that re-reads every other knob).
+            idle_timeout_ = std::chrono::seconds(config.portmap.idle_timeout_s);
+            max_relays_ = config.portmap.max_relays;
+            max_relays_per_rule_ = config.portmap.max_relays_per_rule;
             work_ = std::make_unique<WorkGuard>(io_.get_executor());
             running_.store(true);
             thread_ = std::thread([this] { RunLoop(); });
@@ -89,6 +95,7 @@ namespace vgww {
             }
             acceptors_.clear();
             relays_.clear();
+            relay_count_.store(0, std::memory_order_relaxed);
             last_relay_conn_id_.store(0, std::memory_order_relaxed);
             {
                 // Residual worker callbacks from the previous run must not
@@ -177,6 +184,13 @@ namespace vgww {
                     if (tick % 20 == 0) {
                         ApplyRules();
                     }
+                    // P147 P1-7: reclaim relays whose WAN peer never sent FIN
+                    // and whose LAN service never closed. Same cadence as the
+                    // rule poll; the pass is a single map walk, so an idle
+                    // manager pays one cheap scan every ~2 s, not a timer.
+                    if (tick % kIdleSweepTicks == 0) {
+                        SweepIdleRelays();
+                    }
                     ++tick;
 
                     // 2. Drain xtcp callbacks queued by workers.
@@ -248,6 +262,9 @@ namespace vgww {
                                 continue;
                             }
                             relay.pending_bytes += payload.size();
+                            // P147 P1-7: LAN->WAN traffic proves the relay is
+                            // alive in that direction too.
+                            relay.last_io = std::chrono::steady_clock::now();
                             const size_t depth = relay.pending_bytes;
                             relay.pending.emplace_back(std::move(payload));
                             uint64_t peak = peak_pending_bytes_.load(
@@ -439,6 +456,30 @@ namespace vgww {
                                         return;
                                     }
                                     if (auto live = weak.lock()) {
+                                        // P147 P1-8: the xtcp connection
+                                        // budget is shared with every normal
+                                        // outbound NAT flow, so an unbounded
+                                        // accept side turns one flooded WAN
+                                        // port into a whole-gateway outage.
+                                        // Refuse BEFORE dialing: checking after
+                                        // Connect would already have consumed
+                                        // a slot from that shared budget.
+                                        const std::string rule_key =
+                                            rule_copy.proto + ":" +
+                                            std::to_string(rule_copy.wan_port);
+                                        if (relays_.size() >= max_relays_) {
+                                            ++stats_.relay_cap_refused;
+                                            std::error_code ignored;
+                                            accepted->close(ignored);
+                                            return;
+                                        }
+                                        if (RelayCountForKey(rule_key) >=
+                                            max_relays_per_rule_) {
+                                            ++stats_.rule_cap_refused;
+                                            std::error_code ignored;
+                                            accepted->close(ignored);
+                                            return;
+                                        }
                                         // Dial the LAN client through the xtcp stack:
                                         // local = gateway virtual IP : ephemeral port.
                                         xtcp::core::Endpoint local{};
@@ -485,7 +526,18 @@ namespace vgww {
                                         if (0 != conn_id) {
                                             Relay relay;
                                             relay.wan = accepted;
+                                            // P147 P1-7/P1-8: the idle clock starts
+                                            // at acceptance (a peer that connects
+                                            // and then says nothing is exactly the
+                                            // case the sweep exists for), and the
+                                            // rule key lets the per-rule cap and
+                                            // the rule-removal path find siblings.
+                                            relay.last_io =
+                                                std::chrono::steady_clock::now();
+                                            relay.rule_key = rule_key;
                                             relays_[conn_id] = std::move(relay);
+                                            relay_count_.store(relays_.size(),
+                                                               std::memory_order_relaxed);
                                             last_relay_conn_id_.store(conn_id,
                                                                       std::memory_order_relaxed);
                                             ++stats_.accepted;
@@ -658,6 +710,11 @@ namespace vgww {
                             if (!socket->is_open()) return;
                             it->second.wan_read_armed = false;
                             it->second.wan_read_paused = false;
+                            // P147 P1-7: bytes actually arrived, so this relay
+                            // is alive. Without the stamp the idle sweep could
+                            // only measure "time since accepted" and would tear
+                            // down a long-lived, actively used connection.
+                            it->second.last_io = std::chrono::steady_clock::now();
                             ArmWanRead(conn_id, it->second);  // continuous read loop
                         });
                     if (!body_ok) {
@@ -703,6 +760,47 @@ namespace vgww {
                 teardown_(conn_id, graceful);
             }
             relays_.erase(conn_id);
+            relay_count_.store(relays_.size(), std::memory_order_relaxed);
+        }
+
+        size_t PortMapManager::RelayCountForKey(const std::string& key) const {
+            size_t count = 0;
+            for (const auto& kv : relays_) {
+                if (kv.second.rule_key == key) {
+                    ++count;
+                }
+            }
+            return count;
+        }
+
+        void PortMapManager::SweepIdleRelays() {
+            if (idle_timeout_.count() <= 0) {
+                return;   // 0 = sweep disabled by configuration
+            }
+            const auto now = std::chrono::steady_clock::now();
+            // Collect first: CloseRelay erases from relays_ (and the teardown
+            // hook may re-enter the manager maps indirectly via the data
+            // plane), so iterating while closing is not safe.
+            std::vector<std::pair<uint64_t, std::string>> victims;
+            for (const auto& kv : relays_) {
+                if (kv.second.closed) {
+                    continue;
+                }
+                if (now - kv.second.last_io > idle_timeout_) {
+                    victims.emplace_back(kv.first, kv.second.rule_key);
+                }
+            }
+            for (const auto& victim : victims) {
+                const auto it = relays_.find(victim.first);
+                if (relays_.end() == it) {
+                    continue;
+                }
+                // Graceful: an idle relay is being reclaimed, not aborted. A
+                // RST here would look to the LAN client like a spurious reset
+                // on a connection it still considers fine.
+                stats_.idle_reaped.fetch_add(1, std::memory_order_relaxed);
+                CloseRelay(victim.first, it->second, true);
+            }
         }
 
     }  // namespace relay

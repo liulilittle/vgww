@@ -1126,6 +1126,174 @@ static void TestH1WebConfigPreservesNativePrefs() {
     std::remove(rules.c_str());
 }
 
+// P147 P2-4: GET /api/config omitted web.enabled while Config::ToJsonString
+// persists it (config.cpp:2268) and POST /api/config replaces the WHOLE config.
+// The settings panel therefore loaded `web.enabled` as undefined, and every
+// unrelated save wrote the default `true` back over an operator's `false`,
+// silently re-enabling the management UI. GET must echo the live value.
+static void TestP147P24WebConfigEchosEnabled() {
+    using namespace vgww::core;
+    const std::string path = ScratchFile("p147p24-web-enabled.json");
+    const std::string rules = std::string(path) + ".rules.json";
+    std::remove(path.c_str());
+    std::remove((std::string(path) + ".tmp").c_str());
+    std::remove(rules.c_str());
+
+    Config cfg;
+    const uint16_t cfg_port = static_cast<uint16_t>(UniquePort());
+    cfg.adapter = "WebTestNICWebEnabled";
+    cfg.web.enabled = false;
+    cfg.web.bind = "127.0.0.1";
+    cfg.web.port = cfg_port;
+    cfg.web.token = "p147tok";
+    bool ok = false;
+    cfg.gateway.ipv4 = ParseIpv4("192.168.0.40", ok);
+    cfg.gateway.mask = ParseIpv4("255.255.255.0", ok);
+    MacAddress mac{};
+    ParseMac("30:fc:68:88:b4:a9", mac);
+    cfg.gateway.mac = mac;
+    std::string err;
+    CHECK(cfg.SaveToFile(path, err));
+
+    vgww::runtime::Dataplane dp(cfg);
+    HttpServer api;
+    vgww::web::RegisterApi(api, dp, cfg, path, "p147tok");
+    const uint16_t kPort = UniquePort();
+    std::string start_err;
+    CHECK(api.Start("127.0.0.1", kPort, start_err));
+
+    std::string body;
+    CHECK(HttpGet("/api/config", kPort, body) == 200);
+    // Scoped to the web object: a bare `"enabled":false` also matches
+    // dhcp/bridge/ipv6, so it must be anchored right after `"web":{`. This
+    // also pins the field order (enabled first in the section).
+    CHECK(body.find("\"web\":{\"enabled\":false") != std::string::npos);
+    const auto j = nlohmann::json::parse(body);
+    CHECK(!j.is_discarded());
+    CHECK(j.contains("web"));
+    const bool web_object = j.contains("web") && j["web"].is_object();
+    CHECK(web_object);
+    // const access only: operator[] on a missing const key is UB (it threw
+    // nlohmann::type_error and aborted the process in the red run).
+    const nlohmann::json web =
+        web_object ? j["web"] : nlohmann::json::object();
+    CHECK(web.contains("enabled"));
+    CHECK(web.contains("enabled") && web["enabled"].is_boolean());
+    CHECK(web.value("enabled", true) == false);
+    // The pre-existing web fields must survive the fix unchanged.
+    CHECK(web.value("port", 0) == static_cast<int>(cfg_port));
+    CHECK(web.value("bind", "") == "127.0.0.1");
+    // The auth token stays out of the unauthenticated GET.
+    CHECK(!web.contains("token"));
+
+    // Full-replacement save of the GET body (what saveSettings() does): the
+    // operator's `false` must survive the round-trip instead of reverting.
+    std::string resp;
+    CHECK(HttpPost(kPort, "/api/config", "p147tok", body, resp) == 200);
+    api.Stop();
+    std::string stop_err;
+    CHECK(dp.Stop(stop_err));
+
+    std::string load_err;
+    auto reloaded = Config::LoadFromFile(path, load_err);
+    CHECK(reloaded.has_value());
+    if (reloaded) {
+        CHECK(reloaded->web.enabled == false);
+        CHECK(reloaded->web.port == cfg_port);
+        CHECK(reloaded->web.bind == "127.0.0.1");
+    }
+    std::remove(path.c_str());
+    std::remove((std::string(path) + ".tmp").c_str());
+    std::remove(rules.c_str());
+}
+
+// P147 A-3 (W11-5 dual audit): GET /api/config echoed a `portmap` section
+// (max_relays / max_relays_per_rule / idle_timeout_s) that no test observed,
+// so deleting the whole echo block left the suite green. Config::ToJsonString
+// persists the same three keys (config.cpp:2281) and POST /api/config is a
+// full replacement, so a GET that omits the section silently resets an
+// operator's tuned accept-side bounds on the next Web save (same defect class
+// as P2-4 for web.enabled). The values below are deliberately NON-default
+// (defaults are 4096 / 1024 / 300) so a hard-coded echo cannot pass.
+static void TestP147A3PortmapConfigEchoed() {
+    using namespace vgww::core;
+    const std::string path = ScratchFile("p147a3-portmap-echo.json");
+    const std::string rules = std::string(path) + ".rules.json";
+    std::remove(path.c_str());
+    std::remove((std::string(path) + ".tmp").c_str());
+    std::remove(rules.c_str());
+
+    Config cfg;
+    const uint16_t cfg_port = static_cast<uint16_t>(UniquePort());
+    cfg.adapter = "WebTestNICPortmapEcho";
+    cfg.web.enabled = true;
+    cfg.web.bind = "127.0.0.1";
+    cfg.web.port = cfg_port;
+    cfg.web.token = "p147a3tok";
+    cfg.portmap.max_relays = 2048;
+    cfg.portmap.max_relays_per_rule = 512;
+    cfg.portmap.idle_timeout_s = 120;
+    bool ok = false;
+    cfg.gateway.ipv4 = ParseIpv4("192.168.0.41", ok);
+    cfg.gateway.mask = ParseIpv4("255.255.255.0", ok);
+    MacAddress mac{};
+    ParseMac("30:fc:68:88:b4:aa", mac);
+    cfg.gateway.mac = mac;
+    std::string err;
+    CHECK(cfg.SaveToFile(path, err));
+
+    vgww::runtime::Dataplane dp(cfg);
+    HttpServer api;
+    vgww::web::RegisterApi(api, dp, cfg, path, "p147a3tok");
+    const uint16_t kPort = UniquePort();
+    std::string start_err;
+    CHECK(api.Start("127.0.0.1", kPort, start_err));
+
+    std::string body;
+    CHECK(HttpGet("/api/config", kPort, body) == 200);
+    // Anchored on the full section prefix: a bare `"max_relays":2048` would
+    // also match a future top-level field, and the anchored form pins that
+    // the three keys live in one `portmap` object in this order.
+    CHECK(body.find("\"portmap\":{\"max_relays\":2048") !=
+          std::string::npos);
+    CHECK(body.find(",\"max_relays_per_rule\":512") != std::string::npos);
+    CHECK(body.find(",\"idle_timeout_s\":120") != std::string::npos);
+    const auto j = nlohmann::json::parse(body);
+    CHECK(!j.is_discarded());
+    CHECK(j.contains("portmap"));
+    const bool portmap_object = j.contains("portmap") && j["portmap"].is_object();
+    CHECK(portmap_object);
+    const nlohmann::json pm =
+        portmap_object ? j["portmap"] : nlohmann::json::object();
+    CHECK(pm.contains("max_relays"));
+    CHECK(pm.contains("max_relays_per_rule"));
+    CHECK(pm.contains("idle_timeout_s"));
+    CHECK(pm.value("max_relays", 0u) == 2048u);
+    CHECK(pm.value("max_relays_per_rule", 0u) == 512u);
+    CHECK(pm.value("idle_timeout_s", 0u) == 120u);
+
+    // Full-replacement save of the GET body (what saveSettings() does): the
+    // tuned bounds must survive the round-trip instead of reverting to the
+    // 4096/1024/300 defaults.
+    std::string resp;
+    CHECK(HttpPost(kPort, "/api/config", "p147a3tok", body, resp) == 200);
+    api.Stop();
+    std::string stop_err;
+    CHECK(dp.Stop(stop_err));
+
+    std::string load_err;
+    auto reloaded = Config::LoadFromFile(path, load_err);
+    CHECK(reloaded.has_value());
+    if (reloaded) {
+        CHECK(reloaded->portmap.max_relays == 2048u);
+        CHECK(reloaded->portmap.max_relays_per_rule == 512u);
+        CHECK(reloaded->portmap.idle_timeout_s == 120u);
+    }
+    std::remove(path.c_str());
+    std::remove((std::string(path) + ".tmp").c_str());
+    std::remove(rules.c_str());
+}
+
 // batch37t (user: settings must apply immediately): POST /api/config must
 // hand the parsed config to the applier and answer "applied" when accepted.
 static void TestB37tWebConfigAppliesLive() {
@@ -10856,6 +11024,8 @@ int main(int argc, char** argv) {
     TestStatusIncludesBridge();
     TestApiWholeBodyJson();
     TestH1WebConfigPreservesNativePrefs();
+    TestP147P24WebConfigEchosEnabled();
+    TestP147A3PortmapConfigEchoed();
     TestB37tWebConfigAppliesLive();
     TestB38WebApplyStatus();
     TestB111ApplyStatusIgnoresStaleCompletion();

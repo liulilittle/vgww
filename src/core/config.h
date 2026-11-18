@@ -138,6 +138,28 @@ namespace vgww {
             uint32_t mac_table_size = limits::kDefaultMacTableSize;
         };
 
+        /// P147 P1-7/P1-8: bounds for the port-forwarding engine's WAN side.
+        /// Kept separate from PerfConfig because these limit the ACCEPT side
+        /// (memory and xtcp connection budget), not the datapath throughput
+        /// knobs the perf section names.
+        struct PortmapConfig {
+            /// P1-8: hard cap on concurrent relays. xtcp's `max_conns` is a
+            /// GLOBAL budget shared with ordinary outbound NAT flows (one
+            /// counter, third_party/xtcp/src/core/stack.cpp Connect), so an
+            /// unbounded accept side let a WAN SYN flood starve every normal
+            /// flow. Default matches perf.max_conns' default.
+            uint32_t max_relays = 4096;
+            /// P1-8: per-rule cap so a single flooded WAN port cannot consume
+            /// the whole budget by itself. Must not exceed max_relays.
+            uint32_t max_relays_per_rule = 1024;
+            /// P1-7: idle timeout for a relay, in seconds. A WAN peer that
+            /// never sends FIN and a LAN service that never closes leaves the
+            /// relay (and its xtcp connection) alive forever; the manager
+            /// closes such a relay gracefully after this much silence.
+            /// 0 disables the sweep.
+            uint32_t idle_timeout_s = 300;
+        };
+
         /// Deployment mode (S2): gates the address-assignment services
         /// (DHCPv4/DHCPv6/RA). `bypass` (default) keeps today's behavior -
         /// clients point at VGWW manually, no address services run. `main`
@@ -238,6 +260,7 @@ namespace vgww {
             WebConfig web;
             VlanConfig vlan;
             BridgeConfig bridge;
+            PortmapConfig portmap;
             Mode mode = Mode::kBypass;     ///< bypass unless "mode":"main"
 
             /// Parses a configuration file. Returns nullopt and fills

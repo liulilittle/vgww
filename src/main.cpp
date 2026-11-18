@@ -859,7 +859,14 @@ namespace {
                 // settings.
                 std::string rollback_text = why;
                 std::string file_error;
-                if (!previous.SaveToFile(config_path, file_error)) {
+                // P147 P1-6: `previous` predates any binding route (this
+                // snapshot is taken before apply starts), and those routes
+                // persist their rows to the file WITHOUT writing back *config.
+                // A whole-document save here therefore erased every binding
+                // added since the snapshot. Merge the disk-only rows back, the
+                // same way DoSaveConfig's own save does (config.cpp:2595).
+                if (!previous.SaveToFilePreservingBindings(config_path,
+                                                           file_error)) {
                     rollback_text +=
                         " (config rollback failed: " + file_error + ")";
                 }

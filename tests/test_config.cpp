@@ -2891,6 +2891,70 @@ void TestB34lFractionalIntegerRejected() {
     }
 }
 
+// P147 P1-7/P1-8: the portmap section carries the accept-side bounds. Defaults
+// must be usable without the section, every field must round-trip, and values
+// that cannot work (per-rule cap above the total cap, an out-of-range idle
+// timeout) must be refused rather than silently clamped.
+void TestP147PortmapSection() {
+    // (1) Absent section => documented defaults.
+    {
+        const auto r = LoadFromText(ScratchFile("test_cfg_p147_portmap.json"),
+                                    Skeleton(""));
+        CHECK(r.wrote);
+        CHECK(r.config.has_value());
+        if (r.config) {
+            CHECK(4096 == r.config->portmap.max_relays);
+            CHECK(1024 == r.config->portmap.max_relays_per_rule);
+            CHECK(300 == r.config->portmap.idle_timeout_s);
+        }
+    }
+    // (2) ToJsonString -> LoadFromFile round-trip.
+    {
+        vgww::core::Config c = MakeFullConfig();
+        c.portmap.max_relays = 64;
+        c.portmap.max_relays_per_rule = 16;
+        c.portmap.idle_timeout_s = 45;
+        const std::string path = ScratchFile("test_cfg_p147_portmap_rt.json");
+        CHECK(WriteFile(path, c.ToJsonString()));
+        std::string error;
+        const auto loaded = Config::LoadFromFile(path, error);
+        std::remove(path.c_str());
+        CHECK(loaded.has_value());
+        if (loaded) {
+            CHECK(64 == loaded->portmap.max_relays);
+            CHECK(16 == loaded->portmap.max_relays_per_rule);
+            CHECK(45 == loaded->portmap.idle_timeout_s);
+        }
+    }
+    // (3) Rejections: per-rule above total, zero caps, out-of-range timeout,
+    //     a non-object section, and a fractional value.
+    const auto reject = [](const std::string& section) {
+        const auto r = LoadFromText(ScratchFile("test_cfg_p147_portmap_bad.json"),
+                                    Skeleton(section));
+        CHECK(r.wrote);
+        CHECK(!r.config.has_value());
+        CHECK(!r.error.empty());
+    };
+    reject(R"("portmap":{"max_relays":8,"max_relays_per_rule":9})");
+    reject(R"("portmap":{"max_relays":0})");
+    reject(R"("portmap":{"max_relays_per_rule":0})");
+    reject(R"("portmap":{"max_relays":1048577})");
+    reject(R"("portmap":{"idle_timeout_s":315360001})");
+    reject(R"("portmap":[])");
+    reject(R"("portmap":{"idle_timeout_s":30.5})");
+    // (4) idle_timeout_s = 0 is legal (sweep disabled), not an error.
+    {
+        const auto r = LoadFromText(ScratchFile("test_cfg_p147_portmap_off.json"),
+                                    Skeleton(R"("portmap":{"idle_timeout_s":0})"));
+        CHECK(r.wrote);
+        CHECK(r.config.has_value());
+        if (r.config) {
+            CHECK(0 == r.config->portmap.idle_timeout_s);
+        }
+    }
+    std::fprintf(stderr, "[config] P147 portmap section ok\n");
+}
+
 // A JSON boolean is not a number and must not be accepted as one.
 void TestB34lBooleanAsIntegerRejected() {
     const auto r =
@@ -3318,6 +3382,7 @@ int main() {
     TestB34mDhcpDnsMustBeUsable();
     TestB34mRxBatchMustFitRing();
     TestB84WebBindBounds();
+    TestP147PortmapSection();
     if (0 == g_failures) {
         std::puts("test_config: ALL PASS");
         return 0;

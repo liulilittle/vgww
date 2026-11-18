@@ -1750,6 +1750,336 @@ void TestB312ApplyRulesIsChangeDriven() {
         vgww::web::RuleStore::Instance().RemovePortMap(0);
     }
 
+    /// P147 P1-7: a WAN peer that never sends FIN and a LAN service that never
+    /// closes used to pin the relay (and its xtcp connection) for the life of
+    /// the process - ArmWanRead only ever ended on `err || 0 == n`, and Relay
+    /// had no timestamp at all. The idle sweep must reclaim such a relay, and
+    /// it must do so GRACEFULLY (a RST would look like a spurious reset to a
+    /// client that still considers the connection fine).
+    void TestP147IdleSweepClosesSilentRelay() {
+        xtcp::buf::InitPools();
+        NullBackend backend;
+        xtcp::XtcpStack stack(&backend);
+        stack.SetMaxConnections(16);
+
+        vgww::core::Config config;
+        config.gateway.ipv4 = kGatewayIp;
+        config.gateway.mask = (0u) | (0u << 8) | (255u << 16) | (255u << 24);
+        config.gateway.mac = {0x30, 0xFC, 0x68, 0x88, 0xB4, 0xA9};
+        // Short idle threshold: the production default is 300 s.
+        config.portmap.idle_timeout_s = 2;
+
+        const uint16_t wan_port = ProbeFreePort();
+        CHECK(0 != wan_port);
+        auto& store = vgww::web::RuleStore::Instance();
+        store.Clear();
+        store.AddPortMap({"tcp", wan_port, "127.0.0.1", 45678});
+
+        auto& manager = vgww::relay::PortMapManager::Instance();
+        manager.Stop();
+        const auto send_to_lan = [](uint64_t, const uint8_t*, uint32_t) {
+            return true;
+        };
+        std::atomic<int> graceful{0};
+        std::atomic<int> resets{0};
+        const auto teardown = [&graceful, &resets](uint64_t, bool g) {
+            if (g) graceful.fetch_add(1);
+            else resets.fetch_add(1);
+        };
+        const uint64_t reaped_before = manager.GetStats().idle_reaped.load();
+        manager.Start(&stack, config, send_to_lan, teardown);
+        CHECK(WaitFor([&] { return manager.LiveAcceptLoops() >= 1; }, 3000));
+
+        asio::io_context io;
+        asio::ip::tcp::socket client(io);
+        std::error_code ec;
+        client.connect(asio::ip::tcp::endpoint(
+                           asio::ip::make_address("127.0.0.1"), wan_port),
+                       ec);
+        CHECK(!ec);
+        CHECK(WaitFor([&] { return 0 != manager.LastRelayConnId(); }, 5000));
+        const uint64_t conn_id = manager.LastRelayConnId();
+        manager.OnStackState(conn_id, 4);   // established, then total silence
+        CHECK(WaitFor([&] { return manager.RelayCountForTest() >= 1; }, 5000));
+
+        // The relay is silent: it must be reaped within a small multiple of
+        // the threshold (sweep cadence is every 20 RunLoop passes).
+        const bool reaped = WaitFor([&] {
+            return manager.GetStats().idle_reaped.load() >= reaped_before + 1 &&
+                   manager.RelayCountForTest() == 0;
+        }, 20000);
+        std::printf("P147 idle sweep: reaped=%llu live=%zu graceful=%d "
+                    "resets=%d\n",
+                    static_cast<unsigned long long>(
+                        manager.GetStats().idle_reaped.load() - reaped_before),
+                    manager.RelayCountForTest(), graceful.load(),
+                    resets.load());
+        CHECK(reaped);
+        CHECK(1 == graceful.load());   // graceful, not a RST
+        CHECK(0 == resets.load());
+
+        // The WAN peer must observe the close (it was a real socket).
+        client.non_blocking(true, ec);
+        bool saw_end = false;
+        const auto deadline =
+            std::chrono::steady_clock::now() + std::chrono::seconds(5);
+        while (!saw_end && std::chrono::steady_clock::now() < deadline) {
+            std::array<uint8_t, 256> buf{};
+            std::error_code e;
+            const size_t n = client.read_some(asio::buffer(buf), e);
+            if (0 == n || e == asio::error::eof ||
+                e == asio::error::connection_reset) {
+                saw_end = true;
+            } else if (e && e != asio::error::would_block &&
+                       e != asio::error::try_again) {
+                saw_end = true;
+            } else {
+                std::this_thread::sleep_for(std::chrono::milliseconds(20));
+            }
+        }
+        CHECK(saw_end);
+        client.close(ec);
+
+        manager.Stop();
+        store.Clear();
+    }
+
+    /// P147 P1-7 (the other half): the sweep must NOT reap a relay that is
+    /// actively carrying traffic. The stamp is refreshed by a WAN read that
+    /// delivered bytes, so a connection used more often than the threshold
+    /// must survive arbitrarily long.
+    void TestP147IdleSweepKeepsActiveRelay() {
+        xtcp::buf::InitPools();
+        NullBackend backend;
+        xtcp::XtcpStack stack(&backend);
+        stack.SetMaxConnections(16);
+
+        vgww::core::Config config;
+        config.gateway.ipv4 = kGatewayIp;
+        config.gateway.mask = (0u) | (0u << 8) | (255u << 16) | (255u << 24);
+        config.gateway.mac = {0x30, 0xFC, 0x68, 0x88, 0xB4, 0xA9};
+        config.portmap.idle_timeout_s = 2;
+
+        const uint16_t wan_port = ProbeFreePort();
+        CHECK(0 != wan_port);
+        auto& store = vgww::web::RuleStore::Instance();
+        store.Clear();
+        store.AddPortMap({"tcp", wan_port, "127.0.0.1", 45678});
+
+        auto& manager = vgww::relay::PortMapManager::Instance();
+        manager.Stop();
+        std::atomic<uint64_t> lan_bytes{0};
+        auto send_to_lan = [&lan_bytes](uint64_t, const uint8_t*, uint32_t len) {
+            lan_bytes.fetch_add(len, std::memory_order_relaxed);
+            return true;
+        };
+        const auto teardown = [](uint64_t, bool) {};
+        const uint64_t reaped_before = manager.GetStats().idle_reaped.load();
+        manager.Start(&stack, config, send_to_lan, teardown);
+        CHECK(WaitFor([&] { return manager.LiveAcceptLoops() >= 1; }, 3000));
+
+        asio::io_context io;
+        asio::ip::tcp::socket client(io);
+        std::error_code ec;
+        client.connect(asio::ip::tcp::endpoint(
+                           asio::ip::make_address("127.0.0.1"), wan_port),
+                       ec);
+        CHECK(!ec);
+        CHECK(WaitFor([&] { return 0 != manager.LastRelayConnId(); }, 5000));
+        const uint64_t conn_id = manager.LastRelayConnId();
+        manager.OnStackState(conn_id, 4);
+        CHECK(WaitFor([&] { return manager.RelayCountForTest() >= 1; }, 5000));
+
+        // Keep the WAN->LAN direction busy for ~2.5 thresholds.
+        const auto until =
+            std::chrono::steady_clock::now() + std::chrono::seconds(5);
+        while (std::chrono::steady_clock::now() < until) {
+            const char ping[] = "keepalive";
+            std::error_code we;
+            asio::write(client, asio::buffer(ping, sizeof(ping) - 1), we);
+            if (we) break;
+            std::this_thread::sleep_for(std::chrono::milliseconds(300));
+        }
+        std::printf("P147 idle keeps active: reaped_delta=%llu live=%zu "
+                    "lan_bytes=%llu\n",
+                    static_cast<unsigned long long>(
+                        manager.GetStats().idle_reaped.load() - reaped_before),
+                    manager.RelayCountForTest(),
+                    static_cast<unsigned long long>(lan_bytes.load()));
+        CHECK(0 == manager.GetStats().idle_reaped.load() - reaped_before);
+        CHECK(1 == manager.RelayCountForTest());
+        CHECK(lan_bytes.load() > 0);   // the traffic really reached the LAN hook
+        client.close(ec);
+
+        manager.Stop();
+        store.Clear();
+    }
+
+    /// P147 P1-8: `relays_` had NO cap of its own; the only backstop was
+    /// xtcp's GLOBAL max_conns counter, which portmap shares with every
+    /// normal outbound NAT flow. One flooded WAN port could therefore starve
+    /// the whole gateway. The accept path must refuse (and count) new relays
+    /// once the total cap is reached - before dialing, so no xtcp slot is
+    /// consumed.
+    void TestP147RelayCapRefusesFlood() {
+        xtcp::buf::InitPools();
+        NullBackend backend;
+        xtcp::XtcpStack stack(&backend);
+        stack.SetMaxConnections(16);
+
+        vgww::core::Config config;
+        config.gateway.ipv4 = kGatewayIp;
+        config.gateway.mask = (0u) | (0u << 8) | (255u << 16) | (255u << 24);
+        config.gateway.mac = {0x30, 0xFC, 0x68, 0x88, 0xB4, 0xA9};
+        config.portmap.max_relays = 2;
+        config.portmap.max_relays_per_rule = 2;   // per-rule cap out of the way
+        config.portmap.idle_timeout_s = 0;        // no sweep during the flood
+
+        const uint16_t wan_port = ProbeFreePort();
+        CHECK(0 != wan_port);
+        auto& store = vgww::web::RuleStore::Instance();
+        store.Clear();
+        store.AddPortMap({"tcp", wan_port, "127.0.0.1", 45678});
+
+        auto& manager = vgww::relay::PortMapManager::Instance();
+        manager.Stop();
+        const auto send_to_lan = [](uint64_t, const uint8_t*, uint32_t) {
+            return true;
+        };
+        const auto teardown = [](uint64_t, bool) {};
+        manager.Start(&stack, config, send_to_lan, teardown);
+        CHECK(WaitFor([&] { return manager.LiveAcceptLoops() >= 1; }, 3000));
+
+        const uint64_t accepted_before = manager.GetStats().accepted.load();
+        const uint64_t refused_before =
+            manager.GetStats().relay_cap_refused.load();
+        // Declaration order matters: locals die in REVERSE order, so the
+        // io_context must be declared FIRST to outlive every socket below.
+        // (Destroying the io_context before a socket makes ~socket() touch
+        // freed win_iocp service state - a heap-use-after-free.)
+        asio::io_context io;
+        std::vector<std::unique_ptr<asio::ip::tcp::socket>> clients;
+        for (int i = 0; i < 5; ++i) {
+            auto sock = std::make_unique<asio::ip::tcp::socket>(io);
+            std::error_code ec;
+            sock->connect(asio::ip::tcp::endpoint(
+                              asio::ip::make_address("127.0.0.1"), wan_port),
+                          ec);
+            if (!ec) {
+                clients.push_back(std::move(sock));
+            }
+            std::this_thread::sleep_for(std::chrono::milliseconds(120));
+        }
+        CHECK(WaitFor([&] {
+            return manager.GetStats().relay_cap_refused.load() >
+                   refused_before;
+        }, 8000));
+        std::printf("P147 relay cap: accepted_delta=%llu refused_delta=%llu "
+                    "live=%zu cap=%u\n",
+                    static_cast<unsigned long long>(
+                        manager.GetStats().accepted.load() - accepted_before),
+                    static_cast<unsigned long long>(
+                        manager.GetStats().relay_cap_refused.load() -
+                        refused_before),
+                    manager.RelayCountForTest(),
+                    static_cast<unsigned>(config.portmap.max_relays));
+        // Exactly the cap was admitted; every extra connection was refused.
+        CHECK(2 == manager.GetStats().accepted.load() - accepted_before);
+        CHECK(manager.GetStats().relay_cap_refused.load() - refused_before >= 1);
+        CHECK(manager.RelayCountForTest() <= 2);
+
+        for (auto& sock : clients) {
+            std::error_code ec;
+            sock->close(ec);
+        }
+        manager.Stop();
+        store.Clear();
+    }
+
+    /// P147 P1-8 per-rule half: one flooded WAN port must not be able to fill
+    /// the TOTAL budget by itself, so the per-rule cap is enforced first and
+    /// other rules keep working (the "noisy neighbour" stays contained).
+    void TestP147PerRuleCapIsolatesOnePort() {
+        xtcp::buf::InitPools();
+        NullBackend backend;
+        xtcp::XtcpStack stack(&backend);
+        stack.SetMaxConnections(16);
+
+        vgww::core::Config config;
+        config.gateway.ipv4 = kGatewayIp;
+        config.gateway.mask = (0u) | (0u << 8) | (255u << 16) | (255u << 24);
+        config.gateway.mac = {0x30, 0xFC, 0x68, 0x88, 0xB4, 0xA9};
+        config.portmap.max_relays = 8;
+        config.portmap.max_relays_per_rule = 1;
+        config.portmap.idle_timeout_s = 0;
+
+        const uint16_t port_a = ProbeFreePort();
+        const uint16_t port_b = ProbeFreePort();
+        CHECK(0 != port_a);
+        CHECK(0 != port_b);
+        CHECK(port_a != port_b);
+        auto& store = vgww::web::RuleStore::Instance();
+        store.Clear();
+        store.AddPortMap({"tcp", port_a, "127.0.0.1", 45678});
+        store.AddPortMap({"tcp", port_b, "127.0.0.1", 45678});
+
+        auto& manager = vgww::relay::PortMapManager::Instance();
+        manager.Stop();
+        const auto send_to_lan = [](uint64_t, const uint8_t*, uint32_t) {
+            return true;
+        };
+        const auto teardown = [](uint64_t, bool) {};
+        manager.Start(&stack, config, send_to_lan, teardown);
+        CHECK(WaitFor([&] { return manager.LiveAcceptLoops() >= 2; }, 5000));
+
+        const uint64_t accepted_before = manager.GetStats().accepted.load();
+        const uint64_t rule_refused_before =
+            manager.GetStats().rule_cap_refused.load();
+        asio::io_context io;
+        auto dial = [&io](uint16_t port) {
+            auto sock = std::make_unique<asio::ip::tcp::socket>(io);
+            std::error_code ec;
+            sock->connect(asio::ip::tcp::endpoint(
+                              asio::ip::make_address("127.0.0.1"), port),
+                          ec);
+            return ec ? nullptr : std::move(sock);
+        };
+        auto a1 = dial(port_a);
+        CHECK(nullptr != a1);
+        CHECK(WaitFor([&] {
+            return manager.GetStats().accepted.load() >= accepted_before + 1;
+        }, 5000));
+        auto a2 = dial(port_a);   // same rule, over its per-rule cap
+        CHECK(nullptr != a2);
+        CHECK(WaitFor([&] {
+            return manager.GetStats().rule_cap_refused.load() >
+                   rule_refused_before;
+        }, 8000));
+        auto b1 = dial(port_b);   // a DIFFERENT rule must still be admitted
+        CHECK(nullptr != b1);
+        CHECK(WaitFor([&] {
+            return manager.GetStats().accepted.load() >= accepted_before + 2;
+        }, 8000));
+        std::printf("P147 per-rule cap: accepted_delta=%llu rule_refused=%llu "
+                    "live=%zu\n",
+                    static_cast<unsigned long long>(
+                        manager.GetStats().accepted.load() - accepted_before),
+                    static_cast<unsigned long long>(
+                        manager.GetStats().rule_cap_refused.load() -
+                        rule_refused_before),
+                    manager.RelayCountForTest());
+        CHECK(2 == manager.GetStats().accepted.load() - accepted_before);
+        CHECK(manager.GetStats().rule_cap_refused.load() - rule_refused_before >=
+              1);
+
+        std::error_code ec;
+        if (a1) a1->close(ec);
+        if (a2) a2->close(ec);
+        if (b1) b1->close(ec);
+        manager.Stop();
+        store.Clear();
+    }
+
 }  // namespace
 
 int main() {
@@ -1772,6 +2102,10 @@ int main() {
     TestW11CloseWaitDoesNotShutdownDuringInFlightWrite();
     TestW11WanResetIsNotGraceful();
     TestW11StateQueueIsDeduplicatedAndBounded();
+    TestP147IdleSweepClosesSilentRelay();
+    TestP147IdleSweepKeepsActiveRelay();
+    TestP147RelayCapRefusesFlood();
+    TestP147PerRuleCapIsolatesOnePort();
     TestB312ApplyRulesIsChangeDriven();   // last: it fails one bind on purpose
 
     if (0 == g_failures) {

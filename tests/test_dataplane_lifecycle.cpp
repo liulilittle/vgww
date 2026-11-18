@@ -21,6 +21,7 @@
 #include "relay/portmap_manager.h"
 #include "ui/controller.h"
 
+#include <atomic>
 #include <chrono>
 #include <condition_variable>
 #include <cstdint>
@@ -982,6 +983,43 @@ namespace {
         std::remove(lease_path.c_str());
     }
 
+    /// P147 P2-1: a second Stop() with nothing left to persist (dhcp_/dhcp6_
+    /// were already reset by the first stop) must NOT overwrite the sticky
+    /// verdict the first stop produced. Only an actual persist attempt may
+    /// change the flag.
+    void TestP147P21StickyPersistSurvivesSecondStop() {
+        const vgww::core::Config config = MakeDhcpMainConfig();
+        const std::string lease_path = ScratchFile("p147p21-second-stop.json");
+        std::remove(lease_path.c_str());
+        vgww::runtime::Dataplane dataplane(config, lease_path);
+        dataplane.SetDriverClient(std::make_unique<FakeDriverClient>());
+        std::string error;
+        CHECK(dataplane.Start(error));
+        CHECK(dataplane.DhcpActive());
+        {
+            std::ofstream out(lease_path);
+            out << "{\"version\":1,\"leases\":[]}";
+        }
+        // No FILE_SHARE_DELETE: the atomic replace must fail at Stop.
+        const HANDLE held = ::CreateFileA(
+            lease_path.c_str(), GENERIC_READ,
+            FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr, OPEN_EXISTING,
+            FILE_ATTRIBUTE_NORMAL, nullptr);
+        CHECK(INVALID_HANDLE_VALUE != held);
+        std::string stop_error;
+        CHECK(dataplane.Stop(stop_error));  // teardown fine, dump failed
+        CHECK(!stop_error.empty());
+        CHECK(dataplane.StopPersistFailed());
+        ::CloseHandle(held);
+
+        // Second stop without a restart: the servers are already gone, so no
+        // persist is attempted. The first verdict must survive.
+        std::string stop2_error;
+        CHECK(dataplane.Stop(stop2_error));
+        CHECK(dataplane.StopPersistFailed());
+        std::remove(lease_path.c_str());
+    }
+
     /// batch100: teardown succeeded but the lease document could not be
     /// written -> Stop() still returns true (the plane stopped), yet the loss
     /// must be observable: non-empty error text plus a sticky flag that
@@ -1268,6 +1306,338 @@ namespace {
         CHECK(dataplane.Stop(re_stop));
     }
 
+    /// P147 P1-3/P1-4/P1-5: the facade readers run on web/UI threads while a
+    /// concurrent StopAll resets `dhcp_`/`dhcp6_` and clears `udp_tables`.
+    /// Without a lifecycle lock the null check and the dereference straddle a
+    /// free (TOCTOU). The test keeps several readers hammering the facade
+    /// while a writer cycles Stop/Start, and asserts every post-Stop read is a
+    /// synchronised "no server" answer rather than freed memory.
+    ///
+    /// Anti-vacuity: the writer counts successful Stop calls whose immediate
+    /// post-reset probe observed DhcpActive()==false, and the reader counts
+    /// its completed batches; both must be non-zero or the test only proved
+    /// that nothing ran.
+    void TestP13ConcurrentFacadeVsLifecycle() {
+        vgww::core::Config config = MakeDhcpMainConfig();
+        // Both servers assembled: the v4 and v6 accessors share ONE lifecycle
+        // lock, so the test must exercise both or half the lock domain is
+        // never touched.
+        config.ipv6 = MakeDhcp6MainConfig().ipv6;
+        const std::string lease_path = ScratchFile("p147-concurrency-leases.json");
+        std::remove(lease_path.c_str());
+        std::remove((lease_path + ".leases6").c_str());
+
+        vgww::runtime::Dataplane dataplane(config, lease_path);
+        dataplane.SetDriverClient(std::make_unique<FakeDriverClient>());
+        // Keep the control thread's periodic lease dump out of the way: it
+        // writes the same files the Stop path dumps, and a disk-warm cache is
+        // not what this test measures.
+        dataplane.SetLeaseDumpIntervalForTest(std::chrono::hours(24));
+
+        std::string start_error;
+        CHECK(dataplane.Start(start_error));
+        CHECK(dataplane.DhcpActive());
+        CHECK(dataplane.Dhcp6Active());
+
+        // Load the facade with real rows: an EMPTY lease table makes
+        // GetLeases() finish inside the same scheduler slice as the null
+        // check, so a Stop that frees the server right after can never
+        // overlap the in-flight call and a missing facade lock stays
+        // invisible (the first version of this test proved exactly that -
+        // removing the lock from DhcpLeaseCount did not turn it red). With
+        // 16 bindings every GetLeases() formats 32 strings and copies two
+        // vectors while holding the pointer, which is the window an unlocked
+        // reader actually needs to fault.
+        for (int i = 0; i < 16; ++i) {
+            char mac[32] = {0};
+            char ip[32] = {0};
+            std::snprintf(mac, sizeof(mac), "02:00:00:00:01:%02X", i + 1);
+            std::snprintf(ip, sizeof(ip), "192.168.40.%d", 20 + i);
+            CHECK(dataplane.ReplaceDhcpBinding(std::string(), mac, ip, "p13"));
+        }
+
+        std::atomic<bool> stop_flag{false};
+        std::atomic<uint64_t> reader_batches{0};
+        std::atomic<uint64_t> writer_cycles{0};
+        std::atomic<bool> reader_state_bad{false};
+        std::vector<std::thread> readers;
+        for (int t = 0; t < 4; ++t) {
+            readers.emplace_back([&dataplane, &stop_flag, &reader_batches,
+                                  &reader_state_bad] {
+                uint64_t local = 0;
+                while (!stop_flag.load(std::memory_order_relaxed)) {
+                    for (int i = 0; i < 1000; ++i) {
+                        (void)dataplane.DhcpLeaseCount();
+                        (void)dataplane.Dhcp6LeaseCount();
+                        (void)dataplane.DhcpActive();
+                        (void)dataplane.Dhcp6Active();
+                        (void)dataplane.UdpFlowEvictions();
+                        // P147 C-2 (W11-5 dual audit): GetLifecycleCounts()
+                        // is NOT a concurrent surface. dataplane.h:167-170
+                        // documents it as "call only when no Start()/Stop() is
+                        // in flight": rx_rings/tx_rings/icmp_relays/
+                        // relay_registry_/workers are read without any lock
+                        // while ReleaseDataplaneContainers() (dataplane.cpp:
+                        // 1349-1377) clears them outside dhcp_lifecycle_mu_.
+                        // Calling it from these readers was a contract
+                        // violation (real UB), not a coverage gain - the
+                        // quiescent probe below now covers it instead.
+                        if (!dataplane.GetLeases().empty() &&
+                            !dataplane.DhcpActive()) {
+                            reader_state_bad.store(true,
+                                                    std::memory_order_relaxed);
+                        }
+                        // Row-bearing v6/v4 accessors: the formatting loop is
+                        // the long window an unlocked reader needs.
+                        (void)dataplane.GetDhcpBindings();
+                        (void)dataplane.GetDhcp6Bindings();
+                        (void)dataplane.Dhcp6BindingCount();
+                        (void)dataplane.DhcpLeaseFileCorrupt();
+                        (void)dataplane.Dhcp6LeaseFileCorrupt();
+                        (void)dataplane.DhcpPoolExhaustedCount();
+                        (void)dataplane.Dhcp6PoolExhaustedCount();
+                        (void)dataplane.DhcpRateLimitResets();
+                        (void)dataplane.Dhcp6RateLimitResets();
+                    }
+                    ++local;
+                }
+                reader_batches.store(local + 1, std::memory_order_relaxed);
+            });
+        }
+
+        for (int cycle = 0; cycle < 100; ++cycle) {
+            std::string stop_error;
+            const bool stopped = dataplane.Stop(stop_error);
+            CHECK(stopped);
+            if (!stopped) {
+                break;
+            }
+            // DWELL: hold the plane stopped while the readers keep hammering.
+            // Without this the very next Start() re-allocates the block Stop
+            // just freed at the SAME address, so an unlocked reader reads valid
+            // memory and the UAF stays invisible (measured: removing the facade
+            // lock kept the test green before this window existed). With it,
+            // freed server memory stays deallocated for the whole window.
+            std::this_thread::sleep_for(std::chrono::milliseconds(3));
+            // Reading the row-bearing facade while the plane is down is the
+            // window under test: `dhcp_` is gone, so an unlocked reader reads
+            // freed memory while a locked one reports "no server".
+            CHECK(!dataplane.DhcpActive());
+            CHECK(!dataplane.Dhcp6Active());
+            CHECK(0 == dataplane.DhcpLeaseCount());
+            CHECK(0 == dataplane.Dhcp6LeaseCount());
+            CHECK(0 == dataplane.UdpFlowEvictions());
+            // P147 C-2: the lifecycle probe belongs HERE and nowhere else -
+            // Stop() has returned, so the single-threaded lifecycle owner is
+            // quiescent and the unlocked container reads are per contract
+            // (dataplane.h:167-170). A clean Stop must reset every container
+            // to zero before the next Start.
+            const auto quiescent_counts = dataplane.GetLifecycleCounts();
+            CHECK(quiescent_counts.udp_tables == 0);
+            CHECK(quiescent_counts.rx_rings == 0);
+            CHECK(quiescent_counts.tx_rings == 0);
+            CHECK(quiescent_counts.icmp_relays == 0);
+            CHECK(quiescent_counts.relay_registry == 0);
+            CHECK(quiescent_counts.workers == 0);
+            CHECK(quiescent_counts.running == false);
+            CHECK(!quiescent_counts.shutdown_incomplete);
+            CHECK(dataplane.GetLeases().empty());
+            CHECK(dataplane.GetLeases6().empty());
+            CHECK(dataplane.GetDhcpBindings().empty());
+            CHECK(dataplane.GetDhcp6Bindings().empty());
+            CHECK(0 == dataplane.Dhcp6BindingCount());
+            writer_cycles.fetch_add(1, std::memory_order_relaxed);
+
+            std::string restart_error;
+            const bool restarted = dataplane.Start(restart_error);
+            CHECK(restarted);
+            if (!restarted) {
+                break;
+            }
+            CHECK(dataplane.DhcpActive());
+            CHECK(dataplane.Dhcp6Active());
+        }
+
+        stop_flag.store(true, std::memory_order_relaxed);
+        for (std::thread& reader : readers) {
+            reader.join();
+        }
+
+        CHECK(writer_cycles.load() == 100);
+        CHECK(reader_batches.load() > 0);
+        CHECK(!reader_state_bad.load());
+
+        std::string stop_error;
+        CHECK(dataplane.Stop(stop_error));
+        if (!stop_error.empty()) {
+            std::fprintf(stderr, "final stop error: %s\n",
+                         stop_error.c_str());
+        }
+        std::remove(lease_path.c_str());
+        std::remove((lease_path + ".leases6").c_str());
+    }
+
+    /// P147 P1-1 residual: a start failure AFTER every thread and container
+    /// was created (std::bad_alloc from SetAdapterBinding's WideToUtf8 is the
+    /// production trigger) must roll the plane back completely: no thread is
+    /// left joinable, every container is empty, `running` is false, and a
+    /// second Start() from the same object succeeds instead of being refused
+    /// forever by StateIsEmpty(). The DHCP servers are assembled here (main
+    /// mode + dhcp.enabled) so the rollback also has to drop dhcp_/dhcp6_,
+    /// otherwise StateIsEmpty() refuses every later start.
+    void TestStartFailureAfterThreadsRollsBack() {
+        const vgww::core::Config config = MakeDhcpMainConfig();
+        const std::string lease_path = ScratchFile("rollback-leases.json");
+        std::remove(lease_path.c_str());
+        std::remove((lease_path + ".leases6").c_str());
+        vgww::runtime::Dataplane dataplane(config, lease_path);
+        auto fake = std::make_unique<FakeDriverClient>();
+        FakeDriverClient* raw = fake.get();
+        dataplane.SetDriverClient(std::move(fake));
+
+        bool throw_once = true;
+        dataplane.SetStartPostThreadsProbeForTest([&throw_once] {
+            if (throw_once) {
+                throw std::bad_alloc();
+            }
+        });
+
+        std::string error;
+        CHECK(!dataplane.Start(error));
+        CHECK(!error.empty());
+        CHECK(!dataplane.IsRunning());
+        CHECK(CountsAreEmpty(dataplane.GetLifecycleCounts()));
+        CHECK(!vgww::relay::PortMapManager::Instance().IsRunning());
+        CHECK(!dataplane.DhcpActive());
+        CHECK(!dataplane.Dhcp6Active());
+
+        // The whole plane must be restartable from the same object.
+        throw_once = false;
+        std::string re_error;
+        CHECK(dataplane.Start(re_error));
+        if (!re_error.empty()) {
+            std::fprintf(stderr, "restart error: %s\n", re_error.c_str());
+        }
+        CHECK(dataplane.IsRunning());
+        CHECK(dataplane.DhcpActive());
+        std::string re_stop;
+        CHECK(dataplane.Stop(re_stop));
+        CHECK(re_stop.empty());
+        CHECK(CountsAreEmpty(dataplane.GetLifecycleCounts()));
+        (void)raw;
+        std::remove(lease_path.c_str());
+        std::remove((lease_path + ".leases6").c_str());
+    }
+
+    /// P147 P1-3/P1-4: deterministic lifetime proof. A reader is parked INSIDE
+    /// GetLeases()/GetLeases6() - after the null check, before the dereference
+    /// - and a concurrent Stop() must not be able to free the server under it.
+    ///
+    /// With the lifecycle lock in place the Stop blocks until the read
+    /// finishes: the parked reader completes cleanly and Stop joins afterwards.
+    /// With the facade lock removed (mutation A) Stop frees the server while
+    /// the reader is parked, and the read dereferences freed memory (wrong
+    /// answer, page-heap fault, or a hang if the destructor blocks) - the
+    /// CHECKs below fail instead of silently passing.
+    void TestP13FacadeReaderCannotOutliveServer() {
+        vgww::core::Config config = MakeDhcpMainConfig();
+        config.ipv6 = MakeDhcp6MainConfig().ipv6;
+        const std::string lease_path =
+            ScratchFile("p147-parked-leases.json");
+        std::remove(lease_path.c_str());
+        std::remove((lease_path + ".leases6").c_str());
+
+        vgww::runtime::Dataplane dataplane(config, lease_path);
+        dataplane.SetDriverClient(std::make_unique<FakeDriverClient>());
+        dataplane.SetLeaseDumpIntervalForTest(std::chrono::hours(24));
+
+        std::string start_error;
+        CHECK(dataplane.Start(start_error));
+        CHECK(dataplane.DhcpActive());
+        CHECK(dataplane.Dhcp6Active());
+        CHECK(dataplane.ReplaceDhcpBinding(std::string(), "02:00:00:00:02:01",
+                                           "192.168.40.20", "parked"));
+
+        int stage = 0;
+        std::mutex gate_mutex;
+        std::condition_variable gate_cv;
+        bool reader_parked = false;
+        bool release_reader = false;
+        std::atomic<int> probe_entries{0};
+        dataplane.SetDhcpFacadeProbeForTest([&] {
+            probe_entries.fetch_add(1, std::memory_order_relaxed);
+            std::unique_lock<std::mutex> lock(gate_mutex);
+            if (0 == stage) {
+                stage = 1;
+                reader_parked = true;
+                gate_cv.notify_all();
+                gate_cv.wait(lock, [&] { return release_reader; });
+            }
+        });
+
+        std::vector<vgww::runtime::Dataplane::LeaseView> leases;
+        std::vector<vgww::runtime::Dataplane::Lease6View> leases6;
+        std::vector<vgww::runtime::Dataplane::BindingView> bindings;
+        std::thread reader([&] {
+            // The probe parks the first call; the other two read the same
+            // live server once the gate opens.
+            leases = dataplane.GetLeases();
+            leases6 = dataplane.GetLeases6();
+            bindings = dataplane.GetDhcpBindings();
+        });
+
+        {
+            std::unique_lock<std::mutex> lock(gate_mutex);
+            CHECK(gate_cv.wait_for(lock, std::chrono::seconds(10),
+                                   [&] { return reader_parked; }));
+        }
+
+        std::atomic<bool> stop_done{false};
+        bool stop_ok = false;
+        std::thread stopper([&] {
+            std::string stop_error;
+            stop_ok = dataplane.Stop(stop_error);
+            stop_done.store(true, std::memory_order_relaxed);
+        });
+
+        // The reader is still parked inside the facade: an unlocked Stop has
+        // already freed the server by now. Give it a moment, then release.
+        std::this_thread::sleep_for(std::chrono::milliseconds(300));
+        const bool stop_early = stop_done.load(std::memory_order_relaxed);
+        {
+            std::lock_guard<std::mutex> lock(gate_mutex);
+            release_reader = true;
+            stage = 2;
+        }
+        gate_cv.notify_all();
+
+        reader.join();
+        stopper.join();
+
+        // Lock intact: Stop is serialised behind the read.
+        CHECK(!stop_early);
+        CHECK(stop_ok);
+        CHECK(1 == probe_entries.load(std::memory_order_relaxed) ||
+              2 == probe_entries.load(std::memory_order_relaxed));
+        // The parked read observed a live server (the static binding is listed
+        // by the binding accessor, not by Leases(), which reports dynamic
+        // leases only) ...
+        CHECK(bindings.size() == 1);
+        CHECK(leases.size() <= 1);
+        // ... and the plane is fully down afterwards.
+        CHECK(!dataplane.DhcpActive());
+        CHECK(0 == dataplane.DhcpLeaseCount());
+        CHECK(dataplane.GetLeases().empty());
+
+        dataplane.SetDhcpFacadeProbeForTest(nullptr);
+        std::string start2;
+        CHECK(dataplane.Start(start2));
+        std::string stop2;
+        CHECK(dataplane.Stop(stop2));
+        std::remove(lease_path.c_str());
+        std::remove((lease_path + ".leases6").c_str());
+    }
+
 }  // namespace
 
 int main() {
@@ -1282,12 +1652,16 @@ int main() {
     TestB99V4LeasesDumpedPeriodically();
     TestB100StopReportsLeaseDumpFailure();
     TestB102StopDirtyVerdictSurvivesRestart();
+    TestP147P21StickyPersistSurvivesSecondStop();
     TestDhcpDisabledAndCorruptLease();
     TestV6DisabledWhenIpv6Off();
     TestDhcp6SolicitViaDataplane();
     TestRsNoRaWhenIpv6Disabled();
     TestBypassSendsNoRa();
     TestStartFailureStopsPortMapManager();
+    TestStartFailureAfterThreadsRollsBack();
+    TestP13ConcurrentFacadeVsLifecycle();
+    TestP13FacadeReaderCannotOutliveServer();
 
     if (0 == g_failures) {
         std::puts("test_dataplane_lifecycle: ALL PASS");

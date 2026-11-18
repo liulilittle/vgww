@@ -80,10 +80,26 @@ namespace vgww {
             /// down. Production leaves it null. Call BEFORE Start().
             void SetDialCompletionProbeForTest(std::function<void()> probe);
 
+            /// P147 test seam: runs right before StartAll() publishes the
+            /// adapter binding - i.e. AFTER every thread and container was
+            /// created. Throwing here reproduces std::bad_alloc from
+            /// SetAdapterBinding's WideToUtf8 at the worst possible moment
+            /// (full start, catch must roll back completely). Production
+            /// leaves it null. Call BEFORE Start().
+            void SetStartPostThreadsProbeForTest(std::function<void()> probe);
+
             /// batch99 test seam: shorten the periodic lease-snapshot cadence
             /// (production default 60 s). Both DHCPv4 and DHCPv6 ride it.
             /// Values below 1 ms are clamped to 1 ms.
             void SetLeaseDumpIntervalForTest(std::chrono::milliseconds interval);
+
+            /// P147 P1-3/P1-4 seam: runs INSIDE a facade read, between the
+            /// pointer check and the first dereference, while the caller still
+            /// holds the lifecycle lock. Park a reader here, free the server on
+            /// another thread, then release: with the lock in place the free
+            /// blocks until the read finishes (no UAF); with the lock removed
+            /// the dereference hits freed memory. Production leaves it null.
+            void SetDhcpFacadeProbeForTest(std::function<void()> probe);
 
 
             // ------------------------------------------------------------------

@@ -35,6 +35,7 @@
 #include <cstring>
 #include <functional>
 #include <mutex>
+#include <shared_mutex>
 #include <thread>
 #include <unordered_map>
 #include <unordered_set>
@@ -393,6 +394,19 @@ namespace vgww {
             /// `ipv6.enabled && ipv6.dhcpv6.enabled`; null in bypass.
             std::unique_ptr<dhcp6::Dhcp6Server> dhcp6_;
 
+            /// P147 P1-3/P1-4/P1-5: guards the lifecycle of dhcp_/dhcp6_ and
+            /// the per-worker `udp_tables`. Writers (StartAll assembly, the
+            /// start-failure rollback, StopAll persist+reset and
+            /// ReleaseDataplaneContainers) take it exclusively; every facade
+            /// accessor (web/UI threads) and the data-plane readers take it
+            /// shared. One lock for all three members: two locks would need a
+            /// documented acquisition order and the readers take both.
+            /// Lock order: dhcp_lifecycle_mu_ -> dhcp::DhcpServer::mutex_
+            /// (dhcp.h:269) / dhcp6::Dhcp6Server::mutex_ (dhcp6.h:359). The
+            /// servers never call back into the facade, so the graph is two
+            /// depth-1 trees: no cycle, no inversion.
+            mutable std::shared_mutex dhcp_lifecycle_mu_;
+
             /// v6 persistence path derived from the v4 one: production passes
             /// "<config>.leases.json", the spec section 5.2 store is
             /// "<config>.leases6.json". Unconventional paths keep the suffix
@@ -704,6 +718,15 @@ namespace vgww {
             /// every upstream dial completion body, inside its guard.
             std::function<void()> dial_completion_probe_;
 
+            /// P147 test seam: executes immediately before the adapter
+            /// binding is published, after every thread/container exists.
+            std::function<void()> start_post_threads_probe_;
+
+            /// P147 P1-3/P1-4 seam: see SetDhcpFacadeProbeForTest. Runs inside
+            /// a facade read, after the pointer check and before the first
+            /// dereference, while the caller still holds the lifecycle lock.
+            std::function<void()> dhcp_facade_probe_;
+
             /// batch99: periodic lease snapshot cadence (both families).
             std::atomic<int64_t> lease_dump_interval_ms_{60000};
 
@@ -964,8 +987,19 @@ namespace vgww {
                 for (uint32_t i = 0; i < worker_count; ++i) {
                     registry_dirty.push_back(
                         std::make_unique<std::atomic<bool>>(false));
-                    udp_tables.push_back(std::make_unique<relay::UdpFlowTable>(
-                        config.perf.udp_flow_cap, std::chrono::seconds(60)));
+                    {
+                        // P147 P1-5: `udp_tables` is published to the facade
+                        // readers (UdpFlowEvictions/GetLifecycleCounts) while
+                        // it is still being appended here and later cleared by
+                        // ReleaseDataplaneContainers - the vector's storage
+                        // move is a lifetime event, not a benign resize.
+                        std::unique_lock<std::shared_mutex> life_lock(
+                            dhcp_lifecycle_mu_);
+                        udp_tables.push_back(
+                            std::make_unique<relay::UdpFlowTable>(
+                                config.perf.udp_flow_cap,
+                                std::chrono::seconds(60)));
+                    }
 
                     // Raw ICMP socket per worker. Opening one requires admin
                     // rights; without them we degrade gracefully - the relay
@@ -1039,6 +1073,13 @@ namespace vgww {
                 // enabled. Bypass must never assemble, persist or sweep - a
                 // client that points at VGWW manually keeps its own DHCP.
                 if (core::AddressServicesEnabled(config) && config.dhcp.enabled) {
+                    // P147 P1-3: publish the server only once it is fully
+                    // loaded. The lifecycle lock covers assembly AND the
+                    // LoadLeases call, so a facade reader can never observe a
+                    // half-initialised server (Start is a cold path; the
+                    // exclusive section costs nothing on the data plane).
+                    std::unique_lock<std::shared_mutex> life_lock(
+                        dhcp_lifecycle_mu_);
                     dhcp_ = std::make_unique<dhcp::DhcpServer>(config);
                     size_t dropped = 0;
                     const auto outcome = dhcp_->LoadLeases(
@@ -1078,6 +1119,9 @@ namespace vgww {
                 // pool default (prefix::1000-::1FFF) is resolved by the server.
                 if (core::AddressServicesEnabled(config) && config.ipv6.enabled &&
                     config.ipv6.dhcpv6.enabled) {
+                    // P147 P1-4: same publish-after-load rule as v4.
+                    std::unique_lock<std::shared_mutex> life_lock(
+                        dhcp_lifecycle_mu_);
                     dhcp6_ = std::make_unique<dhcp6::Dhcp6Server>(config);
                     size_t dropped6 = 0;
                     const auto outcome6 = dhcp6_->LoadLeases(
@@ -1186,45 +1230,81 @@ namespace vgww {
                 rx_tx_thread = std::thread([this] {
                     RunGuarded("rx", [this] { RxTxLoop(); });
                 });
+                if (start_post_threads_probe_) {
+                    start_post_threads_probe_();
+                }
                 SetAdapterBinding(*adapter);
                 return true;
-            } catch (const std::exception& ex) {
-                // An exception while arming the start path (ring/thread/stack
-                // allocation) must not leak the rx_event handle nor leave
-                // `running` latched for a half-built plane (S1-T17).
-                AbortBridge();
+            } catch (...) {
+                // P147 P1-1/P1-2: a throw from the last start steps (for
+                // example std::bad_alloc inside SetAdapterBinding) happens
+                // with EVERY thread already running. `running` must drop first
+                // so those loops stop, and nothing they can reach may be freed
+                // before they are reaped (the old handler reset rx_event/
+                // dhcp_ while the loops were still using them).
+                running.store(false);
+                const std::string what = DescribeCurrentException();
+                bool clean = true;
+                if (rx_tx_thread.joinable() && !WaitThread(rx_tx_thread)) {
+                    rx_tx_thread.detach();  // never TerminateThread (H2)
+                    clean = false;
+                }
+                for (std::thread& worker : workers) {
+                    if (worker.joinable() && !WaitThread(worker)) {
+                        worker.detach();
+                        clean = false;
+                    }
+                }
+                workers.clear();
+                if (control_thread.joinable() &&
+                    !WaitThread(control_thread)) {
+                    control_thread.detach();
+                    clean = false;
+                }
                 // C3: PortMapManager::Start ran before this point; a leaked
                 // manager thread would keep accepting WAN connections and a
                 // retry Start would re-assign its joinable thread ->
-                // std::terminate.
+                // std::terminate. Stop is idempotent and runs before the
+                // containers its callbacks write are cleared.
                 relay::PortMapManager::Instance().Stop();
-                rx_event.reset();
-                dhcp_.reset();  // half-built start: no server survives
-                dhcp6_.reset();
-                up_client.reset();
-                up_adapter = nullptr;
-                running.store(false);
+                // JoinBridgeThread (not AbortBridge): RollbackBridge resets
+                // bridge_event_, which the rx_tx wake path may still use.
+                if (!JoinBridgeThread()) {
+                    bridge_broken_ = true;
+                    clean = false;
+                }
+                if (clean) {
+                    RollbackBridge();
+                    MarkBridgeStopped();
+                    // P1-1: free everything StartAll built so a retry is not
+                    // refused forever by StateIsEmpty() (the old handler left
+                    // 15+ containers behind -> only a process restart helped).
+                    ReleaseDataplaneContainers();
+                } else {
+                    // H2: a thread may still run inside driver/stack code that
+                    // points into these objects; keep them alive and refuse
+                    // every future start.
+                    shutdown_incomplete_ = true;
+                }
                 if (timer_period_active_) {
                     ::timeEndPeriod(kTimerPeriodMs);
                     timer_period_active_ = false;
                 }
-                error = std::string("dataplane start failed: ") + ex.what();
+                error = "dataplane start failed: " + what;
                 return false;
-            } catch (...) {
-                AbortBridge();
-                relay::PortMapManager::Instance().Stop();
-                rx_event.reset();
-                dhcp_.reset();
-                dhcp6_.reset();
-                up_client.reset();
-                up_adapter = nullptr;
-                running.store(false);
-                if (timer_period_active_) {
-                    ::timeEndPeriod(kTimerPeriodMs);
-                    timer_period_active_ = false;
+            }
+
+            /// P147: names the exception currently being handled. Must only
+            /// be called from inside a catch block (bare `throw;` rethrows
+            /// the active exception); noexcept so the handler cannot fail.
+            static std::string DescribeCurrentException() noexcept {
+                try {
+                    throw;
+                } catch (const std::exception& ex) {
+                    return ex.what();
+                } catch (...) {
+                    return std::string("unknown exception");
                 }
-                error = "dataplane start failed: unknown exception";
-                return false;
             }
 
             /// H2 per-thread cooperative-exit budget. 5s covers an in-flight
@@ -1245,6 +1325,87 @@ namespace vgww {
                     return true;
                 }
                 return false;
+            }
+
+            /// P147 P1-1: the container/counter teardown shared by StopAll and
+            /// the StartAll failure handler. Callers must already have: stopped
+            /// `running`, reaped every thread that can reach these objects, and
+            /// rolled the bridge back. Order is load-bearing (see H2/H3 below).
+            void ReleaseDataplaneContainers() noexcept {
+                try {
+                    // P147 P1-1: the two event handles are part of the
+                    // start-built state (StateIsEmpty asserts both are
+                    // null), so a failed start must release them here
+                    // too - StopAll used to do it just before calling
+                    // this, which left the catch path with them set.
+                    rx_event.reset();
+                    bridge_event_.reset();
+                    stack.reset();
+                    // H2/H3 order: every socket-owning container must die BEFORE
+                    // the io_context that owns its asio service. Destroying an
+                    // io_context while a socket/relay still references it is a
+                    // use-after-free (caught by the lifecycle test as a segfault
+                    // when io_contexts.clear() ran first).
+                    relay_registry_.clear();  // upstream TCP sockets
+                    relay_index_.clear();
+                    registry_dirty.clear();
+                    icmp_relays.clear();      // raw ICMP sockets
+                    {
+                        // P147 P1-3/P1-4/P1-5: one exclusive section for the
+                        // three members the facade readers observe. The DHCP
+                        // servers must be destroyed while the lifecycle lock is
+                        // held (a reader may be inside LeaseCount() right now),
+                        // and `udp_tables` is part of the same lifetime event.
+                        // This runs BEFORE io_contexts.clear(): the servers and
+                        // the per-flow tables own sockets bound to those
+                        // contexts. The resets also close the P1-1 gap: a
+                        // StartAll failure after assembly used to leave dhcp_
+                        // non-null, so StateIsEmpty() refused every retry.
+                        std::unique_lock<std::shared_mutex> life_lock(
+                            dhcp_lifecycle_mu_);
+                        dhcp_.reset();
+                        dhcp6_.reset();
+                        udp_tables.clear();   // per-flow UDP sockets
+                    }
+                    io_contexts.clear();      // last: contexts outlive no socket
+                    accept_mutexes.clear();
+                    pending_accepts.clear();
+                    abort_mutexes.clear();
+                    pending_teardowns_.clear();
+                    registry_mutexes.clear();
+                    rx_rings.clear();
+                    tx_rings.clear();
+                    portmap_send_queue_.reset();
+                    worker_count = 0;
+                    // Bridge counts reset so the next Start begins empty (H3).
+                    bridge_upstream_handle_ = nullptr;
+                    bridge_downstream_handle_ = nullptr;
+                    {
+                        std::lock_guard<std::mutex> lock(bridge_queue_mutex_);
+                        bridge_control_queue_.clear();
+                    }
+                    bridge_table_.Clear();
+                    bridge_forwarded_.store(0);
+                    bridge_dropped_.store(0);
+                    MarkBridgeStopped();
+                    periodic_ra_due.store(false);
+                    live_rates_.clear();
+                    std::atomic_store(&published_rates_,
+                                      std::make_shared<ClientRatesSnapshot>());
+                    std::atomic_store(&ban_index_snapshot_,
+                                      std::make_shared<const BanIndex>());
+                    if (!client_injected_) {
+                        client.reset();
+                    }
+                    up_client.reset();
+                    up_adapter = nullptr;
+                    adapter = nullptr;
+                    ClearAdapterBinding();
+                } catch (...) {
+                    // P147: a clean teardown must never throw; a failure here
+                    // leaves StateIsEmpty() false, which refuses the next Start
+                    // rather than restarting on half-freed state.
+                }
             }
 
             /// All thread/ring/table containers empty? Start() asserts this
@@ -1343,48 +1504,69 @@ namespace vgww {
 
                 // Persist the DHCPv4 leases before any object is torn down: a
                 // restart then keeps address mappings stable. Reached only on
-                // a clean stop, so no live thread can touch the server.
+                // a clean stop, so no data-plane thread can touch the server -
+                // but the facade readers (web/UI threads, which are NOT joined
+                // here) can, so the dump and the reset both run under the
+                // exclusive lifecycle lock: a reader never sees the pointer
+                // vanish halfway through a persist.
                 bool lease_persist_failed = false;
+                // P147 P2-1: only an ACTUAL persist attempt may update the
+                // sticky verdict. A second Stop() has dhcp_/dhcp6_ already
+                // null (reset by the first stop), so it attempts nothing and
+                // must not overwrite the first stop's failure with a false.
+                bool had_persist_attempt = false;
                 std::string lease_persist_error;
-                if (dhcp_) {
-                    if (!dhcp_->DumpLeases(lease_file,
-                                           std::chrono::steady_clock::now())) {
-                        lease_persist_failed = true;
-                        lease_persist_error +=
-                            "dhcp: lease dump failed on stop: " + lease_file;
-                        std::fprintf(stderr,
-                                     "[vgww] dhcp: lease dump failed on stop: "
-                                     "%s\n",
-                                     lease_file.c_str());
-                    }
-                    dhcp_.reset();
-                }
-
-                // Persist the DHCPv6 leases with the same clean-stop rule so
-                // a restart keeps v6 address mappings stable.
-                if (dhcp6_) {
-                    if (!dhcp6_->DumpLeases(LeaseFile6(),
-                                            std::chrono::steady_clock::now())) {
-                        if (lease_persist_failed) {
-                            lease_persist_error += "; ";
+                {
+                    std::unique_lock<std::shared_mutex> life_lock(
+                        dhcp_lifecycle_mu_);
+                    if (dhcp_) {
+                        had_persist_attempt = true;
+                        if (!dhcp_->DumpLeases(
+                                lease_file, std::chrono::steady_clock::now())) {
+                            lease_persist_failed = true;
+                            lease_persist_error +=
+                                "dhcp: lease dump failed on stop: " + lease_file;
+                            std::fprintf(stderr,
+                                         "[vgww] dhcp: lease dump failed on "
+                                         "stop: %s\n",
+                                         lease_file.c_str());
                         }
-                        lease_persist_failed = true;
-                        lease_persist_error +=
-                            "dhcp6: lease dump failed on stop: " +
-                            LeaseFile6();
-                        std::fprintf(stderr,
-                                     "[vgww] dhcp6: lease dump failed on stop: "
-                                     "%s\n",
-                                     LeaseFile6().c_str());
+                        dhcp_.reset();
                     }
-                    dhcp6_.reset();
+
+                    // Persist the DHCPv6 leases with the same clean-stop rule
+                    // so a restart keeps v6 address mappings stable.
+                    if (dhcp6_) {
+                        had_persist_attempt = true;
+                        if (!dhcp6_->DumpLeases(LeaseFile6(),
+                                                std::chrono::steady_clock::
+                                                    now())) {
+                            if (lease_persist_failed) {
+                                lease_persist_error += "; ";
+                            }
+                            lease_persist_failed = true;
+                            lease_persist_error +=
+                                "dhcp6: lease dump failed on stop: " +
+                                LeaseFile6();
+                            std::fprintf(
+                                stderr,
+                                "[vgww] dhcp6: lease dump failed on stop: "
+                                "%s\n",
+                                LeaseFile6().c_str());
+                        }
+                        dhcp6_.reset();
+                    }
                 }
                 // batch100: the teardown itself succeeded, so Stop() still
                 // returns true - but a dirty lease document must not look
                 // like a clean shutdown. The sticky flag survives the server
                 // teardown; the text is attached after the success path's
                 // final error.clear() below.
-                stop_persist_failed_ = lease_persist_failed;
+                // P147 P2-1: update only when this stop actually attempted a
+                // persist, so a later no-op stop cannot clear the verdict.
+                if (had_persist_attempt) {
+                    stop_persist_failed_ = lease_persist_failed;
+                }
 
                 if (nullptr != adapter && nullptr != client) {
                     std::string ignored;
@@ -1418,54 +1600,8 @@ namespace vgww {
                     }
                     bridge_mode_up_ = false;
                 }
-                rx_event.reset();
-                bridge_event_.reset();
                 mark("teardown begin");
-                stack.reset();
-                // H2/H3 order: every socket-owning container must die BEFORE
-                // the io_context that owns its asio service. Destroying an
-                // io_context while a socket/relay still references it is a
-                // use-after-free (caught by the lifecycle test as a segfault
-                // when io_contexts.clear() ran first).
-                relay_registry_.clear();  // upstream TCP sockets
-                relay_index_.clear();
-                registry_dirty.clear();
-                icmp_relays.clear();      // raw ICMP sockets
-                udp_tables.clear();       // per-flow UDP sockets
-                io_contexts.clear();      // last: contexts outlive no socket
-                accept_mutexes.clear();
-                pending_accepts.clear();
-                abort_mutexes.clear();
-                pending_teardowns_.clear();
-                registry_mutexes.clear();
-                rx_rings.clear();
-                tx_rings.clear();
-                portmap_send_queue_.reset();
-                worker_count = 0;
-                // Bridge counts reset so the next Start begins empty (H3).
-                bridge_upstream_handle_ = nullptr;
-                bridge_downstream_handle_ = nullptr;
-                {
-                    std::lock_guard<std::mutex> lock(bridge_queue_mutex_);
-                    bridge_control_queue_.clear();
-                }
-                bridge_table_.Clear();
-                bridge_forwarded_.store(0);
-                bridge_dropped_.store(0);
-                MarkBridgeStopped();
-                periodic_ra_due.store(false);
-                live_rates_.clear();
-                std::atomic_store(&published_rates_,
-                                  std::make_shared<ClientRatesSnapshot>());
-                std::atomic_store(&ban_index_snapshot_,
-                                  std::make_shared<const BanIndex>());
-                if (!client_injected_) {
-                    client.reset();
-                }
-                up_client.reset();
-                up_adapter = nullptr;
-                adapter = nullptr;
-                ClearAdapterBinding();
+                ReleaseDataplaneContainers();
                 error.clear();
                 // batch100: a clean teardown with a failed lease snapshot is
                 // reported through the error text (Stop still returns true:
@@ -2679,6 +2815,13 @@ namespace vgww {
                     }
 
                     case FrameClass::kDhcpV4: {
+                        // P147 P1-3: the RX thread is reaped before StopAll
+                        // resets the server, but the facade readers share the
+                        // pointer and the rollback path can race a late frame;
+                        // one shared lock spans the whole null-check-to-call
+                        // sequence so the server cannot be freed underneath.
+                        std::shared_lock<std::shared_mutex> life_lock(
+                            dhcp_lifecycle_mu_);
                         // Bypass (no server assembled): keep the host's own
                         // DHCP path intact - the frame goes up to MSTCP.
                         if (!dhcp_) {
@@ -2763,6 +2906,9 @@ namespace vgww {
                     }
 
                     case FrameClass::kDhcpV6: {
+                        // P147 P1-4: same shared-lock rule as kDhcpV4.
+                        std::shared_lock<std::shared_mutex> life_lock(
+                            dhcp_lifecycle_mu_);
                         // Bypass (no v6 server assembled): keep the host's own
                         // DHCPv6 path intact - the frame goes up to MSTCP.
                         if (!dhcp6_) {
@@ -2977,7 +3123,11 @@ namespace vgww {
                     if (now - last_sweep > std::chrono::seconds(5)) {
                         udp_tables[index]->Sweep(now);
                         // One worker owns the DHCP sweep so N workers do not
-                        // contend on the server mutex every cycle.
+                        // contend on the server mutex every cycle. P147 P1-3:
+                        // the sweep calls into the server, so it runs under the
+                        // shared lifecycle lock like every other reader.
+                        std::shared_lock<std::shared_mutex> life_lock(
+                            dhcp_lifecycle_mu_);
                         if (0 == index && dhcp_) {
                             dhcp_->Sweep(now);
                         }
@@ -3721,6 +3871,12 @@ namespace vgww {
                         // to be dumped only on a clean Stop, so a crash or a
                         // hard kill lost every v4 lease while v6 kept a 60 s
                         // snapshot. DumpLeases counts its own write failures.
+                        // P147 P1-3/P1-4: the control thread is reaped before
+                        // StopAll resets the servers, but the lock keeps the
+                        // null test and the call atomic against the rollback
+                        // path (and documents the reader contract).
+                        std::shared_lock<std::shared_mutex> life_lock(
+                            dhcp_lifecycle_mu_);
                         if (dhcp_) {
                             dhcp_->DumpLeases(lease_file, now);
                         }
@@ -3912,6 +4068,21 @@ namespace vgww {
             }
         }
 
+        void Dataplane::SetStartPostThreadsProbeForTest(
+            std::function<void()> probe) {
+            if (impl_) {
+                impl_->start_post_threads_probe_ = std::move(probe);
+            }
+        }
+
+        void Dataplane::SetDhcpFacadeProbeForTest(
+            std::function<void()> probe) {
+            if (impl_) {
+                impl_->dhcp_facade_probe_ = std::move(probe);
+            }
+        }
+
+
         void Dataplane::SetLeaseDumpIntervalForTest(
             std::chrono::milliseconds interval) {
             if (impl_) {
@@ -4042,7 +4213,17 @@ namespace vgww {
             counts.rx_rings = impl_->rx_rings.size();
             counts.tx_rings = impl_->tx_rings.size();
             counts.io_contexts = impl_->io_contexts.size();
-            counts.udp_tables = impl_->udp_tables.size();
+            // P147 P1-5 (D6): `udp_tables` is cleared by the teardown while a
+            // web/UI thread can still be here, so the size read needs the same
+            // lock that guards the clear. A failed lock reports 0 - the same
+            // answer as "no tables".
+            try {
+                std::shared_lock<std::shared_mutex> life_lock(
+                    impl_->dhcp_lifecycle_mu_);
+                counts.udp_tables = impl_->udp_tables.size();
+            } catch (...) {
+                counts.udp_tables = 0;
+            }
             counts.icmp_relays = impl_->icmp_relays.size();
             counts.relay_registry = 0;
             for (const auto& list : impl_->relay_registry_) {
@@ -4163,12 +4344,27 @@ namespace vgww {
         // ------------------------------------------------------------------
         // DHCPv4 facade (S2). Every accessor is safe when no server was
         // assembled (bypass or dhcp.enabled=false): it returns an empty or
-        // false result instead of dereferencing a null server.
+        // false result instead of dereferencing a null server. Every accessor
+        // also takes a shared lifecycle lock (P147 P1-3): the null check and
+        // the call used to straddle a concurrent StopAll reset (TOCTOU ->UAF),
+        // and the lock is held across the null test and the dereference so the
+        // server cannot be destroyed in between.
         // ------------------------------------------------------------------
         std::vector<Dataplane::LeaseView> Dataplane::GetLeases() const {
             std::vector<LeaseView> result;
-            if (!impl_ || !impl_->dhcp_) {
+            if (!impl_) {
                 return result;
+            }
+            std::shared_lock<std::shared_mutex> life_lock(
+                impl_->dhcp_lifecycle_mu_);
+            if (!impl_->dhcp_) {
+                return result;
+            }
+            // P147 seam: parked here the reader holds the lifecycle lock and
+            // has already accepted the non-null pointer - the exact instant a
+            // concurrent StopAll wants to free the server.
+            if (impl_->dhcp_facade_probe_) {
+                impl_->dhcp_facade_probe_();
             }
             const auto raw =
                 impl_->dhcp_->Leases(std::chrono::steady_clock::now());
@@ -4187,7 +4383,12 @@ namespace vgww {
 
         std::vector<Dataplane::BindingView> Dataplane::GetDhcpBindings() const {
             std::vector<BindingView> result;
-            if (!impl_ || !impl_->dhcp_) {
+            if (!impl_) {
+                return result;
+            }
+            std::shared_lock<std::shared_mutex> life_lock(
+                impl_->dhcp_lifecycle_mu_);
+            if (!impl_->dhcp_) {
                 return result;
             }
             const auto raw = impl_->dhcp_->StaticBindings();
@@ -4213,7 +4414,12 @@ namespace vgww {
                                            const std::string& mac,
                                            const std::string& ip,
                                            const std::string& hostname) {
-            if (!impl_ || !impl_->dhcp_) {
+            if (!impl_) {
+                return false;
+            }
+            std::shared_lock<std::shared_mutex> life_lock(
+                impl_->dhcp_lifecycle_mu_);
+            if (!impl_->dhcp_) {
                 return false;
             }
             core::MacAddress parsed{};
@@ -4240,7 +4446,12 @@ namespace vgww {
         }
 
         bool Dataplane::RemoveDhcpBinding(const std::string& mac) {
-            if (!impl_ || !impl_->dhcp_) {
+            if (!impl_) {
+                return false;
+            }
+            std::shared_lock<std::shared_mutex> life_lock(
+                impl_->dhcp_lifecycle_mu_);
+            if (!impl_->dhcp_) {
                 return false;
             }
             core::MacAddress parsed{};
@@ -4253,14 +4464,32 @@ namespace vgww {
         }
 
         bool Dataplane::DhcpActive() const noexcept {
-            return impl_ && impl_->dhcp_ != nullptr;
+            if (!impl_) {
+                return false;
+            }
+            try {
+                std::shared_lock<std::shared_mutex> life_lock(
+                    impl_->dhcp_lifecycle_mu_);
+                return impl_->dhcp_ != nullptr;
+            } catch (...) {
+                return false;  // a poisoned lifecycle lock reports "inactive"
+            }
         }
 
         size_t Dataplane::DhcpLeaseCount() const noexcept {
-            if (!impl_ || !impl_->dhcp_) {
+            if (!impl_) {
                 return 0;
             }
-            return impl_->dhcp_->LeaseCount();
+            try {
+                std::shared_lock<std::shared_mutex> life_lock(
+                    impl_->dhcp_lifecycle_mu_);
+                if (!impl_->dhcp_) {
+                    return 0;
+                }
+                return impl_->dhcp_->LeaseCount();
+            } catch (...) {
+                return 0;
+            }
         }
 
         Dataplane::PortmapStats Dataplane::GetPortmapStats() const {
@@ -4283,22 +4512,48 @@ namespace vgww {
         }
 
         uint64_t Dataplane::DhcpPoolExhaustedCount() const noexcept {
-            if (!impl_ || !impl_->dhcp_) {
+            if (!impl_) {
                 return 0;
             }
-            return impl_->dhcp_->PoolExhaustedCount();
+            try {
+                std::shared_lock<std::shared_mutex> life_lock(
+                    impl_->dhcp_lifecycle_mu_);
+                if (!impl_->dhcp_) {
+                    return 0;
+                }
+                return impl_->dhcp_->PoolExhaustedCount();
+            } catch (...) {
+                return 0;
+            }
         }
 
         uint64_t Dataplane::DhcpDroppedLeaseCount() const noexcept {
-            if (!impl_ || !impl_->dhcp_) {
+            if (!impl_) {
                 return 0;
             }
-            return impl_->dhcp_->DroppedLeaseCount();
+            try {
+                std::shared_lock<std::shared_mutex> life_lock(
+                    impl_->dhcp_lifecycle_mu_);
+                if (!impl_->dhcp_) {
+                    return 0;
+                }
+                return impl_->dhcp_->DroppedLeaseCount();
+            } catch (...) {
+                return 0;
+            }
         }
 
         bool Dataplane::DhcpLeaseFileCorrupt() const noexcept {
-            return impl_ && impl_->dhcp_ &&
-                   impl_->dhcp_->LeaseFileCorrupt();
+            if (!impl_) {
+                return false;
+            }
+            try {
+                std::shared_lock<std::shared_mutex> life_lock(
+                    impl_->dhcp_lifecycle_mu_);
+                return impl_->dhcp_ && impl_->dhcp_->LeaseFileCorrupt();
+            } catch (...) {
+                return false;
+            }
         }
 
         uint64_t Dataplane::DhcpParseRejectedCount() const noexcept {
@@ -4310,17 +4565,35 @@ namespace vgww {
         }
 
         uint64_t Dataplane::DhcpRateLimitResets() const noexcept {
-            if (!impl_ || !impl_->dhcp_) {
+            if (!impl_) {
                 return 0;
             }
-            return impl_->dhcp_->RateLimitResets();
+            try {
+                std::shared_lock<std::shared_mutex> life_lock(
+                    impl_->dhcp_lifecycle_mu_);
+                if (!impl_->dhcp_) {
+                    return 0;
+                }
+                return impl_->dhcp_->RateLimitResets();
+            } catch (...) {
+                return 0;
+            }
         }
 
         uint64_t Dataplane::Dhcp6RateLimitResets() const noexcept {
-            if (!impl_ || !impl_->dhcp6_) {
+            if (!impl_) {
                 return 0;
             }
-            return impl_->dhcp6_->RateLimitResets();
+            try {
+                std::shared_lock<std::shared_mutex> life_lock(
+                    impl_->dhcp_lifecycle_mu_);
+                if (!impl_->dhcp6_) {
+                    return 0;
+                }
+                return impl_->dhcp6_->RateLimitResets();
+            } catch (...) {
+                return 0;
+            }
         }
 
         uint64_t Dataplane::RuleSnapshotRefreshCount() const noexcept {
@@ -4349,6 +4622,8 @@ namespace vgww {
             if (!impl_) {
                 return 0;
             }
+            std::shared_lock<std::shared_mutex> life_lock(
+                impl_->dhcp_lifecycle_mu_);
             uint64_t total = 0;
             for (const auto& table : impl_->udp_tables) {
                 if (table) {
@@ -4359,17 +4634,35 @@ namespace vgww {
         }
 
         uint64_t Dataplane::DhcpPersistFailureCount() const noexcept {
-            if (!impl_ || !impl_->dhcp_) {
+            if (!impl_) {
                 return 0;
             }
-            return impl_->dhcp_->PersistFailureCount();
+            try {
+                std::shared_lock<std::shared_mutex> life_lock(
+                    impl_->dhcp_lifecycle_mu_);
+                if (!impl_->dhcp_) {
+                    return 0;
+                }
+                return impl_->dhcp_->PersistFailureCount();
+            } catch (...) {
+                return 0;
+            }
         }
 
         bool Dataplane::DhcpPersistBlocked() const noexcept {
-            if (!impl_ || !impl_->dhcp_) {
+            if (!impl_) {
                 return false;
             }
-            return impl_->dhcp_->PersistBlocked();
+            try {
+                std::shared_lock<std::shared_mutex> life_lock(
+                    impl_->dhcp_lifecycle_mu_);
+                if (!impl_->dhcp_) {
+                    return false;
+                }
+                return impl_->dhcp_->PersistBlocked();
+            } catch (...) {
+                return false;
+            }
         }
 
         // ------------------------------------------------------------------
@@ -4479,8 +4772,17 @@ namespace vgww {
 
         std::vector<Dataplane::Lease6View> Dataplane::GetLeases6() const {
             std::vector<Lease6View> result;
-            if (!impl_ || !impl_->dhcp6_) {
+            if (!impl_) {
                 return result;
+            }
+            std::shared_lock<std::shared_mutex> life_lock(
+                impl_->dhcp_lifecycle_mu_);
+            if (!impl_->dhcp6_) {
+                return result;
+            }
+            // P147 seam: same parking point as the v4 accessor.
+            if (impl_->dhcp_facade_probe_) {
+                impl_->dhcp_facade_probe_();
             }
             const auto raw =
                 impl_->dhcp6_->Leases(std::chrono::steady_clock::now());
@@ -4501,7 +4803,12 @@ namespace vgww {
         std::vector<Dataplane::Binding6View> Dataplane::GetDhcp6Bindings()
             const {
             std::vector<Binding6View> result;
-            if (!impl_ || !impl_->dhcp6_) {
+            if (!impl_) {
+                return result;
+            }
+            std::shared_lock<std::shared_mutex> life_lock(
+                impl_->dhcp_lifecycle_mu_);
+            if (!impl_->dhcp6_) {
                 return result;
             }
             const auto raw = impl_->dhcp6_->StaticBindings();
@@ -4527,7 +4834,12 @@ namespace vgww {
                                             const std::string& duid,
                                             const std::string& ip,
                                             const std::string& hostname) {
-            if (!impl_ || !impl_->dhcp6_) {
+            if (!impl_) {
+                return false;
+            }
+            std::shared_lock<std::shared_mutex> life_lock(
+                impl_->dhcp_lifecycle_mu_);
+            if (!impl_->dhcp6_) {
                 return false;
             }
             std::vector<uint8_t> parsed;
@@ -4556,7 +4868,12 @@ namespace vgww {
         }
 
         bool Dataplane::RemoveDhcp6Binding(const std::string& duid) {
-            if (!impl_ || !impl_->dhcp6_) {
+            if (!impl_) {
+                return false;
+            }
+            std::shared_lock<std::shared_mutex> life_lock(
+                impl_->dhcp_lifecycle_mu_);
+            if (!impl_->dhcp6_) {
                 return false;
             }
             std::vector<uint8_t> parsed;
@@ -4567,47 +4884,109 @@ namespace vgww {
         }
 
         bool Dataplane::Dhcp6Active() const noexcept {
-            return impl_ && impl_->dhcp6_ != nullptr;
+            if (!impl_) {
+                return false;
+            }
+            try {
+                std::shared_lock<std::shared_mutex> life_lock(
+                    impl_->dhcp_lifecycle_mu_);
+                return impl_->dhcp6_ != nullptr;
+            } catch (...) {
+                return false;
+            }
         }
 
         size_t Dataplane::Dhcp6LeaseCount() const noexcept {
-            if (!impl_ || !impl_->dhcp6_) {
+            if (!impl_) {
                 return 0;
             }
-            return impl_->dhcp6_->LeaseCount();
+            try {
+                std::shared_lock<std::shared_mutex> life_lock(
+                    impl_->dhcp_lifecycle_mu_);
+                if (!impl_->dhcp6_) {
+                    return 0;
+                }
+                return impl_->dhcp6_->LeaseCount();
+            } catch (...) {
+                return 0;
+            }
         }
 
         bool Dataplane::Dhcp6PersistBlocked() const noexcept {
-            if (!impl_ || !impl_->dhcp6_) {
+            if (!impl_) {
                 return false;
             }
-            return impl_->dhcp6_->PersistBlocked();
+            try {
+                std::shared_lock<std::shared_mutex> life_lock(
+                    impl_->dhcp_lifecycle_mu_);
+                if (!impl_->dhcp6_) {
+                    return false;
+                }
+                return impl_->dhcp6_->PersistBlocked();
+            } catch (...) {
+                return false;
+            }
         }
 
         uint64_t Dataplane::Dhcp6PersistFailureCount() const noexcept {
-            if (!impl_ || !impl_->dhcp6_) {
+            if (!impl_) {
                 return 0;
             }
-            return impl_->dhcp6_->PersistFailureCount();
+            try {
+                std::shared_lock<std::shared_mutex> life_lock(
+                    impl_->dhcp_lifecycle_mu_);
+                if (!impl_->dhcp6_) {
+                    return 0;
+                }
+                return impl_->dhcp6_->PersistFailureCount();
+            } catch (...) {
+                return 0;
+            }
         }
 
         uint64_t Dataplane::Dhcp6PoolExhaustedCount() const noexcept {
-            if (!impl_ || !impl_->dhcp6_) {
+            if (!impl_) {
                 return 0;
             }
-            return impl_->dhcp6_->PoolExhaustedCount();
+            try {
+                std::shared_lock<std::shared_mutex> life_lock(
+                    impl_->dhcp_lifecycle_mu_);
+                if (!impl_->dhcp6_) {
+                    return 0;
+                }
+                return impl_->dhcp6_->PoolExhaustedCount();
+            } catch (...) {
+                return 0;
+            }
         }
 
         uint64_t Dataplane::Dhcp6DroppedLeaseCount() const noexcept {
-            if (!impl_ || !impl_->dhcp6_) {
+            if (!impl_) {
                 return 0;
             }
-            return impl_->dhcp6_->DroppedLeaseCount();
+            try {
+                std::shared_lock<std::shared_mutex> life_lock(
+                    impl_->dhcp_lifecycle_mu_);
+                if (!impl_->dhcp6_) {
+                    return 0;
+                }
+                return impl_->dhcp6_->DroppedLeaseCount();
+            } catch (...) {
+                return 0;
+            }
         }
 
         bool Dataplane::Dhcp6LeaseFileCorrupt() const noexcept {
-            return impl_ && impl_->dhcp6_ &&
-                   impl_->dhcp6_->LeaseFileCorrupt();
+            if (!impl_) {
+                return false;
+            }
+            try {
+                std::shared_lock<std::shared_mutex> life_lock(
+                    impl_->dhcp_lifecycle_mu_);
+                return impl_->dhcp6_ && impl_->dhcp6_->LeaseFileCorrupt();
+            } catch (...) {
+                return false;
+            }
         }
 
         bool Dataplane::StopPersistFailed() const noexcept {
@@ -4615,10 +4994,19 @@ namespace vgww {
         }
 
         size_t Dataplane::Dhcp6BindingCount() const noexcept {
-            if (!impl_ || !impl_->dhcp6_) {
+            if (!impl_) {
                 return 0;
             }
-            return impl_->dhcp6_->StaticBindingCount();
+            try {
+                std::shared_lock<std::shared_mutex> life_lock(
+                    impl_->dhcp_lifecycle_mu_);
+                if (!impl_->dhcp6_) {
+                    return 0;
+                }
+                return impl_->dhcp6_->StaticBindingCount();
+            } catch (...) {
+                return 0;
+            }
         }
 
     }  // namespace runtime

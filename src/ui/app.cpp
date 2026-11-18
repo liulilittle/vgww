@@ -1126,6 +1126,19 @@ namespace vgww {
                     router_->ForEachBuiltPage([](Page& page) {
                         page.OnCommandFailed();
                     });
+                } else if (result.ok && router_ != nullptr) {
+                    // P147 C-1: the success counterpart, broadcast exactly like
+                    // the failure above and for the same reason (the page that
+                    // armed the optimistic state may not be the one showing when
+                    // the async result lands). A page that adopted a baseline
+                    // BEFORE its command was confirmed - the settings save marks
+                    // `applied_` = submitted draft, `save_pending_` - must drop
+                    // that adoption when the result is a success, or the flag
+                    // outlives its intent and a LATER unrelated failure would
+                    // restore the stale draft over the saved values.
+                    router_->ForEachBuiltPage([&result](Page& page) {
+                        page.OnCommandSucceeded(result);
+                    });
                 }
                 if (result.save_config) {
                     // A native settings save is toasted by its true outcome - success

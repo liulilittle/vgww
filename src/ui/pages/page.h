@@ -90,6 +90,22 @@ namespace vgww {
             /// snapshot left the primary action disabled forever.
             /// Default: nothing.
             virtual void OnCommandFailed() {}
+            /// P147 C-1: the mirror image of OnCommandFailed - a command this
+            /// shell posted came back with `ok == true`. A page that adopted an
+            /// OPTIMISTIC baseline before the async work confirmed it (the
+            /// Settings save adopts the submitted draft as `applied_` while the
+            /// save+apply is still in flight) releases that adoption here.
+            /// `result` carries the same fields the failure toast uses, so a
+            /// page can tell ITS command from an unrelated success: the
+            /// settings page only clears its pending save for
+            /// `result.save_config` (a native settings save - the Web wizard's
+            /// saves and the first-run setup post the same command WITHOUT that
+            /// flag, and the re-entry guard keeps at most one native save in
+            /// flight).
+            /// Default: nothing.
+            virtual void OnCommandSucceeded(const CommandResult& result) {
+                (void)result;
+            }
         };
 
         /// The app installs its router as the navigation target;

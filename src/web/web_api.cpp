@@ -3015,7 +3015,14 @@ namespace vgww {
                          // operator's `false` back to the default `true`.
                          << ",\"rx_flush_eager\":"
                          << (config.perf.rx_flush_eager ? "true" : "false")
-                         << "},\"web\":{\"port\":" << config.web.port
+                         // P147 P2-4: Config::ToJsonString persists
+                         // web.enabled (config.cpp:2268) but this GET never
+                         // emitted it, and POST is a full replacement, so any
+                         // Web save wrote the default `true` back over an
+                         // operator's `false` and silently re-enabled the UI.
+                         << "},\"web\":{\"enabled\":"
+                         << (config.web.enabled ? "true" : "false")
+                         << ",\"port\":" << config.web.port
                          << ",\"bind\":\"" << JsonEscaped(config.web.bind)
                          << "\"}";
                     if (config.vlan.enabled()) {
@@ -3031,7 +3038,19 @@ namespace vgww {
                          << "\",\"downstream\":\""
                          << JsonEscaped(config.bridge.downstream)
                          << "\",\"mac_table_size\":"
-                         << config.bridge.mac_table_size << "}}";
+                         << config.bridge.mac_table_size << "}";
+                    // P147 P1-7/P1-8: the port-forwarding accept-side bounds
+                    // are persisted (Config::ToJsonString) and accepted by the
+                    // loader, so the GET schema MUST echo them: POST is a full
+                    // replacement, so an omitted section would reset an
+                    // operator's tuned cap/timeout to the default on the next
+                    // Web save (the same defect class as P2-4 for web.enabled).
+                    json << ",\"portmap\":{\"max_relays\":"
+                         << config.portmap.max_relays
+                         << ",\"max_relays_per_rule\":"
+                         << config.portmap.max_relays_per_rule
+                         << ",\"idle_timeout_s\":"
+                         << config.portmap.idle_timeout_s << "}}";
                     return Response::Json(json.str());
                 });
 

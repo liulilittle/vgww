@@ -2921,6 +2921,33 @@ public:
     std::vector<vgww::ui::Command> commands;
 };
 
+// P147 C-1: a save executor whose outcome can be switched per command kind, so
+// one test can make the settings SAVE succeed and a later, UNRELATED command
+// (start/stop service) fail - the exact sequence that exposed the sticky
+// `save_pending_` rollback.
+class SwitchableSaveExecutor final : public vgww::ui::CommandExecutor {
+public:
+    vgww::ui::CommandResult Execute(const vgww::ui::Command& cmd) override {
+        commands.push_back(cmd);
+        if (const auto* save = std::get_if<vgww::ui::SaveConfigCmd>(&cmd)) {
+            if (fail_saves) {
+                return vgww::ui::CommandResult{
+                    false, L"bind failed: 18103 already in use",
+                    save->native_feedback};
+            }
+            return vgww::ui::CommandResult{true, L"ok", save->native_feedback};
+        }
+        if (fail_others) {
+            return vgww::ui::CommandResult{false, L"service stop refused"};
+        }
+        return vgww::ui::CommandResult{true, L"ok"};
+    }
+
+    std::vector<vgww::ui::Command> commands;
+    bool fail_saves = false;
+    bool fail_others = false;
+};
+
 /// Bounded wait for the single command worker (strict FIFO).
 static bool WaitForCommands(RecordingExecutor& executor, std::size_t count,
                             vgww::ui::UiController& controller) {
@@ -38069,6 +38096,488 @@ static void TestP141B8QueueFullKeepsForm() {
 // P141 B-9: the bridge page showed "Bridging is off" whenever the MAC table was
 // empty. A RUNNING bridge with zero learned devices must not claim it is off -
 // it is learning, just nothing has spoken yet.
+// P147 P1-6: a failed live apply used to restore the previous document with
+// the whole-document SaveToFile. `previous` is snapshotted BEFORE any binding
+// route can run (main.cpp:795), and the binding routes persist only the file
+// (controller.cpp:456 UpsertDhcpBinding) - they never write back *config
+// (main.cpp assigns *config only at :833 and :851). So a rollback after
+// add-binding -> settings-save -> apply-failure erased the new binding from
+// disk. The rollback must merge disk-only bindings back
+// (SaveToFilePreservingBindings, config.cpp:2595-2627).
+//
+// The rollback is a local lambda inside src/main.cpp, an exe-only TU that no
+// test binary links, so the call site itself is out of reach. This test pins
+// it the same way tests/test_driver_installer.cpp pins installer.cpp: a source
+// anchor on the production line (the red/green discriminator for the fix),
+// plus the behavioural sequence through the public core API.
+static void TestP147RollbackPreservesNewerBindings() {
+    // (1) Production anchor: the save that precedes the rollback-failure
+    // annotation must be the merge-preserving one.
+    {
+        wchar_t exe_path[MAX_PATH * 2] = {0};
+        const DWORD exe_len =
+            ::GetModuleFileNameW(nullptr, exe_path, MAX_PATH * 2);
+        CHECK(exe_len > 0 && exe_len < MAX_PATH * 2);
+        if (exe_len > 0 && exe_len < MAX_PATH * 2) {
+            namespace fs = std::filesystem;
+            fs::path dir =
+                fs::path(std::wstring(exe_path, exe_len)).parent_path();
+            fs::path root;
+            for (int i = 0; i < 8 && !dir.empty(); ++i) {
+                std::error_code mec;
+                if (fs::exists(dir / "scripts" / "native-i18n-t2" / "ar.json",
+                               mec)) {
+                    root = dir;
+                    break;
+                }
+                if (!dir.has_parent_path()) break;
+                dir = dir.parent_path();
+            }
+            CHECK(!root.empty());
+            const fs::path src = root / "src" / "main.cpp";
+            std::ifstream in(src, std::ios::binary);
+            CHECK(in.good());
+            std::string text((std::istreambuf_iterator<char>(in)),
+                             std::istreambuf_iterator<char>());
+            // Anchor on the failure annotation emitted only by the rollback,
+            // then look back for the save it reports on.
+            const size_t marker = text.find("config rollback failed");
+            CHECK(marker != std::string::npos);
+            const size_t save_pos =
+                marker == std::string::npos
+                    ? std::string::npos
+                    : text.rfind("previous.SaveToFile", marker);
+            CHECK(save_pos != std::string::npos);
+            // The production statement may wrap across lines, so compare a
+            // whitespace-collapsed window instead of an exact literal.
+            const auto collapse = [](std::string s) {
+                std::string out;
+                out.reserve(s.size());
+                bool prev_ws = false;
+                for (const char c : s) {
+                    const bool ws = (c == ' ' || c == '\t' || c == '\r' ||
+                                     c == '\n');
+                    if (ws) {
+                        if (!prev_ws) out.push_back(' ');
+                    } else {
+                        out.push_back(c);
+                    }
+                    prev_ws = ws;
+                }
+                return out;
+            };
+            const char kExpected[] =
+                "previous.SaveToFilePreservingBindings(config_path, "
+                "file_error)";
+            CHECK(save_pos != std::string::npos &&
+                  collapse(text.substr(save_pos, 240)).rfind(kExpected, 0) ==
+                      0);
+        }
+    }
+
+    // (2) Behaviour: snapshot (no bindings) -> route writes a binding to the
+    // file only -> rollback must keep it.
+    const std::string path = TempDirNarrowUnique("p147_rollback.json");
+    const std::string legacy_path =
+        TempDirNarrowUnique("p147_rollback_legacy.json");
+    std::remove(path.c_str());
+    std::remove(legacy_path.c_str());
+
+    bool ok = false;
+    vgww::core::Config previous;  // the apply-start snapshot
+    previous.adapter = "Ethernet";
+    previous.gateway.ipv4 = vgww::core::ParseIpv4("192.168.60.1", ok);
+    CHECK(ok);
+    previous.gateway.mask = vgww::core::ParseIpv4("255.255.255.0", ok);
+    CHECK(ok);
+    CHECK(vgww::core::ParseMac("30:fc:68:88:b6:01", previous.gateway.mac));
+    previous.dhcp.enabled = true;
+    previous.dhcp.pool_start = vgww::core::ParseIpv4("192.168.60.100", ok);
+    CHECK(ok);
+    previous.dhcp.pool_end = vgww::core::ParseIpv4("192.168.60.200", ok);
+    CHECK(ok);
+    previous.dhcp.dns.push_back(vgww::core::ParseIpv4("1.1.1.1", ok));
+    CHECK(ok);
+    CHECK(previous.dhcp.static_bindings.empty());
+
+    std::string error;
+    CHECK(previous.SaveToFile(path, error));
+
+    vgww::core::MacAddress late_mac{};
+    CHECK(vgww::core::ParseMac("02:00:00:00:66:01", late_mac));
+    const uint32_t late_ip = vgww::core::ParseIpv4("192.168.60.66", ok);
+    CHECK(ok);
+    error.clear();
+    CHECK(vgww::core::UpsertDhcpBinding(path, late_mac, late_ip, "late", error));
+    // The route persisted the file only; the snapshot object is untouched.
+    CHECK(previous.dhcp.static_bindings.empty());
+
+    error.clear();
+    CHECK(previous.SaveToFilePreservingBindings(path, error));
+    {
+        std::string load_error;
+        const auto disk = vgww::core::Config::LoadFromFile(path, load_error);
+        CHECK(disk.has_value());
+        if (disk) {
+            int found = 0;
+            for (const auto& b : disk->dhcp.static_bindings) {
+                if (b.mac == late_mac) {
+                    ++found;
+                    CHECK(b.ip == late_ip);
+                    CHECK(b.hostname == "late");
+                }
+            }
+            CHECK(1 == found);
+        }
+    }
+
+    // (3) Pin the historical failure mode: the whole-document save on the
+    // same state erases the late binding. This is the behaviour the fix
+    // replaces, proven on a copy so it cannot mask (2).
+    {
+        std::error_code ec;
+        std::filesystem::copy_file(
+            path, legacy_path, std::filesystem::copy_options::overwrite_existing,
+            ec);
+        CHECK(!ec);
+        error.clear();
+        CHECK(previous.SaveToFile(legacy_path, error));
+        std::string load_error;
+        const auto legacy =
+            vgww::core::Config::LoadFromFile(legacy_path, load_error);
+        CHECK(legacy.has_value());
+        if (legacy) {
+            for (const auto& b : legacy->dhcp.static_bindings) {
+                CHECK(!(b.mac == late_mac));
+            }
+        }
+    }
+
+    std::remove(path.c_str());
+    std::remove(legacy_path.c_str());
+}
+
+
+// P147 P2-7: the settings page adopted the submitted draft as its applied_
+// baseline as soon as SubmitCommand ACCEPTED the command (a queue push), while
+// the real save+apply is asynchronous and can still fail. On failure
+// OnCommandFailed only released the re-entry guard, so the next tick saw
+// ReadDraft() == applied_ ("no user edits"), mirrored the OLD snapshot back over
+// the controls and the operator's edits vanished with no dirty badge and no
+// retry path.
+//
+// The scenario below is exactly that sequence: edit -> Save (queued) -> the
+// async apply FAILS -> the following tick publishes the pre-save snapshot ->
+// the edit must still be on screen (and the form must still be dirty).
+static void TestP147P27FailedApplyKeepsEdits() {
+    using namespace vgww::ui;
+    FixTextMetrics();
+    I18n::Instance().SetLang(Lang::ZhCN);
+
+    ShellFakeSource source;
+    FailingSaveExecutor executor;  // every SaveConfigCmd comes back ok == false
+    UiController controller(source, executor);
+    std::string error;
+    CHECK(controller.Start(error));
+
+    UiSnapshot snapshot = MakeRulesSnapshot(1, 1);
+    ConfigView& view = snapshot.config;
+    view.adapter = "Ethernet 2";
+    view.mode = "bypass";
+    view.gateway_ip = "192.168.1.1";
+    view.gateway_mask = "255.255.255.0";
+    view.gateway_mac = "02:00:00:00:00:01";
+    view.dhcp_pool_start = "192.168.1.100";
+    view.dhcp_pool_end = "192.168.1.200";
+    view.dhcp_lease_s = 86400;
+    view.ula_prefix = "fd00:0000:0000:0000:0000:0000:0000:0000";
+    view.prefix_len = 64;
+    view.ra_lifetime_s = 1800;
+    view.dhcp6_pool_start = "fd00:0000:0000:0000:0000:0000:0000:1000";
+    view.dhcp6_pool_end = "fd00:0000:0000:0000:0000:0000:0000:1fff";
+    view.dhcp6_lease_s = 3600;
+    view.web_bind = "127.0.0.1";
+    view.web_port = 8080;
+    view.ui_scale = "auto";
+    view.theme = "dark";
+    view.perf_workers = 4;
+    view.perf_max_conns = 2048;
+    view.perf_dial_timeout_ms = 5000;
+    view.vlan_id = 0;
+    view.bridge_table_size = 4096;
+    view.config_path = "";
+
+    UiApp app;
+    app.Compose(controller, snapshot);
+    app.root().Arrange({0.0f, 0.0f, 1280.0f, 800.0f});
+    app.router().Navigate("settings");
+    app.Update(snapshot);
+    app.root().Arrange({0.0f, 0.0f, 1280.0f, 800.0f});
+
+    auto* save = dynamic_cast<Button*>(FindById(app.root(), "settings.save"));
+    auto* pool_end = dynamic_cast<TextInputElement*>(
+        FindById(app.root(), "settings.dhcp_pool_end"));
+    auto* dirty =
+        dynamic_cast<BadgeElement*>(FindById(app.root(), "settings.dirty"));
+    CHECK(save != nullptr && pool_end != nullptr && dirty != nullptr);
+    if (save == nullptr || pool_end == nullptr || dirty == nullptr) {
+        controller.Stop();
+        return;
+    }
+    CHECK(pool_end->value() == L"192.168.1.200");
+    // FailingSaveExecutor is a different type from RecordingExecutor, so the
+    // shared WaitForCommands does not apply; this is the batch42/batch281
+    // drain loop (DrainResults) used by the other failing-save tests.
+    const auto wait_for_commands = [&](std::size_t count) {
+        const auto deadline = std::chrono::steady_clock::now() +
+                              std::chrono::seconds(3);
+        while (executor.commands.size() < count &&
+               std::chrono::steady_clock::now() < deadline) {
+            controller.DrainResults();
+            std::this_thread::sleep_for(std::chrono::milliseconds(5));
+        }
+        return executor.commands.size() >= count;
+    };
+
+    // (1) A real edit, so the Save is a real posted command.
+    TypeInto(*pool_end, L"192.168.1.240");
+    app.root().Arrange({0.0f, 0.0f, 1280.0f, 800.0f});
+    CHECK(dirty->visible);
+
+    // (2) Save: the command is only QUEUED here. The async apply will fail.
+    executor.commands.clear();
+    ClickElement(*save);
+    CHECK(wait_for_commands(1));
+    CHECK(executor.commands.size() == 1);
+    CHECK(std::get_if<SaveConfigCmd>(&executor.commands[0]) != nullptr);
+
+    // (3) Drive the app's own result-drain path: this is what broadcasts
+    // OnCommandFailed to the settings page and toasts the failure.
+    {
+        const auto deadline = std::chrono::steady_clock::now() +
+                              std::chrono::seconds(3);
+        const std::size_t toast_base = app.toasts().active_count();
+        while (app.toasts().active_count() == toast_base &&
+               std::chrono::steady_clock::now() < deadline) {
+            app.DrainCommandResultsForTest();
+            std::this_thread::sleep_for(std::chrono::milliseconds(5));
+        }
+        CHECK(app.toasts().active_count() > toast_base);
+        // Sanity: the outcome really was the FAILURE path.
+        if (!app.toasts().toasts().empty()) {
+            CHECK(app.toasts().toasts().back().kind == ToastKind::Danger);
+        }
+    }
+
+    // (4) Next tick: the freshly published snapshot still describes the
+    // PRE-SAVE configuration (the apply rolled back), and the app repaints.
+    UiSnapshot next = snapshot;
+    next.seq = 2;
+    app.Update(next);
+
+    // RED before the fix: applied_ was already the submitted draft, the form
+    // looked "clean", the snapshot was mirrored back and the edit was wiped.
+    CHECK(pool_end->value() == L"192.168.1.240");
+    CHECK(dirty->visible);
+
+    // The same tick must not have re-poisoned the save path either: the
+    // operator's retry is still a real command.
+    executor.commands.clear();
+    ClickElement(*save);
+    CHECK(wait_for_commands(1));
+    CHECK(executor.commands.size() == 1);
+    if (executor.commands.size() == 1) {
+        const auto* cmd = std::get_if<SaveConfigCmd>(&executor.commands[0]);
+        CHECK(cmd != nullptr);
+        if (cmd != nullptr) {
+            std::printf("P147P27 retry pool_end=%s\n",
+                        vgww::core::FormatIpv4(cmd->config.dhcp.pool_end).c_str());
+            CHECK(vgww::core::FormatIpv4(cmd->config.dhcp.pool_end) ==
+                  "192.168.1.240");
+        }
+    }
+    controller.Stop();
+    I18n::Instance().SetLang(Lang::ZhCN);
+}
+
+
+// P147 C-1 (W11⑤ 乙审): the P2-7 fix armed `save_pending_` in Save() so a
+// FAILED async apply could restore the pre-submit baselines, but the flag was
+// only ever cleared inside OnCommandFailed - a SUCCESSFUL save left it armed
+// forever. Any later, UNRELATED command failure (the app broadcasts
+// OnCommandFailed to EVERY built page) then hit the same branch and restored
+// `pending_applied_`/`pending_draft_` - the OLD snapshot draft - silently
+// wiping the values the operator had already saved successfully.
+//
+// Sequence under test: edit -> Save SUCCEEDS -> an unrelated command FAILS ->
+// the form must still show the saved values (not the pre-save ones).
+static void TestP147C1SuccessfulSaveNotRolledBackByLaterFailure() {
+    using namespace vgww::ui;
+    FixTextMetrics();
+    I18n::Instance().SetLang(Lang::ZhCN);
+
+    ShellFakeSource source;
+    SwitchableSaveExecutor executor;  // saves succeed, unrelated cmds fail later
+    UiController controller(source, executor);
+    std::string error;
+    CHECK(controller.Start(error));
+
+    UiSnapshot snapshot = MakeRulesSnapshot(1, 1);
+    ConfigView& view = snapshot.config;
+    view.adapter = "Ethernet 2";
+    view.mode = "bypass";
+    view.gateway_ip = "192.168.1.1";
+    view.gateway_mask = "255.255.255.0";
+    view.gateway_mac = "02:00:00:00:00:01";
+    view.dhcp_pool_start = "192.168.1.100";
+    view.dhcp_pool_end = "192.168.1.200";
+    view.dhcp_lease_s = 86400;
+    view.ula_prefix = "fd00:0000:0000:0000:0000:0000:0000:0000";
+    view.prefix_len = 64;
+    view.ra_lifetime_s = 1800;
+    view.dhcp6_pool_start = "fd00:0000:0000:0000:0000:0000:0000:1000";
+    view.dhcp6_pool_end = "fd00:0000:0000:0000:0000:0000:0000:1fff";
+    view.dhcp6_lease_s = 3600;
+    view.web_bind = "127.0.0.1";
+    view.web_port = 8080;
+    view.ui_scale = "auto";
+    view.theme = "dark";
+    view.perf_workers = 4;
+    view.perf_max_conns = 2048;
+    view.perf_dial_timeout_ms = 5000;
+    view.vlan_id = 0;
+    view.bridge_table_size = 4096;
+    view.config_path = "";
+
+    UiApp app;
+    app.Compose(controller, snapshot);
+    app.root().Arrange({0.0f, 0.0f, 1280.0f, 800.0f});
+    app.router().Navigate("settings");
+    app.Update(snapshot);
+    app.root().Arrange({0.0f, 0.0f, 1280.0f, 800.0f});
+
+    auto* save = dynamic_cast<Button*>(FindById(app.root(), "settings.save"));
+    auto* pool_end = dynamic_cast<TextInputElement*>(
+        FindById(app.root(), "settings.dhcp_pool_end"));
+    auto* dirty =
+        dynamic_cast<BadgeElement*>(FindById(app.root(), "settings.dirty"));
+    CHECK(save != nullptr && pool_end != nullptr && dirty != nullptr);
+    if (save == nullptr || pool_end == nullptr || dirty == nullptr) {
+        controller.Stop();
+        return;
+    }
+    CHECK(pool_end->value() == L"192.168.1.200");
+    const auto wait_for_commands = [&](std::size_t count) {
+        const auto deadline = std::chrono::steady_clock::now() +
+                              std::chrono::seconds(3);
+        while (executor.commands.size() < count &&
+               std::chrono::steady_clock::now() < deadline) {
+            controller.DrainResults();
+            std::this_thread::sleep_for(std::chrono::milliseconds(5));
+        }
+        return executor.commands.size() >= count;
+    };
+
+    // (1) A real edit, then Save with an executor that SUCCEEDS.
+    TypeInto(*pool_end, L"192.168.1.240");
+    app.root().Arrange({0.0f, 0.0f, 1280.0f, 800.0f});
+    CHECK(dirty->visible);
+    {
+        const std::size_t toast_base = app.toasts().active_count();
+        executor.commands.clear();
+        ClickElement(*save);
+        WaitForSaveOutcome(app, executor, 1, toast_base);
+        CHECK(executor.commands.size() == 1);
+        // Sanity: the save really took the SUCCESS path.
+        if (!app.toasts().toasts().empty()) {
+            CHECK(app.toasts().toasts().back().kind == ToastKind::Success);
+        }
+    }
+
+    // (2) The successful apply publishes the new config; one tick mirrors it.
+    UiSnapshot saved = snapshot;
+    saved.seq = 2;
+    saved.config.dhcp_pool_end = "192.168.1.240";
+    app.Update(saved);
+    app.root().Arrange({0.0f, 0.0f, 1280.0f, 800.0f});
+    CHECK(pool_end->value() == L"192.168.1.240");
+    CHECK(!dirty->visible);
+
+    // (3) The harmful branch: a fresh edit typed AFTER the successful save must
+    // survive the next UNRELATED command failure. A sticky `save_pending_`
+    // re-fills the form from `pending_draft_` - the draft as it was AT SAVE
+    // TIME - so the newer 192.168.1.250 would be replaced by the already saved
+    // 192.168.1.240 with no warning.
+    CHECK(!dirty->visible);
+    TypeInto(*pool_end, L"192.168.1.250");
+    app.root().Arrange({0.0f, 0.0f, 1280.0f, 800.0f});
+    CHECK(dirty->visible);
+    executor.fail_saves = false;
+    executor.fail_others = true;
+    CHECK(controller.Post(Command{StopServiceCmd{}}));
+    CHECK(wait_for_commands(2));
+    {
+        const std::size_t toast_base = app.toasts().active_count();
+        const auto deadline = std::chrono::steady_clock::now() +
+                              std::chrono::seconds(3);
+        while (app.toasts().active_count() == toast_base &&
+               std::chrono::steady_clock::now() < deadline) {
+            app.DrainCommandResultsForTest();
+            std::this_thread::sleep_for(std::chrono::milliseconds(5));
+        }
+        CHECK(app.toasts().active_count() > toast_base);
+        if (!app.toasts().toasts().empty()) {
+            CHECK(app.toasts().toasts().back().kind == ToastKind::Danger);
+        }
+    }
+    // RED before the fix: 192.168.1.250 was overwritten by the save-time draft.
+    std::printf("P147C1 pool_end_after_unrelated_failure=%ls dirty=%d\n",
+                pool_end->value().c_str(), dirty->visible ? 1 : 0);
+    CHECK(pool_end->value() == L"192.168.1.250");
+    CHECK(dirty->visible);
+
+    // (4) Save the surviving edit, then let an unrelated failure arrive with NO
+    // further edit: the already-saved form must stay clean (a sticky flag would
+    // restore the pre-save baseline and mark it dirty, arming a bogus re-save
+    // and a false "unsaved edits" prompt on leave).
+    {
+        const std::size_t toast_base = app.toasts().active_count();
+        executor.commands.clear();
+        executor.fail_others = false;
+        ClickElement(*save);
+        WaitForSaveOutcome(app, executor, 1, toast_base);
+        CHECK(executor.commands.size() == 1);
+    }
+    {
+        UiSnapshot saved2 = snapshot;
+        saved2.seq = 3;
+        saved2.config.dhcp_pool_end = "192.168.1.250";
+        app.Update(saved2);
+        app.root().Arrange({0.0f, 0.0f, 1280.0f, 800.0f});
+    }
+    CHECK(pool_end->value() == L"192.168.1.250");
+    CHECK(!dirty->visible);
+    executor.fail_others = true;
+    CHECK(controller.Post(Command{StopServiceCmd{}}));
+    CHECK(wait_for_commands(2));
+    {
+        const std::size_t toast_base = app.toasts().active_count();
+        const auto deadline = std::chrono::steady_clock::now() +
+                              std::chrono::seconds(3);
+        while (app.toasts().active_count() == toast_base &&
+               std::chrono::steady_clock::now() < deadline) {
+            app.DrainCommandResultsForTest();
+            std::this_thread::sleep_for(std::chrono::milliseconds(5));
+        }
+    }
+    std::printf("P147C1 after_success_then_unrelated_failure: value=%ls dirty=%d\n",
+                pool_end->value().c_str(), dirty->visible ? 1 : 0);
+    CHECK(pool_end->value() == L"192.168.1.250");
+    CHECK(!dirty->visible);
+    controller.Stop();
+    I18n::Instance().SetLang(Lang::ZhCN);
+}
+
 static void TestP141B9BridgeRunningEmptyStateNotOff() {
     using namespace vgww::ui;
     FixTextMetrics();
@@ -38666,6 +39175,9 @@ int main() {
     TestP141B7FixedTimeTextWidthStable();
     TestP141B8QueueFullKeepsForm();
     TestP141B9BridgeRunningEmptyStateNotOff();
+    TestP147RollbackPreservesNewerBindings();
+    TestP147P27FailedApplyKeepsEdits();
+    TestP147C1SuccessfulSaveNotRolledBackByLaterFailure();
     TestB33jCurveIsContinuous();
     TestB33kGradientAndAxisTicks();
     if (g_failures == 0) {

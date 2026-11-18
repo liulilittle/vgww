@@ -952,6 +952,44 @@ namespace vgww {
                 }
             }
 
+            /// P147 P1-7/P1-8: "portmap" section (all keys optional; ranges
+            /// are enforced by ValidateConfig so programmatic configs get the
+            /// same refusal the loader gives).
+            void ParsePortmap(const json& root, Config& config,
+                              std::string& error) {
+                const auto it = root.find("portmap");
+                if (it == root.end()) {
+                    return;  // absent = defaults
+                }
+                if (!it->is_object()) {
+                    error = "portmap must be an object";
+                    return;
+                }
+                constexpr uint32_t kAny = 0xFFFFFFFFu;
+                if (const auto e = it->find("max_relays"); e != it->end()) {
+                    if (!ReadInteger(*e, "portmap.max_relays", 1, kAny,
+                                     config.portmap.max_relays, error)) {
+                        return;
+                    }
+                }
+                if (const auto e = it->find("max_relays_per_rule");
+                    e != it->end()) {
+                    if (!ReadInteger(*e, "portmap.max_relays_per_rule", 1,
+                                     kAny,
+                                     config.portmap.max_relays_per_rule,
+                                     error)) {
+                        return;
+                    }
+                }
+                if (const auto e = it->find("idle_timeout_s"); e != it->end()) {
+                    // 0 is legal and means "sweep disabled".
+                    if (!ReadInteger(*e, "portmap.idle_timeout_s", 0, kAny,
+                                     config.portmap.idle_timeout_s, error)) {
+                        return;
+                    }
+                }
+            }
+
             void ParsePerf(const json& root, Config& config, std::string& error) {
                 const auto it = root.find("perf");
                 if (it == root.end()) {
@@ -1380,6 +1418,32 @@ namespace vgww {
             // batch31 P1-4: the RX fallback wait bounds the worst-case ping.
             if (!range(config.perf.rx_poll_ms, 1, 200)) {
                 error = "perf.rx_poll_ms must be in [1, 200]";
+                return false;
+            }
+
+            // P147 P1-7/P1-8: the accept-side bounds. max_relays is compared
+            // against the same kMaxCap ceiling as perf.max_conns because it is
+            // a connection budget; a per-rule cap above the total cap could
+            // never bind, so it is refused instead of silently clamped.
+            if (!range(config.portmap.max_relays, 1, kMaxCap)) {
+                error = "portmap.max_relays must be in [1, 1048576]";
+                return false;
+            }
+            if (!range(config.portmap.max_relays_per_rule, 1, kMaxCap)) {
+                error = "portmap.max_relays_per_rule must be in "
+                        "[1, 1048576]";
+                return false;
+            }
+            if (config.portmap.max_relays_per_rule >
+                config.portmap.max_relays) {
+                error = "portmap.max_relays_per_rule must not exceed "
+                        "portmap.max_relays";
+                return false;
+            }
+            // 0 = sweep disabled; the ceiling is ten years of seconds.
+            if (!range(config.portmap.idle_timeout_s, 0, 315360000u)) {
+                error = "portmap.idle_timeout_s must be in [0, 315360000] "
+                        "(0 disables the idle sweep)";
                 return false;
             }
 
@@ -1947,6 +2011,10 @@ namespace vgww {
                 if (!error.empty()) {
                     return std::nullopt;
                 }
+                ParsePortmap(root, config, error);
+                if (!error.empty()) {
+                    return std::nullopt;
+                }
             } catch (const std::exception& ex) {
                 // Missing keys via at(), wrong types via get<T>() - both throw.
                 error = std::string("config structure invalid: ") + ex.what();
@@ -2210,6 +2278,10 @@ namespace vgww {
                                   {"upstream", bridge.upstream},
                                   {"downstream", bridge.downstream},
                                   {"mac_table_size", bridge.mac_table_size}};
+            root["portmap"] = json{{"max_relays", portmap.max_relays},
+                                   {"max_relays_per_rule",
+                                    portmap.max_relays_per_rule},
+                                   {"idle_timeout_s", portmap.idle_timeout_s}};
             return root.dump();
         }
 
