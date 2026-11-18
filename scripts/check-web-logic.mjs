@@ -5724,6 +5724,203 @@ cases.push(['D15: every settings field label is a key the table defines', async 
   ok(text !== 'set.dhcpv6.lease', 't() must resolve it to real text, got the raw key');
 }]);
 
+// ===========================================================================
+// P147: the four leftovers the P146 double review settled on (F14, F13, F11,
+// applied-pending). Same rules: each case must be red before the fix.
+// ===========================================================================
+
+// F14 (P3) - the sidebar version was a hardcoded "v0.1.0" that nothing ever
+// wrote, while the About page already reads sys.version from /api/system.
+// loadAbout() must push the SAME value into #ver ("v" + version); an empty
+// answer must leave the placeholder alone rather than paint "vundefined".
+cases.push(['F14: the sidebar version follows the server build', async () => {
+  vm.runInContext('renderTicket.clear();', context);
+  const ver = nodeFor('#ver');
+  systemPayload.version = '9.9.9';
+  await sandbox.loadAbout();
+  eq(ver.textContent, 'v9.9.9',
+     'the sidebar must show the version /api/system reports, got: ' + ver.textContent);
+  systemPayload.version = '';
+  await sandbox.loadAbout();
+  ok(ver.textContent.indexOf('undefined') < 0,
+     'an absent version must not paint "vundefined", got: ' + ver.textContent);
+  eq(ver.textContent, 'v9.9.9',
+     'an absent version leaves the last real version in place, got: ' + ver.textContent);
+  systemPayload.version = 'test';
+  vm.runInContext('renderTicket.clear();', context);
+}]);
+
+// F13 (P3) - refreshStatus' catch only repainted the DEVICE table; the host
+// tiles kept the previous poll's numbers, so one failed refresh left the page
+// saying "network error" over a device list while the CPU/uptime tiles still
+// claimed to be live. Both halves must show the same failure state.
+cases.push(['F13: a failed dashboard refresh also marks the host tiles', async () => {
+  vm.runInContext('renderTicket.clear();', context);
+  const hc = nodeFor('#host-cards');
+  statusPayload = {
+    gateway: { ip: '192.168.0.1', ipv6: '' },
+    stats: { rx_frames: 5, tx_frames: 5, tcp_accepted: 1 },
+    bridge: {},
+  };
+  systemPayload.proc = { cpu_percent: 77.7, ws_bytes: 1048576, virt_bytes: 1048576, cores: 4 };
+  clientList = [{ ip: '10.0.0.5', mac: 'AA:BB:CC:DD:EE:05', up_bps: 0, down_bps: 0, seen_s: 1 }];
+  await sandbox.refreshStatus();
+  ok(tableText(hc).indexOf('77.7%') >= 0,
+     'the successful refresh must paint the cpu, got: ' + tableText(hc));
+
+  // Break the whole status read: refreshStatus' OWN catch must mark both
+  // halves (the /api/clients failure is swallowed inside renderDevices, so the
+  // outer catch is only reachable through /api/status).
+  const realFetch = sandbox.fetch;
+  sandbox.fetch = async (p, o) => {
+    if (String(p) === '/api/status') {
+      return { ok: false, status: 500, async json() { return {}; }, async text() { return 'boom'; } };
+    }
+    return realFetch(p, o);
+  };
+  try {
+    await sandbox.refreshStatus();
+  } finally {
+    sandbox.fetch = realFetch;
+  }
+  const net = vm.runInContext('t("err.network")', context);
+  ok(tableText(hc).indexOf(net) >= 0,
+     'a failed status refresh must mark the host tiles (refreshStatus catch), got: ' + tableText(hc));
+  ok(tableText(hc).indexOf('77.7%') < 0,
+     'the host tiles must not keep stale numbers next to an error, got: ' + tableText(hc));
+
+  // A clients-only failure is NOT this case: renderDevices swallows it and
+  // renderSystem then repaints the tiles from a live /api/system answer, so
+  // they are fresh, not stale. Pin that division so a later edit cannot
+  // "fix" it by freezing the tiles on every client hiccup.
+  vm.runInContext('renderTicket.clear();', context);
+  systemPayload.proc = { cpu_percent: 88.8, ws_bytes: 1048576, virt_bytes: 1048576, cores: 4 };
+  await sandbox.refreshStatus();
+  sandbox.fetch = async (p, o) => {
+    if (String(p) === '/api/clients') {
+      return { ok: false, status: 500, async json() { return {}; }, async text() { return 'boom'; } };
+    }
+    return realFetch(p, o);
+  };
+  try {
+    await sandbox.refreshStatus();
+  } finally {
+    sandbox.fetch = realFetch;
+  }
+  ok(tableText(hc).indexOf('88.8%') >= 0,
+     'a clients-only failure must still leave live host tiles, got: ' + tableText(hc));
+  ok(tableText(hc).indexOf(net) < 0,
+     'a clients-only failure must not paint the host tiles as failed, got: ' + tableText(hc));
+  clientList = [];
+  systemPayload.proc = { cpu_percent: 0, ws_bytes: 0, virt_bytes: 0, cores: 4 };
+  vm.runInContext('renderTicket.clear();', context);
+}]);
+
+// F11 (P3) - the toast container was a fixed aria-live="polite" region, so an
+// error was announced at the next pause instead of immediately. The container
+// is shared, so the LEVEL of the queue decides: any error entry makes the
+// region assertive; once no error is left it must fall back to polite.
+cases.push(['F11: error toasts switch the live region to assertive', async () => {
+  const box = nodeFor('#toast');
+  clearToasts();
+  eq(box.getAttribute('aria-live'), 'polite',
+     'an empty queue is a polite region');
+  sandbox.toast('plain info', 'info');
+  eq(box.getAttribute('aria-live'), 'polite',
+     'a non-error toast keeps the polite region');
+  sandbox.toast('an error', 'error');
+  eq(box.getAttribute('aria-live'), 'assertive',
+     'an error on screen must make the region assertive');
+  // An info arriving after the error must not downgrade the region while the
+  // error is still on screen.
+  sandbox.toast('more info', 'info');
+  eq(box.getAttribute('aria-live'), 'assertive',
+     'a still-visible error keeps the region assertive');
+  clearToasts();
+  eq(box.getAttribute('aria-live'), 'polite',
+     'the region must fall back to polite once no error is left');
+}]);
+
+// applied-pending (P3) - the "saved to the file, apply unconfirmed" branch
+// adopted the LIVE form as the clean snapshot. A draft typed while the POST was
+// in flight was therefore declared clean, and the next non-forced reload
+// silently overwrote it. Same rule as D6: compare against the submit-time key.
+cases.push(['P147: a pending save keeps a draft typed while it was in flight', async () => {
+  vm.runInContext('renderTicket.clear();', context);
+  configPayload = JSON.parse(JSON.stringify(SERVER_CONFIG));
+  resetSettingsForm();
+  await sandbox.loadSettings(true);
+  eq(sandbox.syncDirty(), false, 'a freshly loaded form is clean');
+
+  nodeFor('#set-workers').value = '4';
+  configPostReply = { ok: true, note: 'applied', apply_id: 21 };
+  configPostStatus = 200;
+  const realFetch = sandbox.fetch;
+  let release = null;
+  let posts = 0;
+  sandbox.fetch = async (path, opt) => {
+    const p = String(path);
+    if (p === '/api/config' && opt && opt.method === 'POST') {
+      posts++;
+      if (posts === 1) await new Promise((res) => { release = res; });
+      return jsonResponse(configPostReply);
+    }
+    if (p === '/api/config/apply-status') throw new Error('offline');
+    return realFetch(p, opt);
+  };
+  clearToasts();
+  const saving = sandbox.saveSettings();
+  await flush();
+  await flush();
+  ok(release !== null, 'the save must be in flight for this case');
+  nodeFor('#set-workers').value = 'typed-mid-save';
+  release();
+  try {
+    await saving;
+  } finally {
+    sandbox.fetch = realFetch;
+  }
+  await flush();
+  eq(sandbox.syncDirty(), true,
+     'an unconfirmed apply must not declare the newer draft clean');
+  // The next ordinary (non-forced) reload must leave the draft alone.
+  configPayload = JSON.parse(JSON.stringify(SERVER_CONFIG));
+  await sandbox.loadSettings();
+  eq(nodeFor('#set-workers').value, 'typed-mid-save',
+     'a pending save must not let the next reload overwrite the draft, got: ' +
+     nodeFor('#set-workers').value);
+
+  // The other direction: with nothing typed after submit the form must read
+  // clean, or every pending save would leave a permanent "unsaved changes".
+  vm.runInContext('renderTicket.clear();', context);
+  configPayload = JSON.parse(JSON.stringify(SERVER_CONFIG));
+  resetSettingsForm();
+  await sandbox.loadSettings(true);
+  nodeFor('#set-workers').value = '5';
+  configPostReply = { ok: true, note: 'applied', apply_id: 22 };
+  posts = 0;
+  let polls = 0;
+  sandbox.fetch = async (path, opt) => {
+    const p = String(path);
+    if (p === '/api/config' && opt && opt.method === 'POST') return jsonResponse(configPostReply);
+    if (p === '/api/config/apply-status') { polls++; throw new Error('offline'); }
+    return realFetch(p, opt);
+  };
+  try {
+    await sandbox.saveSettings();
+  } finally {
+    sandbox.fetch = realFetch;
+  }
+  await flush();
+  ok(polls > 0, 'the pending path must actually be exercised');
+  eq(sandbox.syncDirty(), false,
+     'a pending save with nothing typed in flight must leave the form clean');
+  configPostReply = { ok: true };
+  configPayload = null;
+  vm.runInContext('renderTicket.clear();', context);
+  clearToasts();
+}]);
+
 // P146 D7: the boot chain runs loadAutostart() fire-and-forget. Let its
 // microtasks land, then snapshot what boot asked for - a function that exists
 // but is never called at boot is exactly the defect this pins.
@@ -5743,7 +5940,7 @@ for (const [name, fn] of cases) {
 //
 // The floor is raised whenever cases are added; removing a case without
 // lowering it fails loudly.
-const MIN_CASES = 104;
+const MIN_CASES = 108;
 if (cases.length < MIN_CASES) {
   console.error(`FAIL ${NAME}: only ${cases.length} case(s) are registered, but at least ${MIN_CASES} are required.`);
   console.error('  A case was deleted (or never registered). Restore it, or - if the deletion was');

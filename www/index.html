@@ -3549,9 +3549,9 @@ function renderToasts() {
   const box = $("#toast");
   // Keep exactly the nodes that still belong to a queued entry, in queue order.
   // Evicted (over TOAST_MAX) and expired entries lose their node here.
-  const live = new Set(toasts.map(item => item.el).filter(Boolean));
+  const kept = new Set(toasts.map(item => item.el).filter(Boolean));
   for (const el of [...box.children]) {
-    if (!live.has(el)) box.removeChild(el);
+    if (!kept.has(el)) box.removeChild(el);
   }
   toasts.forEach(item => {
     if (!item.el) {
@@ -3570,6 +3570,13 @@ function renderToasts() {
     if (item.el.textContent !== text) item.el.textContent = text;
   });
   box.classList.toggle("show", toasts.length > 0);
+  // P147 F11: the container is one shared live region, so its politeness has
+  // to follow the queue. role="status" + polite means an error waits for the
+  // next pause (and can be dropped when other output is busy). While any error
+  // entry is on screen the region is assertive; once none is left it returns
+  // to polite so ordinary confirmations stay non-interrupting.
+  const live = toasts.some(item => item.level === "error") ? "assertive" : "polite";
+  if (box.getAttribute("aria-live") !== live) box.setAttribute("aria-live", live);
 }
 
 function toast(msg, level, key) {
@@ -3976,6 +3983,11 @@ async function refreshStatus() {
     // consistent shape and the next successful poll reconciles from it.
     paintTable(document.querySelector("#dev-table tbody"), [],
                tableSpan("dev-table"), t("err.network"));
+    // P147 F13: the host tiles belong to the same refresh. Without this the
+    // device body said "network error" while the tiles beside it kept the
+    // previous poll's CPU/uptime/throughput - stale numbers presented as live.
+    // One-item error shape, the same one renderSystem's own catch uses.
+    paintCards($("#host-cards"), [{ k: "-", v: t("err.network"), small: "" }]);
   }
 }
 
@@ -4190,6 +4202,10 @@ async function renderDevices() {
     // consistent shape and the next successful poll reconciles from it.
     paintTable(document.querySelector("#dev-table tbody"), [],
                tableSpan("dev-table"), t("err.network"));
+    // The host tiles are deliberately NOT touched here: refreshStatus goes on
+    // to renderSystem(), which repaints them from a live /api/system answer,
+    // so a clients-only failure leaves fresh tiles beside an honest device
+    // error. Only a failure refreshStatus itself sees can leave them stale.
   }
 }
 
@@ -4919,6 +4935,12 @@ async function loadAbout() {
   };
   // version comes from the API now (never hardcode it in the page).
   set("ab-version", sys && sys.version);
+  // P147 F14: the sidebar footer still read a hardcoded "v0.1.0" that nothing
+  // ever wrote, so a rebuilt binary kept advertising the placeholder. Same
+  // value, one read: the "/api/system" answer above. An absent version leaves
+  // the placeholder in place rather than painting "vundefined".
+  const verEl = document.getElementById("ver");
+  if (verEl && sys && sys.version) verEl.textContent = "v" + sys.version;
   set("ab-memory", t("ab.memory.default"));
   set("ab-config", sys && sys.config_path);
   set("ab-uptime", fmtFixedTime(sys && sys.uptime_s));
@@ -5820,6 +5842,17 @@ async function saveSettings() {
         // would state something untrue. .toast-info already exists and is
         // otherwise unused - the neutral level this message needed.
         toastT("set.saved.pending", "info");
+        // P147: this used to adopt the LIVE form as the clean snapshot. Any
+        // draft typed while the POST was in flight was therefore declared
+        // clean, and the next non-forced reload silently overwrote it - the
+        // same loss D6 fixed on the success path. Same rule here: the sent
+        // state is the snapshot; if the form moved since, the draft stays and
+        // the badge keeps telling the truth about it.
+        if (submittedKey !== JSON.stringify(readSettingsDirtyState())) {
+          settingsSnapshot = submitted;
+          syncDirty();
+          return;
+        }
         settingsSnapshot = readSettingsDirtyState();
         syncDirty();
         return;
