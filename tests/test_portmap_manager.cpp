@@ -986,6 +986,110 @@ void TestB86MalformedLanIpIsRefusedNotZeroDialed() {
     vgww::web::RuleStore::Instance().Clear();
 }
 
+/// P148 P2-9: a WAN port held by another process must NOT be re-bound on
+/// every ApplyRules pass. The RunLoop polls the RuleStore every 20 ticks of a
+/// 200 us loop (250 passes/s), so the pre-fix retry burned ~250 failing
+/// open/bind/listen syscalls, ~250 stderr lines and +250 on bind_failed every
+/// second. With the exponential backoff (1 s, 2 s, 4 s ... 60 s) a one-second
+/// window may contain at most the first retry plus a couple of scheduling
+/// slop attempts.
+void TestP148FailedBindRetriesWithBackoff() {
+    vgww::core::Config config;
+    config.gateway.ipv4 = kGatewayIp;
+    config.gateway.mask = (0u) | (0u << 8) | (255u << 16) | (255u << 24);
+    config.gateway.mac = {0x30, 0xFC, 0x68, 0x88, 0xB4, 0xA9};
+
+    NullBackend backend;
+    xtcp::XtcpStack stack(&backend);
+    stack.SetMaxConnections(16);
+
+    auto& manager = vgww::relay::PortMapManager::Instance();
+    auto& store = vgww::web::RuleStore::Instance();
+    manager.Stop();
+    store.AttachFile("");
+    store.Clear();
+
+    const auto send_to_lan = [](uint64_t, const uint8_t*, uint32_t) {
+        return true;
+    };
+    const auto teardown = [](uint64_t, bool) {};
+
+    // Hold the port exclusively so every manager bind attempt fails.
+    asio::io_context io;
+    asio::ip::tcp::acceptor holder(io);
+    std::error_code ec;
+    holder.open(asio::ip::tcp::v4(), ec);
+    CHECK(!ec);
+    BOOL exclusive = TRUE;
+    CHECK(0 == ::setsockopt(holder.native_handle(), SOL_SOCKET,
+                            SO_EXCLUSIVEADDRUSE,
+                            reinterpret_cast<const char*>(&exclusive),
+                            sizeof(exclusive)));
+    holder.bind(asio::ip::tcp::endpoint(asio::ip::address_v4::any(), 0), ec);
+    CHECK(!ec);
+    holder.listen(1, ec);
+    CHECK(!ec);
+    const uint16_t held_port = holder.local_endpoint().port();
+    CHECK(0 != held_port);
+    store.AddPortMap({"tcp", held_port, "127.0.0.1", 45678});
+
+    manager.Start(&stack, config, send_to_lan, teardown);
+    const uint64_t before = manager.GetStats().bind_failed.load();
+    CHECK(WaitFor([&] {
+        return manager.GetStats().bind_failed.load() > before;
+    }, 3000));
+
+    // Deterministic gate. ApplyRules is manager-thread confined, so the
+    // manager is stopped first (Stop joins the thread) and the seam is driven
+    // synchronously. At this point the FIRST 1 s backoff is still outstanding,
+    // so an unchanged-rule pass must return before touching the port at all.
+    // This is the assertion that actually pins the fix - a wall-clock rate
+    // depends on how fast the RunLoop polls under load, while this asserts the
+    // branch itself. Pre-fix (no gate) each pass ran the full body and bumped
+    // both counters.
+    manager.Stop();
+    const uint64_t gate_bind_before = manager.GetStats().bind_failed.load();
+    const uint64_t gate_pass_before = manager.GetStats().apply_passes.load();
+    manager.ApplyRulesForTest();
+    manager.ApplyRulesForTest();
+    manager.ApplyRulesForTest();
+    const uint64_t gate_bind_after = manager.GetStats().bind_failed.load();
+    const uint64_t gate_pass_after = manager.GetStats().apply_passes.load();
+    std::printf("P148 gate: bind_failed %llu -> %llu, apply_passes %llu -> %llu\n",
+                static_cast<unsigned long long>(gate_bind_before),
+                static_cast<unsigned long long>(gate_bind_after),
+                static_cast<unsigned long long>(gate_pass_before),
+                static_cast<unsigned long long>(gate_pass_after));
+    CHECK(gate_bind_after == gate_bind_before);    // backoff honoured
+    CHECK(gate_pass_after == gate_pass_before);    // no wasted rebuild
+
+    // Wall-clock cross-check on a fresh manager: one failed bind, then a
+    // one-second window. Restart rebuilds the acceptors once (binds again);
+    // the retry schedule carried over from the run above is >= 1 s out, so
+    // the window may hold at most that single rebuild attempt.
+    manager.Start(&stack, config, send_to_lan, teardown);
+    const uint64_t restart_base = manager.GetStats().bind_failed.load();
+    CHECK(WaitFor([&] {
+        return manager.GetStats().bind_failed.load() > restart_base;
+    }, 3000));
+    const uint64_t window_start = manager.GetStats().bind_failed.load();
+    std::this_thread::sleep_for(std::chrono::milliseconds(1000));
+    const uint64_t window_end = manager.GetStats().bind_failed.load();
+    const uint64_t delta = window_end - window_start;
+    std::printf("P148 backoff: bind_failed delta over 1s = %llu\n",
+                static_cast<unsigned long long>(delta));
+    // Backoff >= 1 s => at most one scheduled retry in the window; the cap of
+    // 5 tolerates scheduler slop while staying 50x below the pre-fix ~250.
+    CHECK(delta <= 5);
+
+    manager.Stop();
+    holder.close(ec);
+    store.Clear();
+    CHECK(WaitFor([&] {
+        return vgww::relay::PortMapManager::LiveAcceptLoops() == 0;
+    }, 3000));
+}
+
 /// batch312: ApplyRules is change-driven (RuleStore::Rev) instead of
 /// rebuilding the wanted set on every RunLoop pass (~10/s, allocating in
 /// proportion to the rule count for the life of the process), but a failed
@@ -2106,6 +2210,7 @@ int main() {
     TestP147IdleSweepKeepsActiveRelay();
     TestP147RelayCapRefusesFlood();
     TestP147PerRuleCapIsolatesOnePort();
+    TestP148FailedBindRetriesWithBackoff();
     TestB312ApplyRulesIsChangeDriven();   // last: it fails one bind on purpose
 
     if (0 == g_failures) {

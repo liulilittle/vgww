@@ -172,6 +172,13 @@ namespace vgww {
                 accept_rearm_probe_ = std::move(probe);
             }
 
+            /// P148 P2-9 test seam: drive one ApplyRules pass synchronously.
+            /// The caller MUST have stopped the manager (ApplyRules is
+            /// manager-thread confined). Lets a test prove the retry gate
+            /// deterministically - a wall-clock window would depend on how
+            /// fast the RunLoop happens to poll under load.
+            void ApplyRulesForTest() { ApplyRules(); }
+
             /// P147 P1-7/P1-8 telemetry: current number of live relays. The
             /// map itself is manager-thread only, so the accept/erase paths
             /// publish the size into an atomic (relay_count_) that any thread
@@ -319,6 +326,21 @@ namespace vgww {
             /// by the manager thread, read by the status surface).
             mutable std::mutex failed_ports_mutex_;
             std::vector<uint16_t> failed_ports_;
+            /// P148 P2-9: per-port bind retry schedule. Before this, a
+            /// rule whose WAN port was held by another process was re-bound
+            /// on EVERY ApplyRules pass (the RunLoop polls at 200 us and
+            /// applies every 20 ticks = 250 attempts/s), i.e. 250 failing
+            /// open/bind/listen syscalls AND 250 stderr lines per second,
+            /// with `stats_.bind_failed` inflated by the same factor. Each
+            /// failed port now waits an exponential backoff (1 s, 2 s, 4 s,
+            /// ... capped at 60 s) before the next attempt. Guarded by
+            /// failed_ports_mutex_ (same lock as failed_ports_, so the
+            /// status surface and the retry gate never disagree).
+            struct FailedPortRetry {
+                std::chrono::steady_clock::time_point next_attempt;
+                std::chrono::milliseconds backoff{1000};
+            };
+            std::map<uint16_t, FailedPortRetry> failed_port_retry_;
             std::mutex queue_mutex_;
             std::deque<std::pair<uint64_t, core::PoolVector<uint8_t>>> data_queue_;
             std::deque<std::pair<uint64_t, int>> state_queue_;

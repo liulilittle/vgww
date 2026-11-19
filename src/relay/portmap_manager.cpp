@@ -5,6 +5,7 @@
 
 #include <xtcp/core/stack.h>
 
+#include <algorithm>
 #include <cstdio>
 
 namespace vgww {
@@ -343,16 +344,27 @@ namespace vgww {
             // publishes each snapshot), so "rev unchanged" proves "rules
             // unchanged".
             const uint64_t rev = web::RuleStore::Instance().Rev();
-            if (have_applied_rules_ && rev == applied_rule_rev_) {
-                // A failed bind IS retried on later passes even when the rule
-                // set is unchanged: the WAN port may have been released by
-                // another process. With no failures there is nothing to do.
-                bool any_failed = false;
+            const bool rules_changed =
+                !have_applied_rules_ || (rev != applied_rule_rev_);
+            const auto now = std::chrono::steady_clock::now();
+            if (!rules_changed) {
+                // A failed bind IS retried without a rule change: the WAN
+                // port may have been released by another process. P148 P2-9:
+                // a retry is only due once that port's backoff has elapsed;
+                // without this gate the 250 Hz ApplyRules poll re-bound a
+                // held port 250 times per second (each attempt one failing
+                // open/bind/listen, one stderr line, and +1 bind_failed).
+                bool any_due = false;
                 {
                     std::lock_guard<std::mutex> lock(failed_ports_mutex_);
-                    any_failed = !failed_ports_.empty();
+                    for (const auto& entry : failed_port_retry_) {
+                        if (now >= entry.second.next_attempt) {
+                            any_due = true;
+                            break;
+                        }
+                    }
                 }
-                if (!any_failed) {
+                if (!any_due) {
                     return;
                 }
             }
@@ -360,9 +372,16 @@ namespace vgww {
             applied_rule_rev_ = rev;
             ++stats_.apply_passes;
             // batch34e: recompute each pass so a port that became free (or a
-            // removed rule) stops being reported.
+            // removed rule) stops being reported. P148 P2-9: a changed rule
+            // set is new information - every port gets one immediate attempt
+            // and its backoff restarts from 1 s. A retry-only pass keeps the
+            // schedule intact, otherwise each attempt would reset its own
+            // backoff and the delay could never grow past 1 s.
             {
                 std::lock_guard<std::mutex> lock(failed_ports_mutex_);
+                if (rules_changed) {
+                    failed_port_retry_.clear();
+                }
                 failed_ports_.clear();
             }
             const auto rules = web::RuleStore::Instance().PortMaps();
@@ -405,6 +424,9 @@ namespace vgww {
                     // showing it) but NO acceptor exists, so nothing is ever
                     // forwarded. Count it, log it, and remember the port so
                     // the surface can name it instead of failing silently.
+                    // P148 P2-9: schedule the next attempt exponentially
+                    // (1 s, 2 s, 4 s, ... capped at 60 s). The counter and the
+                    // log line now advance once per attempt, not 250x/s.
                     ++stats_.bind_failed;
                     {
                         std::lock_guard<std::mutex> lock(failed_ports_mutex_);
@@ -413,6 +435,11 @@ namespace vgww {
                         if (failed_ports_.size() > kMaxFailedPorts) {
                             failed_ports_.erase(failed_ports_.begin());
                         }
+                        auto& retry = failed_port_retry_[rule.wan_port];
+                        const auto attempt_at = std::chrono::steady_clock::now();
+                        retry.next_attempt = attempt_at + retry.backoff;
+                        retry.backoff = std::min(
+                            retry.backoff * 2, std::chrono::milliseconds(60000));
                     }
                     std::fprintf(stderr,
                                  "[portmap] WAN port %u could not be opened "
@@ -579,6 +606,13 @@ namespace vgww {
                 };
                 (*loop)();
                 acceptors_[key] = {acceptor, rule, loop};
+                // P148 P2-9: the port is ours now - drop any retry schedule
+                // left from an earlier failed attempt so a later removal or
+                // re-add starts from the 1 s step, not a stale 60 s cap.
+                {
+                    std::lock_guard<std::mutex> lock(failed_ports_mutex_);
+                    failed_port_retry_.erase(rule.wan_port);
+                }
             }
 
             // Remove acceptors whose rules disappeared.
