@@ -1,4 +1,4 @@
-﻿// ============================================================================
+// ============================================================================
 // dataplane.cpp - Data plane implementation (pimpl; xtcp types stay here).
 // ============================================================================
 #include <winsock2.h>
@@ -2416,16 +2416,23 @@ namespace vgww {
                             }
                             for (size_t b = 0; b < count; ++b) {
                                 TxFrame& frame = tx_buf[b];
+                                // The destination MAC is read by every step below
+                                // (rate cap, per-client accounting, bridge egress);
+                                // copy it once instead of up to three times.
+                                const bool have_dst =
+                                    frame.size() >= net::kMacAddrLen;
+                                net::WireMac frame_dst{};
+                                if (have_dst) {
+                                    std::memcpy(frame_dst.data(), frame.data(),
+                                                net::kMacAddrLen);
+                                }
                                 // Downlink rate limit: cap bytes handed to each
                                 // client. Only fully-synthesized Ethernet frames
                                 // arrive here (dst MAC at [0..5]); a frame too
                                 // short to parse is forwarded untouched.
-                                if (frame.size() >= net::kMacAddrLen) {
-                                    net::WireMac dst{};
-                                    std::memcpy(dst.data(), frame.data(),
-                                                net::kMacAddrLen);
+                                if (have_dst) {
                                     if (!rate_limiter_.AllowDownlink(
-                                            dst, frame.size(),
+                                            frame_dst, frame.size(),
                                             std::chrono::steady_clock::now())) {
                                         ++stats->rate_limited;
                                         continue;  // drop: TCP retransmits as needed
@@ -2435,9 +2442,7 @@ namespace vgww {
                                 // push toward the wire belongs to its destination
                                 // MAC (skipped for broadcast/group destinations).
                                 if (frame.size() >= net::kEthernetHeaderLen) {
-                                    core::MacAddress dst;
-                                    std::memcpy(dst.data(), frame.data(),
-                                                net::kMacAddrLen);
+                                    const core::MacAddress& dst = frame_dst;
                                     if (!net::IsGroupAddress(dst)) {
                                         // batch94: same cap as the uplink path.
                                         // TX destinations are normally learned
@@ -2468,11 +2473,8 @@ namespace vgww {
                                 // assignment would copy-assign the struct, clobbering
                                 // down.primary's handle+items (never do that here).
                                 PortBatch* egress = &down.primary;
-                                if (bridge_active_.load() &&
-                                    frame.size() >= net::kMacAddrLen) {
-                                    net::WireMac dst{};
-                                    std::memcpy(dst.data(), frame.data(),
-                                                net::kMacAddrLen);
+                                if (bridge_active_.load() && have_dst) {
+                                    const net::WireMac& dst = frame_dst;
                                     std::optional<uint32_t> learned;
                                     {
                                         std::lock_guard<std::mutex> lock(
