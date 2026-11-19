@@ -2323,17 +2323,26 @@ namespace vgww {
                 up.primary.handle = adapter->handle;
                 down.downstream.handle = bridge_downstream_handle_;
                 up.downstream.handle = bridge_downstream_handle_;
+                uint64_t wake_us = 0;
 
                 while (running.load()) {
-                    const uint64_t wake_us = NowUs();
+                    // The wake timestamps exist only for the opt-in latency
+                    // trace; reading the clock costs two calls per iteration
+                    // otherwise, so they stay inside the trace guard.
+                    if (lat_trace) {
+                        wake_us = NowUs();
+                    }
                     const DWORD waited =
                         ::WaitForSingleObject(rx_event.get(),
                                               config.perf.rx_poll_ms);
-                    const uint64_t after_wait_us = NowUs();
-                    if (lat_trace && WAIT_OBJECT_0 == waited) {
-                        // How long the thread sat before the event woke it: the
-                        // "wake-up granularity" segment of the latency budget.
-                        lat_wait_us = after_wait_us - wake_us;
+                    if (lat_trace) {
+                        const uint64_t after_wait_us = NowUs();
+                        if (WAIT_OBJECT_0 == waited) {
+                            // How long the thread sat before the event woke it:
+                            // the "wake-up granularity" segment of the latency
+                            // budget.
+                            lat_wait_us = after_wait_us - wake_us;
+                        }
                     }
 
                     // Drain the kernel queue completely (bounded by batches).
