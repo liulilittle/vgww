@@ -995,10 +995,23 @@ namespace vgww {
                 return true;
             }
             if (code == "zh-CN") {
+                // P3-5: this branch used to return true unconditionally, so a
+                // damaged zh-CN block left the selector on "zh-CN" (code_ was
+                // set) while the resident tables served English - the user
+                // picked Chinese and got an English UI, and the choice was
+                // persisted. Report the same way the generic path below does.
                 lang_ = vgww::ui::Lang::ZhCN;
                 code_ = "zh-CN";
                 rtl_ = false;
                 loaded_valid_ = LoadLanguageBlock(code, loaded_);
+                if (!loaded_valid_) {
+                    // The block is unreadable; the resident zh-CN tables are
+                    // also unusable, so fall back to English and say so.
+                    lang_ = vgww::ui::Lang::En;
+                    code_ = "en";
+                    loaded_valid_ = false;
+                    return false;
+                }
                 return true;
             }
             const int index = FindCatalogIndex(code);
