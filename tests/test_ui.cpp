@@ -38827,6 +38827,113 @@ static void TestP148P28CorruptConfigSaveRefused() {
     I18n::Instance().SetLang(Lang::ZhCN);
 }
 
+// P148 P2-2: the DHCP binding commands changed the runtime store and the
+// document but never the authoritative Config. `apply_config_live` snapshots
+// that Config BEFORE any binding route runs and restores it on failure, so a
+// later failed apply rolled a DELETED binding back into memory and onto disk.
+// The executor now mirrors every successful add/remove into the Config through
+// the BindingChangedHook; this test drives the real executor and asserts the
+// hook receives the exact key (including the edit's old MAC).
+static void TestP148P22BindingChangeReachesConfigHook() {
+    using namespace vgww::ui;
+    FixTextMetrics();
+    I18n::Instance().SetLang(Lang::ZhCN);
+
+    const std::string cfg_path = TempDirNarrowUnique("p148p22_ui.json");
+    const std::string lease_path = TempDirNarrowUnique("p148p22_ui.leases.json");
+    std::remove(cfg_path.c_str());
+    std::remove(lease_path.c_str());
+
+    vgww::core::Config cfg;
+    cfg.adapter = "Ethernet";
+    cfg.mode = vgww::core::Mode::kMain;
+    cfg.dhcp.enabled = true;
+    bool ok = false;
+    cfg.gateway.ipv4 = vgww::core::ParseIpv4("192.168.46.1", ok);
+    cfg.gateway.mask = vgww::core::ParseIpv4("255.255.255.0", ok);
+    cfg.gateway.mac = {0x30, 0xFC, 0x68, 0x88, 0xB4, 0xC6};
+    cfg.dhcp.pool_start = vgww::core::ParseIpv4("192.168.46.100", ok);
+    cfg.dhcp.pool_end = vgww::core::ParseIpv4("192.168.46.200", ok);
+    cfg.dhcp.lease_seconds = 3600;
+    cfg.perf.workers = 2;
+    cfg.perf.ring_capacity = 64;
+    cfg.perf.max_conns = 64;
+    std::string err;
+    CHECK(cfg.SaveToFile(cfg_path, err));
+
+    vgww::runtime::Dataplane dataplane(cfg, lease_path);
+    dataplane.SetDriverClient(std::make_unique<B24AdapterDriver>());
+    CHECK(dataplane.Start(err));
+    CHECK(dataplane.DhcpActive());
+
+    // The authoritative Config, exactly as main.cpp owns it.
+    std::mutex config_mutex;
+    DataplaneCommandExecutor executor(dataplane, cfg_path);
+    int hook_calls = 0;
+    executor.SetBindingChangedHook(
+        [&cfg, &config_mutex, &dataplane, &hook_calls](const std::string& mac,
+                                                       bool added) {
+            ++hook_calls;
+            (void)mac;
+            (void)added;
+            std::vector<vgww::core::StaticBindingText> rows;
+            for (const auto& b : dataplane.GetDhcpBindings()) {
+                rows.push_back(vgww::core::StaticBindingText{
+                    b.mac, b.ip, b.hostname});
+            }
+            std::lock_guard<std::mutex> lock(config_mutex);
+            vgww::core::MirrorDhcpBindings(cfg.dhcp.static_bindings, rows);
+        });
+
+    const auto config_has = [&cfg](const char* mac_text) {
+        vgww::core::MacAddress want{};
+        if (!vgww::core::ParseMac(mac_text, want)) {
+            return false;
+        }
+        for (const auto& b : cfg.dhcp.static_bindings) {
+            if (b.mac == want) {
+                return true;
+            }
+        }
+        return false;
+    };
+
+    // Add: the Config must carry the row afterwards.
+    CHECK(!config_has("02:00:00:00:C6:01"));
+    const CommandResult added = executor.Execute(Command{AddDhcpBindingCmd{
+        "02:00:00:00:c6:01", "192.168.46.111", "ui-host", ""}});
+    CHECK(added.ok);
+    CHECK(1 == hook_calls);
+    CHECK(config_has("02:00:00:00:C6:01"));
+
+    // Edit: the old MAC leaves the Config, the new one enters it.
+    const CommandResult edited = executor.Execute(Command{AddDhcpBindingCmd{
+        "02:00:00:00:c6:02", "192.168.46.112", "", "02:00:00:00:c6:01"}});
+    CHECK(edited.ok);
+    CHECK(!config_has("02:00:00:00:C6:01"));
+    CHECK(config_has("02:00:00:00:C6:02"));
+
+    // Delete: the Config must not keep the deleted row.
+    const CommandResult removed =
+        executor.Execute(Command{RemoveDhcpBindingCmd{"02:00:00:00:c6:02"}});
+    CHECK(removed.ok);
+    CHECK(!config_has("02:00:00:00:C6:02"));
+    CHECK(cfg.dhcp.static_bindings.empty());
+
+    // A refused command must not fire the hook at all.
+    const int before = hook_calls;
+    const CommandResult refused = executor.Execute(Command{AddDhcpBindingCmd{
+        "not-a-mac", "192.168.46.113", "", ""}});
+    CHECK(!refused.ok);
+    CHECK(hook_calls == before);
+
+    dataplane.Stop(err);
+    std::remove(cfg_path.c_str());
+    std::remove(lease_path.c_str());
+    std::remove((lease_path + ".leases6").c_str());
+    I18n::Instance().SetLang(Lang::ZhCN);
+}
+
 static void TestP141B9BridgeRunningEmptyStateNotOff() {
     using namespace vgww::ui;
     FixTextMetrics();
@@ -39428,6 +39535,7 @@ int main() {
     TestP147P27FailedApplyKeepsEdits();
     TestP147C1SuccessfulSaveNotRolledBackByLaterFailure();
     TestP148P28CorruptConfigSaveRefused();
+    TestP148P22BindingChangeReachesConfigHook();
     TestB33jCurveIsContinuous();
     TestB33kGradientAndAxisTicks();
     if (g_failures == 0) {

@@ -2816,6 +2816,26 @@ namespace vgww {
                 error);
         }
 
+        void MirrorDhcpBindings(std::vector<StaticBinding>& list,
+                                const std::vector<StaticBindingText>& rows) {
+            std::vector<StaticBinding> rebuilt;
+            rebuilt.reserve(rows.size());
+            for (const auto& row : rows) {
+                StaticBinding parsed;
+                if (!ParseMac(row.mac, parsed.mac)) {
+                    continue;
+                }
+                bool ip_ok = false;
+                parsed.ip = ParseIpv4(row.ip, ip_ok);
+                if (!ip_ok || 0 == parsed.ip) {
+                    continue;
+                }
+                parsed.hostname = row.hostname;
+                rebuilt.push_back(std::move(parsed));
+            }
+            list = std::move(rebuilt);
+        }
+
         bool UpsertDhcp6Binding(const std::string& path,
                                 const std::vector<uint8_t>& duid,
                                 const std::array<uint8_t, 16>& ip,

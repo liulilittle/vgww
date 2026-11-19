@@ -2226,7 +2226,8 @@ namespace vgww {
                      ConfigApplier config_applier,
                      std::shared_ptr<ConfigApplyStatus> apply_status,
                      ConsoleDroppedProvider console_dropped,
-                     AutostartGetter autostart_getter) {
+                     AutostartGetter autostart_getter,
+                     BindingChangedHook binding_changed) {
             // Persist rules next to the config so port-maps/bans/rate-limits
             // survive process restarts.
             {
@@ -3615,7 +3616,8 @@ namespace vgww {
                          });
 
             server.Route("POST", "/api/dhcp/bindings",
-                         [&dataplane, config_path, audit](const Request& request) {
+                         [&dataplane, config_path, audit,
+                          binding_changed](const Request& request) {
                              // batch41 (live CRUD audit): while the service is
                              // stopped there is no DHCP server to bind into;
                              // say "service not running" instead of the old
@@ -3682,11 +3684,18 @@ namespace vgww {
                              AuditWithPersist(audit,
                                  "dhcp binding add " + mac + " -> " + ip,
                                  persisted);
+                             // P148 P2-2: mirror the row into the
+                             // authoritative Config; a later failed apply must
+                             // not roll back to a snapshot without it.
+                             if (persisted && binding_changed) {
+                                 binding_changed(mac, true);
+                             }
                              return OkWithPersistFlag(persisted);
                         });
 
             server.Route("DELETE", "/api/dhcp/bindings",
-                         [&dataplane, config_path, audit](const Request& request) {
+                         [&dataplane, config_path, audit,
+                          binding_changed](const Request& request) {
                               if (!dataplane.DhcpActive()) {
                                   audit("dhcp binding delete failed (service not "
                                         "running)");
@@ -3710,6 +3719,13 @@ namespace vgww {
                              AuditWithPersist(audit, "dhcp binding delete " +
                                                   it->second,
                                               persisted);
+                             // P148 P2-2: the binding is gone in memory and on
+                             // disk; the authoritative Config must not keep
+                             // the stale row (a later failed apply would
+                             // otherwise write it back).
+                             if (persisted && binding_changed) {
+                                 binding_changed(it->second, false);
+                             }
                              return OkWithPersistFlag(persisted);
                         });
 
@@ -4234,7 +4250,8 @@ namespace vgww {
                          ConfigApplier config_applier,
                          std::shared_ptr<ConfigApplyStatus> apply_status,
                          ConsoleDroppedProvider console_dropped,
-                         AutostartGetter autostart_getter) {
+                         AutostartGetter autostart_getter,
+                         BindingChangedHook binding_changed) {
             // Fixed-token compatibility overload: freeze the same effective
             // credential and configured bit the old implementation used.
             auto state = std::make_shared<AuthTokenState>();
@@ -4249,7 +4266,8 @@ namespace vgww {
                             std::move(config_applier),
                             std::move(apply_status),
                             std::move(console_dropped),
-                            std::move(autostart_getter));
+                            std::move(autostart_getter),
+                            std::move(binding_changed));
         }
 
     }  // namespace web

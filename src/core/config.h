@@ -393,6 +393,23 @@ namespace vgww {
                                 const std::vector<uint8_t>& duid,
                                 std::string& error);
 
+        /// P148 P2-2: one DHCPv4 static binding in text form - the shape a
+        /// runtime store snapshot exposes (mac/ip as display strings).
+        struct StaticBindingText {
+            std::string mac;
+            std::string ip;
+            std::string hostname;
+        };
+
+        /// P148 P2-2: replaces `list` with `rows`, skipping entries whose mac
+        /// or ip does not parse (an unparsable store row can never be
+        /// persisted). The binding routes call this under the entry point's
+        /// config_mutex so the authoritative Config matches the runtime store;
+        /// otherwise `apply_config_live`'s pre-apply snapshot still holds a
+        /// DELETED binding and its rollback writes it back to disk.
+        void MirrorDhcpBindings(std::vector<StaticBinding>& list,
+                                const std::vector<StaticBindingText>& rows);
+
         /// Validates semantic constraints that span parsed fields (gateway
         /// shape, DHCP pool, ULA, perf/bridge ranges) plus the value ranges
         /// the JSON parser bounds at load time. Public since S4 Task 5: the

@@ -491,7 +491,10 @@ namespace vgww {
 
             CommandResult DoAddDhcpBinding(runtime::Dataplane& dataplane,
                                            const std::string& config_path,
-                                           const AddDhcpBindingCmd& cmd) {
+                                           const AddDhcpBindingCmd& cmd,
+                                           const DataplaneCommandExecutor::
+                                               BindingChangedHook&
+                                                   binding_changed) {
                 vgww::core::MacAddress mac{};
                 if (!vgww::core::ParseMac(cmd.mac, mac)) {
                     console_log::AppendAuditLine(
@@ -530,6 +533,15 @@ namespace vgww {
                     return Fail(I18n::Instance().FormatCopy(
                         Str::SaveWriteFailedFmt, {Widen(persist_error)}));
                 }
+                // P148 P2-2: mirror the row into the authoritative Config. A
+                // MAC edit dropped the old key inside PersistBindV4, so that
+                // key must leave *config as well.
+                if (binding_changed) {
+                    if (!cmd.replace_mac.empty()) {
+                        binding_changed(cmd.replace_mac, false);
+                    }
+                    binding_changed(cmd.mac, true);
+                }
                 console_log::AppendAuditLine("dhcp binding add " + cmd.mac +
                                              " -> " + cmd.ip);
                 return Ok(I18n::Instance().Copy(Str::CmdDhcpBindingAdded));
@@ -537,7 +549,9 @@ namespace vgww {
 
             CommandResult DoRemoveDhcpBinding(
                 runtime::Dataplane& dataplane, const std::string& config_path,
-                const RemoveDhcpBindingCmd& cmd) {
+                const RemoveDhcpBindingCmd& cmd,
+                const DataplaneCommandExecutor::BindingChangedHook&
+                    binding_changed) {
                 vgww::core::MacAddress mac{};
                 if (!vgww::core::ParseMac(cmd.mac, mac)) {
                     console_log::AppendAuditLine(
@@ -565,6 +579,11 @@ namespace vgww {
                         "dhcp binding delete failed (write error)");
                     return Fail(I18n::Instance().FormatCopy(
                         Str::SaveWriteFailedFmt, {Widen(persist_error)}));
+                }
+                // P148 P2-2: the binding is gone in memory and on disk; the
+                // authoritative Config must not keep the stale row.
+                if (binding_changed) {
+                    binding_changed(cmd.mac, false);
                 }
                 console_log::AppendAuditLine("dhcp binding delete " + cmd.mac);
                 return Ok(I18n::Instance().Copy(Str::CmdDhcpBindingRemoved));
@@ -1062,11 +1081,11 @@ namespace vgww {
                         return DoRemoveRateLimit(concrete);
                     } else if constexpr (std::is_same_v<T, AddDhcpBindingCmd>) {
                         return DoAddDhcpBinding(dataplane_, config_path_,
-                                                concrete);
+                                                concrete, binding_changed_);
                     } else if constexpr (std::is_same_v<T,
                                                         RemoveDhcpBindingCmd>) {
                         return DoRemoveDhcpBinding(dataplane_, config_path_,
-                                                   concrete);
+                                                   concrete, binding_changed_);
                     } else if constexpr (std::is_same_v<T,
                                                         AddDhcp6BindingCmd>) {
                         return DoAddDhcp6Binding(dataplane_, config_path_,

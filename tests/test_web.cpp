@@ -5595,6 +5595,244 @@ static void TestB93DhcpBindingPersistsToConfig() {
 // enforces on POST: proto is tcp, lan_ip is a dotted quad, both ports are
 // non-zero. A file written by hand (or by an older version) otherwise injects
 // rules that can never bind or dial, while the UI lists them as active.
+// ============================================================================
+// P148 P2-2: the DHCP binding routes changed the runtime store and the
+// document but never the authoritative Config. `apply_config_live` snapshots
+// that Config BEFORE any binding route runs and restores it on failure, so a
+// later failed apply rolled a DELETED binding back into memory and onto disk.
+// Three layers are pinned here:
+//   (1) both HTTP routes report the exact (mac, added) to the new hook;
+//   (2) MirrorDhcpBindings (the production mirror body) makes the Config
+//       match the store and drops rows that cannot parse;
+//   (3) the rollback scenario end to end: after DELETE, a failed apply's
+//       rollback write must NOT put the deleted binding back on disk.
+static void TestP148P22WebBindingChangeMirrorsConfig() {
+    using namespace vgww::core;
+
+    // (0) PRODUCTION ANCHOR (main.cpp is an exe-only TU no test binary links,
+    // same technique as TestP147RollbackPreservesNewerBindings): the hook must
+    // be handed to BOTH entry points - the headless/Web registration and the
+    // native UI executor. Wiring only one of them leaves the other able to
+    // resurrect a deleted binding through a failed apply.
+    {
+        wchar_t exe_path[MAX_PATH * 2] = {0};
+        const DWORD exe_len =
+            ::GetModuleFileNameW(nullptr, exe_path, MAX_PATH * 2);
+        CHECK(exe_len > 0 && exe_len < MAX_PATH * 2);
+        if (exe_len > 0 && exe_len < MAX_PATH * 2) {
+            namespace fs = std::filesystem;
+            fs::path dir =
+                fs::path(std::wstring(exe_path, exe_len)).parent_path();
+            fs::path root;
+            for (int i = 0; i < 8 && !dir.empty(); ++i) {
+                std::error_code mec;
+                if (fs::exists(dir / "scripts" / "native-i18n-t2" / "ar.json",
+                               mec)) {
+                    root = dir;
+                    break;
+                }
+                if (!dir.has_parent_path()) break;
+                dir = dir.parent_path();
+            }
+            CHECK(!root.empty());
+            std::ifstream in(root / "src" / "main.cpp", std::ios::binary);
+            CHECK(in.good());
+            std::string text((std::istreambuf_iterator<char>(in)),
+                             std::istreambuf_iterator<char>());
+            CHECK(text.find("on_binding_changed") != std::string::npos);
+            CHECK(text.find("MirrorDhcpBindings(config->dhcp.static_bindings") !=
+                  std::string::npos);
+            // Both wiring sites: the Web registration tail and the UI executor.
+            CHECK(text.find("on_binding_changed);") != std::string::npos);
+            CHECK(text.find("ui_executor.SetBindingChangedHook(on_binding_changed)") !=
+                  std::string::npos);
+        }
+    }
+
+    // (1) + (2) through the real routes and the real mirror helper.
+    const std::string cfg_path = ScratchFile("p148p22_web.json");
+    const std::string lease_path = ScratchFile("p148p22_web.leases.json");
+    std::remove(cfg_path.c_str());
+    std::remove(lease_path.c_str());
+    Config cfg;
+    cfg.adapter = "P22NIC";
+    cfg.mode = Mode::kMain;
+    cfg.dhcp.enabled = true;
+    bool ok = false;
+    cfg.gateway.ipv4 = ParseIpv4("192.168.47.1", ok);
+    cfg.gateway.mask = ParseIpv4("255.255.255.0", ok);
+    cfg.gateway.mac = {0x30, 0xFC, 0x68, 0x88, 0xB4, 0xD7};
+    cfg.dhcp.pool_start = ParseIpv4("192.168.47.100", ok);
+    cfg.dhcp.pool_end = ParseIpv4("192.168.47.200", ok);
+    cfg.dhcp.lease_seconds = 3600;
+    cfg.perf.workers = 2;
+    cfg.perf.ring_capacity = 64;
+    cfg.perf.max_conns = 64;
+    std::string err;
+    CHECK(cfg.SaveToFile(cfg_path, err));
+
+    vgww::runtime::Dataplane dp(cfg, lease_path);
+    dp.SetDriverClient(std::make_unique<WebFakeDriver>());
+    std::string start_error;
+    CHECK(dp.Start(start_error));
+    CHECK(dp.DhcpActive());
+
+    std::mutex config_mutex;
+    std::vector<std::pair<std::string, bool>> seen;
+    auto hook = [&cfg, &config_mutex, &dp, &seen](const std::string& mac,
+                                                  bool added) {
+        seen.push_back({mac, added});
+        std::vector<StaticBindingText> rows;
+        for (const auto& b : dp.GetDhcpBindings()) {
+            rows.push_back(StaticBindingText{b.mac, b.ip, b.hostname});
+        }
+        std::lock_guard<std::mutex> lock(config_mutex);
+        MirrorDhcpBindings(cfg.dhcp.static_bindings, rows);
+    };
+    const auto config_has = [&cfg](const char* mac_text) {
+        MacAddress want{};
+        if (!ParseMac(mac_text, want)) {
+            return false;
+        }
+        for (const auto& b : cfg.dhcp.static_bindings) {
+            if (b.mac == want) {
+                return true;
+            }
+        }
+        return false;
+    };
+
+    HttpServer api;
+    vgww::web::RegisterApi(api, dp, cfg, cfg_path, "boot-secret", {}, {}, {},
+                           {}, {}, {}, {}, {}, hook);
+    const uint16_t kP = UniquePort();
+    CHECK(api.Start("127.0.0.1", kP, err));
+
+    std::string body;
+    CHECK(200 == HttpPost(kP, "/api/dhcp/bindings", "boot-secret",
+                          R"({"mac":"02:00:00:00:d7:01","ip":"192.168.47.111","hostname":"cam"})",
+                          body));
+    CHECK(body.find("\"persisted\":true") != std::string::npos);
+    CHECK(1 == seen.size());
+    if (!seen.empty()) {
+        CHECK(seen[0].first == "02:00:00:00:d7:01");
+        CHECK(seen[0].second);
+    }
+    CHECK(config_has("02:00:00:00:D7:01"));
+    const std::string del =
+        "DELETE /api/dhcp/bindings?mac=02:00:00:00:d7:01 HTTP/1.1\r\n"
+        "Host: t\r\nX-Auth-Token: boot-secret\r\nContent-Length: 0\r\n"
+        "Connection: close\r\n\r\n";
+    CHECK(200 == HttpRaw(kP, del, body));
+    CHECK(2 == seen.size());
+    if (seen.size() >= 2) {
+        CHECK(seen[1].first == "02:00:00:00:d7:01");
+        CHECK(!seen[1].second);
+    }
+    CHECK(!config_has("02:00:00:00:D7:01"));
+    CHECK(cfg.dhcp.static_bindings.empty());
+    api.Stop();
+
+    // (2b) A store row that cannot be parsed must never enter the Config.
+    {
+        std::vector<StaticBindingText> rows;
+        rows.push_back(StaticBindingText{"02:00:00:00:d7:02", "192.168.47.112",
+                                         "good"});
+        rows.push_back(StaticBindingText{"garbage", "192.168.47.113", "bad"});
+        rows.push_back(StaticBindingText{"02:00:00:00:d7:03", "0.0.0.0", "bad"});
+        std::vector<StaticBinding> list;
+        MirrorDhcpBindings(list, rows);
+        CHECK(1 == list.size());
+        if (!list.empty()) {
+            MacAddress want{};
+            CHECK(ParseMac("02:00:00:00:d7:02", want));
+            CHECK(list[0].mac == want);
+            CHECK(list[0].hostname == "good");
+        }
+    }
+
+    // A route with no hook wired (persistence disabled) must not crash and
+    // must not pretend the hook ran.
+    {
+        HttpServer api2;
+        vgww::web::RegisterApi(api2, dp, cfg, "", "boot-secret");
+        const uint16_t kP2 = UniquePort();
+        CHECK(api2.Start("127.0.0.1", kP2, err));
+        CHECK(200 == HttpPost(kP2, "/api/dhcp/bindings", "boot-secret",
+                              R"({"mac":"02:00:00:00:d7:04","ip":"192.168.47.114"})",
+                              body));
+        CHECK(body.find("\"persisted\":false") != std::string::npos);
+        CHECK(2 == seen.size());  // an unpersisted row never mirrors
+        api2.Stop();
+        std::string ignored;
+        dp.RemoveDhcpBinding("02:00:00:00:d7:04");
+    }
+
+    // (3) Rollback: DELETE, then a failed apply's rollback save must not
+    // resurrect the binding on disk. This mirrors main.cpp's sequence:
+    // snapshot `previous` (post-fix it no longer carries the deleted row),
+    // failed apply restores it, rollback writes it back with the
+    // merge-preserving save.
+    {
+        const std::string rb_path = ScratchFile("p148p22_rollback.json");
+        std::remove(rb_path.c_str());
+        Config live = cfg;  // the authoritative Config, mirrored by the hook
+        MacAddress kept{};
+        CHECK(ParseMac("02:00:00:00:d7:10", kept));
+        live.dhcp.static_bindings.push_back(
+            StaticBinding{kept, ParseIpv4("192.168.47.220", ok), "keep"});
+        CHECK(ok);
+        CHECK(live.SaveToFile(rb_path, err));
+        CHECK(live.SaveToFile(cfg_path, err));
+
+        const Config previous = live;  // pre-apply snapshot
+        // The route deletes one binding (store + file + mirror).
+        CHECK(dp.DhcpActive());
+        MacAddress gone{};
+        CHECK(ParseMac("02:00:00:00:d7:11", gone));
+        CHECK(dp.SetDhcpBinding("02:00:00:00:d7:11", "192.168.47.221", "gone"));
+        CHECK(dp.RemoveDhcpBinding("02:00:00:00:d7:11"));
+        CHECK(DeleteDhcpBinding(cfg_path, gone, err));
+        {
+            std::vector<StaticBindingText> rows;
+            for (const auto& b : dp.GetDhcpBindings()) {
+                rows.push_back(StaticBindingText{b.mac, b.ip, b.hostname});
+            }
+            std::lock_guard<std::mutex> lock(config_mutex);
+            MirrorDhcpBindings(live.dhcp.static_bindings, rows);
+        }
+        bool in_live = false;
+        for (const auto& b : live.dhcp.static_bindings) {
+            if (b.mac == gone) in_live = true;
+        }
+        CHECK(!in_live);
+
+        // Failed apply -> rollback restores `previous` and rewrites the file
+        // with the merge-preserving save (main.cpp:920).
+        CHECK(previous.SaveToFilePreservingBindings(cfg_path, err));
+        std::string load_err;
+        const auto disk = Config::LoadFromFile(cfg_path, load_err);
+        CHECK(disk.has_value());
+        if (disk) {
+            int gone_rows = 0;
+            int kept_rows = 0;
+            for (const auto& b : disk->dhcp.static_bindings) {
+                if (b.mac == gone) ++gone_rows;
+                if (b.mac == kept) ++kept_rows;
+            }
+            CHECK(0 == gone_rows);  // the deleted binding must not resurrect
+            CHECK(1 == kept_rows);  // the unrelated binding survives
+        }
+        std::remove(rb_path.c_str());
+    }
+
+    std::string stop_error;
+    dp.Stop(stop_error);
+    std::remove(cfg_path.c_str());
+    std::remove(lease_path.c_str());
+    std::remove((lease_path + ".leases6").c_str());
+}
+
 static void TestB34oLoadedRulesAreSemanticallyValid() {
     using namespace vgww::web;
     const std::string path = WriteRuleFile(
@@ -11378,6 +11616,7 @@ int main(int argc, char** argv) {
     TestP147A3PortmapConfigEchoed();
     TestP148P25ReadRoutesNeedTokenOffLoopback();
     TestP148P26ExitWaitsForDetachedApply();
+    TestP148P22WebBindingChangeMirrorsConfig();
     TestB37tWebConfigAppliesLive();
     TestB38WebApplyStatus();
     TestB111ApplyStatusIgnoresStaleCompletion();

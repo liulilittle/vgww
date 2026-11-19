@@ -545,6 +545,13 @@ namespace vgww {
         /// doing that on an HTTP worker would self-join.
         using ConfigApplier =
             std::function<bool(const core::Config&, uint64_t attempt_id)>;
+        /// P148 P2-2: a DHCP binding was added/removed in memory and on disk.
+        /// The entry point owns the authoritative Config, so it must mirror
+        /// the change into *config (under config_mutex); otherwise a later
+        /// failed apply rolls back to a snapshot that still holds a deleted
+        /// binding and writes it back to disk.
+        using BindingChangedHook =
+            std::function<void(const std::string& mac, bool added)>;
         void RegisterApi(HttpServer& server, runtime::Dataplane& dataplane,
                          const core::Config& config,
                          const std::string& config_path,
@@ -556,7 +563,8 @@ namespace vgww {
                          ConfigApplier config_applier = {},
                          std::shared_ptr<ConfigApplyStatus> apply_status = {},
                          ConsoleDroppedProvider console_dropped = {},
-                         AutostartGetter autostart_getter = {});
+                         AutostartGetter autostart_getter = {},
+                         BindingChangedHook binding_changed = {});
 
         /// batch37s: live-token variant used by the entry point so a settings
         /// save can rotate/clear the credential and restart the listener
@@ -573,7 +581,8 @@ namespace vgww {
                          ConfigApplier config_applier = {},
                          std::shared_ptr<ConfigApplyStatus> apply_status = {},
                          ConsoleDroppedProvider console_dropped = {},
-                         AutostartGetter autostart_getter = {});
+                         AutostartGetter autostart_getter = {},
+                         BindingChangedHook binding_changed = {});
 
         /// Extracts a string field from a flat JSON body. Handles the common
         /// escapes (\" \\ \n); returns false when the key is missing.

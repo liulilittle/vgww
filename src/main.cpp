@@ -834,6 +834,25 @@ namespace {
         // from an HTTP worker, which http.Stop would self-join). The mutex
         // serializes concurrent Web saves.
         std::mutex apply_mutex;
+        // P148 P2-2: a DHCP binding route changes the runtime store and the
+        // file, but used to leave the authoritative Config (this lambda's
+        // `*config`) untouched. `apply_config_live` snapshots that Config
+        // before an apply (main.cpp:847) and restores it on failure
+        // (main.cpp:903) - so a failed apply rolled a DELETED binding back
+        // into memory and onto disk. The runtime store is the source of
+        // truth for bindings; every successful add/remove mirrors the whole
+        // v4 binding set into *config under config_mutex.
+        const auto on_binding_changed = [&dataplane, &config, &config_mutex](
+                                            const std::string&, bool) {
+            std::vector<vgww::core::StaticBindingText> rows;
+            for (const auto& b : dataplane.GetDhcpBindings()) {
+                rows.push_back(vgww::core::StaticBindingText{
+                    b.mac, b.ip, b.hostname});
+            }
+            std::lock_guard<std::mutex> lock(*config_mutex);
+            vgww::core::MirrorDhcpBindings(config->dhcp.static_bindings,
+                                           rows);
+        };
         auto apply_config_live = [&](const Config& next,
                                      std::wstring& error) -> bool {
             std::lock_guard<std::mutex> apply_lock(apply_mutex);
@@ -1087,7 +1106,10 @@ namespace {
             // P146 D7: the read half of "Start with Windows". Reads the Run key
             // the tray owns (tray.cpp:511 IsAutostartEnabled) so the console's
             // checkbox can echo what the machine will actually do.
-            [] { return vgww::ui::tray::IsAutostartEnabled(); });
+            [] { return vgww::ui::tray::IsAutostartEnabled(); },
+            // P148 P2-2: binding routes keep *config in step with the store
+            // so an apply rollback cannot resurrect a deleted binding.
+            on_binding_changed);
 
         // HttpServer is OPT-IN (--web / --web-only; S4.4 switched the default off).
         // It binds the configured web.bind (default 127.0.0.1) - never every
@@ -1157,6 +1179,8 @@ namespace {
             vgww::ui::DataplaneCommandExecutor ui_executor(
                 dataplane, config_path, &vgww::ui::TrayAutostartHook,
                 std::move(apply_live));
+            // P148 P2-2: the native binding commands mirror into *config too.
+            ui_executor.SetBindingChangedHook(on_binding_changed);
             vgww::ui::UiController ui_controller(ui_source, ui_executor);
 
             std::string controller_error;

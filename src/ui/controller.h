@@ -104,6 +104,13 @@ namespace vgww {
             /// reports a failure (the file is already saved).
             using ApplyLiveHook =
                 std::function<bool(const core::Config&, std::wstring& error)>;
+            /// P148 P2-2: a DHCP binding was added/removed in memory and on
+            /// disk. The entry point owns the authoritative Config, so it must
+            /// mirror the change into *config (under config_mutex); otherwise
+            /// a later failed apply rolls back to a snapshot that still holds
+            /// a deleted binding and writes it back to disk.
+            using BindingChangedHook =
+                std::function<void(const std::string& mac, bool added)>;
 
             DataplaneCommandExecutor(runtime::Dataplane& dataplane,
                                      std::string config_path,
@@ -112,11 +119,16 @@ namespace vgww {
 
             CommandResult Execute(const Command& cmd) override;
 
+            void SetBindingChangedHook(BindingChangedHook hook) {
+                binding_changed_ = std::move(hook);
+            }
+
         private:
             runtime::Dataplane& dataplane_;
             std::string config_path_;
             AutostartHook autostart_;
             ApplyLiveHook apply_live_;
+            BindingChangedHook binding_changed_;
         };
 
     }  // namespace ui
