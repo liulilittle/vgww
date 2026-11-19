@@ -2423,6 +2423,18 @@ namespace vgww {
                                   // icmp_replies, which stays truthful.
                                   << ",\"icmp_too_big\":"
                                   << stats.icmp_too_big.load()
+                                  // The ICMP relay tag pool and the driver send
+                                  // path were the two counters the data plane
+                                  // kept but no reader consumed: a saturated tag
+                                  // pool silently stopped answering pings, and a
+                                  // failing send IOCTL dropped every frame in
+                                  // the batch with no trace anywhere.
+                                  << ",\"icmp_tag_exhausted\":"
+                                  << stats.icmp_tag_exhausted.load()
+                                  << ",\"portmap_send_dropped\":"
+                                  << stats.portmap_send_dropped.load()
+                                  << ",\"tx_send_failed_frames\":"
+                                  << stats.tx_send_failed_frames.load()
                                   // batch128: capacity-boundary faults the
                                   // native UI surfaces (bridge page) but the
                                   // WebUI status poll never carried.

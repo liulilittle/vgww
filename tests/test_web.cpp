@@ -1854,6 +1854,13 @@ static void TestB127StatusContractKeys() {
         CHECK(require(std::string("dhcp6.") + key));
     }
     CHECK(require("stats.udp_flow_evictions"));
+    // The tag-pool exhaustion and driver-send failure counters used to exist on
+    // the data plane with no reader at all: a saturated ICMP relay pool stopped
+    // answering pings and a failing send IOCTL dropped whole batches with
+    // nothing on screen. The status poll must carry them.
+    CHECK(require("stats.icmp_tag_exhausted"));
+    CHECK(require("stats.portmap_send_dropped"));
+    CHECK(require("stats.tx_send_failed_frames"));
     CHECK(require("bridge.mac_evictions"));
     CHECK(require("bridge.neighbor_rejections"));
     CHECK(require("dhcp.rate_limit_resets"));
