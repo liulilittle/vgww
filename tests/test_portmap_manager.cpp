@@ -2336,6 +2336,105 @@ void TestB312ApplyRulesIsChangeDriven() {
         store.Clear();
     }
 
+    /// P148 A-7: the WAN->LAN backpressure pause leaves the WAN read ARMED, so
+    /// no read completion will refresh `last_io` while the chain is paused. The
+    /// idle sweep measures `last_io`, so a relay that paused late in its idle
+    /// window was reclaimed as "idle" the moment the pre-pause age plus the
+    /// pause crossed the threshold - even though it was alive and merely
+    /// waiting on a full send queue. Stamping `last_io` at the pause makes the
+    /// sweep measure from the pause itself, which is the honest reading of
+    /// "no traffic in either direction".
+    void TestP148A7PausedRelayIsNotReapedAsIdle() {
+        xtcp::buf::InitPools();
+        NullBackend backend;
+        xtcp::XtcpStack stack(&backend);
+        stack.SetMaxConnections(16);
+
+        vgww::core::Config config;
+        config.gateway.ipv4 = kGatewayIp;
+        config.gateway.mask = (0u) | (0u << 8) | (255u << 16) | (255u << 24);
+        config.gateway.mac = {0x30, 0xFC, 0x68, 0x88, 0xB4, 0xA9};
+        config.portmap.idle_timeout_s = 3;
+
+        const uint16_t wan_port = ProbeFreePort();
+        CHECK(0 != wan_port);
+        auto& store = vgww::web::RuleStore::Instance();
+        store.Clear();
+        store.AddPortMap({"tcp", wan_port, "127.0.0.1", 45678});
+
+        std::atomic<bool> accepting{true};
+        std::atomic<uint64_t> lan_calls{0};
+        auto send_to_lan = [&](uint64_t, const uint8_t*, uint32_t) -> bool {
+            lan_calls.fetch_add(1, std::memory_order_relaxed);
+            return accepting.load(std::memory_order_relaxed);
+        };
+        const auto teardown = [](uint64_t, bool) {};
+
+        auto& manager = vgww::relay::PortMapManager::Instance();
+        manager.Stop();
+        manager.Start(&stack, config, send_to_lan, teardown);
+        CHECK(WaitFor([&] { return manager.LiveAcceptLoops() >= 1; }, 3000));
+        const uint64_t reaped_before = manager.GetStats().idle_reaped.load();
+
+        asio::io_context io;
+        asio::ip::tcp::socket client(io);
+        std::error_code ec;
+        client.connect(asio::ip::tcp::endpoint(
+                           asio::ip::make_address("127.0.0.1"), wan_port),
+                       ec);
+        CHECK(!ec);
+        CHECK(WaitFor([&] { return 0 != manager.LastRelayConnId(); }, 5000));
+        const uint64_t conn_id = manager.LastRelayConnId();
+        manager.OnStackState(conn_id, 4);
+        CHECK(WaitFor([&] { return manager.RelayCountForTest() >= 1; }, 5000));
+
+        // Traffic reaches the LAN: this is the read completion that stamps
+        // `last_io`.
+        std::error_code send_err;
+        client.send(asio::buffer("live", 4), 0, send_err);
+        CHECK(!send_err);
+        CHECK(WaitFor([&] { return lan_calls.load() >= 1; }, 3000));
+        CHECK(1 == manager.RelayCountForTest());
+
+        // Age the stamp to just under the threshold while the relay stays up.
+        std::this_thread::sleep_for(std::chrono::milliseconds(2600));
+        CHECK(0 == manager.GetStats().idle_reaped.load() - reaped_before);
+        CHECK(1 == manager.RelayCountForTest());
+
+        // The LAN queue is full now: this datagram pauses the chain. The pause
+        // is short - but the pre-pause age plus this pause crosses the
+        // threshold, which is exactly the window the fix closes.
+        accepting.store(false, std::memory_order_relaxed);
+        client.send(asio::buffer("backpressure", 12), 0, send_err);
+        CHECK(!send_err);
+        CHECK(WaitFor([&] { return lan_calls.load() >= 2; }, 3000));
+        std::this_thread::sleep_for(std::chrono::milliseconds(900));
+
+        const uint64_t reaped_paused =
+            manager.GetStats().idle_reaped.load() - reaped_before;
+        std::printf("P148 A-7 paused: live=%zu reaped_delta=%llu lan_calls=%llu\n",
+                    manager.RelayCountForTest(),
+                    static_cast<unsigned long long>(reaped_paused),
+                    static_cast<unsigned long long>(lan_calls.load()));
+        CHECK(0 == reaped_paused);
+        CHECK(1 == manager.RelayCountForTest());
+
+        // The pause is a live state, not a dead one: once the queue drains the
+        // relay must still forward NEW traffic. (The datagram that triggered
+        // the pause was dropped by contract, so this sends a fresh one.)
+        accepting.store(true, std::memory_order_relaxed);
+        manager.ResumePausedWanReads();
+        CHECK(WaitFor([&] { return lan_calls.load() >= 2; }, 3000));
+        const uint64_t lan_after_resume = lan_calls.load();
+        client.send(asio::buffer("resumed", 7), 0, send_err);
+        CHECK(!send_err);
+        CHECK(WaitFor([&] { return lan_calls.load() > lan_after_resume; }, 5000));
+
+        client.close(ec);
+        manager.Stop();
+        store.Clear();
+    }
+
 }  // namespace
 
 int main() {
@@ -2363,6 +2462,7 @@ int main() {
     TestP147RelayCapRefusesFlood();
     TestP147PerRuleCapIsolatesOnePort();
     TestP148P212RemovedRuleClosesEstablishedRelays();
+    TestP148A7PausedRelayIsNotReapedAsIdle();
     TestP148FailedBindRetriesWithBackoff();
     TestB312ApplyRulesIsChangeDriven();   // last: it fails one bind on purpose
 

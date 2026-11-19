@@ -758,6 +758,17 @@ namespace vgww {
                                     return;
                                 }
                                 it->second.wan_read_paused = true;
+                                // P148 A-7: a paused relay is NOT an idle one.
+                                // The read stays armed, so no completion will
+                                // ever refresh last_io until the data plane
+                                // drains and calls ResumePausedWanReads - and
+                                // the idle sweep would then reclaim a live
+                                // connection that is merely waiting on
+                                // backpressure. Stamping here keeps the sweep's
+                                // meaning ("no traffic in either direction for
+                                // idle_timeout_") true for the paused state too.
+                                it->second.last_io =
+                                    std::chrono::steady_clock::now();
                                 return;  // wan_read_armed stays true: hard pause
                             }
                             const auto it = relays_.find(conn_id);
