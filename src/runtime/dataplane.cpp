@@ -579,6 +579,12 @@ namespace vgww {
             /// driver or detached NIC warns exactly once instead of spamming
             /// the console every 200 ms poll.
             std::string last_ioctl_warn_;
+            /// P148 P2-3: the RX thread and FlushBatch both write this de-duplicator,
+            /// and std::string assignment frees the old buffer - two concurrent
+            /// assignments are a heap corruption, not a benign race. One mutex covers
+            /// the compare-and-store so the "warn once per distinct text" contract
+            /// still holds across both threads.
+            std::mutex ioctl_warn_mutex_;
 
             /// WAN->LAN send requests from the port-map manager thread,
             /// flushed on worker 0 (stack emit requires a worker context).
@@ -2257,10 +2263,14 @@ namespace vgww {
                             // Mostly just an empty queue, but a genuine
                             // IOCTL failure must not vanish silently: report
                             // each distinct error text once.
-                            if (!err.empty() && last_ioctl_warn_ != err) {
-                                last_ioctl_warn_ = err;
-                                std::fprintf(stderr, "[vgww] driver: %s\n",
-                                             err.c_str());
+                            if (!err.empty()) {
+                                std::lock_guard<std::mutex> warn_lock(
+                                    ioctl_warn_mutex_);
+                                if (last_ioctl_warn_ != err) {
+                                    last_ioctl_warn_ = err;
+                                    std::fprintf(stderr, "[vgww] driver: %s\n",
+                                                 err.c_str());
+                                }
                             }
                             break;
                         }
@@ -4019,9 +4029,12 @@ namespace vgww {
                         target.handle, batch.data(),
                         static_cast<uint32_t>(batch.size()), err);
                 }
-                if (!ok && !err.empty() && last_ioctl_warn_ != err) {
-                    last_ioctl_warn_ = err;
-                    std::fprintf(stderr, "[vgww] driver: %s\n", err.c_str());
+                if (!ok && !err.empty()) {
+                    std::lock_guard<std::mutex> warn_lock(ioctl_warn_mutex_);
+                    if (last_ioctl_warn_ != err) {
+                        last_ioctl_warn_ = err;
+                        std::fprintf(stderr, "[vgww] driver: %s\n", err.c_str());
+                    }
                 }
                 batch.clear();
             }

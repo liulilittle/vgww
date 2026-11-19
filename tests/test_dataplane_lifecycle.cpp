@@ -1638,6 +1638,86 @@ namespace {
         std::remove((lease_path + ".leases6").c_str());
     }
 
+    // P148 P2-3: `last_ioctl_warn_` is written by the RX thread (:2266) and
+    // by FlushBatch (:4032) with no synchronisation; std::string assignment
+    // frees the old buffer, so two concurrent writers are a heap corruption
+    // (UAF on the reader side), not a benign data race.
+    //
+    // W5: a data race cannot be reproduced deterministically from a unit
+    // test, and the two writers live inside a running dataplane TU whose
+    // thread plumbing is not injectable. This test therefore does NOT claim
+    // to demonstrate the race at runtime; it pins the fix structurally: both
+    // assignments must sit inside `warn_lock(ioctl_warn_mutex_)`, and the
+    // mutex must be a member of the plane. Deleting either lock_guard turns
+    // this red (verified by mutation P148-mut-p23).
+    void TestP148P23IoctlWarnRace() {
+        wchar_t exe_path[MAX_PATH * 2] = {0};
+        const DWORD exe_len =
+            ::GetModuleFileNameW(nullptr, exe_path, MAX_PATH * 2);
+        CHECK(exe_len > 0 && exe_len < MAX_PATH * 2);
+        if (exe_len <= 0 || exe_len >= MAX_PATH * 2) {
+            return;
+        }
+        namespace fs = std::filesystem;
+        fs::path dir = fs::path(std::wstring(exe_path, exe_len)).parent_path();
+        fs::path root;
+        for (int i = 0; i < 8 && !dir.empty(); ++i) {
+            std::error_code mec;
+            if (fs::exists(dir / "src" / "runtime" / "dataplane.cpp", mec)) {
+                root = dir;
+                break;
+            }
+            if (!dir.has_parent_path()) break;
+            dir = dir.parent_path();
+        }
+        CHECK(!root.empty());
+        if (root.empty()) {
+            return;
+        }
+        std::ifstream in(root / "src" / "runtime" / "dataplane.cpp",
+                         std::ios::binary);
+        CHECK(in.good());
+        if (!in.good()) {
+            return;
+        }
+        std::string text((std::istreambuf_iterator<char>(in)),
+                         std::istreambuf_iterator<char>());
+
+        // (1) The de-duplicator is still a member and the guard exists.
+        CHECK(text.find("std::string last_ioctl_warn_;") != std::string::npos);
+        CHECK(text.find("std::mutex ioctl_warn_mutex_;") != std::string::npos);
+
+        // (2) Every `last_ioctl_warn_ = err;` store must be preceded by its
+        // own `warn_lock(ioctl_warn_mutex_)` guard. The guard may wrap across
+        // lines, so anchor on the declaration head and require the mutex name
+        // inside the same guard window.
+        size_t from = 0;
+        int guarded_stores = 0;
+        for (;;) {
+            const size_t store = text.find("last_ioctl_warn_ = err;", from);
+            if (store == std::string::npos) {
+                break;
+            }
+            const size_t lock =
+                text.rfind("std::lock_guard<std::mutex> warn_lock", store);
+            CHECK(lock != std::string::npos);
+            if (lock != std::string::npos) {
+                const std::string between = text.substr(lock, store - lock);
+                // The guard must name the warn mutex ...
+                CHECK(between.find("ioctl_warn_mutex_") != std::string::npos);
+                // ... and must be the *enclosing* one, not a stale guard from
+                // the previous site: no other store may sit in between.
+                CHECK(between.find("last_ioctl_warn_ = err;") ==
+                      std::string::npos);
+                ++guarded_stores;
+            }
+            from = store + 1;
+        }
+        // Exactly the two known writers, both guarded. A third unguarded
+        // writer added later shows up as guarded_stores != 2.
+        CHECK(2 == guarded_stores);
+    }
+
 }  // namespace
 
 int main() {
@@ -1662,6 +1742,7 @@ int main() {
     TestStartFailureAfterThreadsRollsBack();
     TestP13ConcurrentFacadeVsLifecycle();
     TestP13FacadeReaderCannotOutliveServer();
+    TestP148P23IoctlWarnRace();
 
     if (0 == g_failures) {
         std::puts("test_dataplane_lifecycle: ALL PASS");
