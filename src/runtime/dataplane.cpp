@@ -3207,8 +3207,23 @@ namespace vgww {
                         last_sweep = now;
                     }
                     if (0 == n) {
-                        std::this_thread::sleep_for(
-                            std::chrono::microseconds(200));
+                        // Idle backoff. The 200 us sleep this replaced is quantised
+                        // by the Windows wait scheduler to one tick, and the tick
+                        // here is far coarser than 200 us, so the control work
+                        // below ran far slower than intended whenever no frames
+                        // were in flight. Waiting on the RX wake event keeps the
+                        // idle wake-up at the event itself - the RX thread
+                        // signals it once per frame - while the timeout still
+                        // bounds the control period so the 5 s sweep cannot
+                        // drift. Stop and the teardown path signal this event
+                        // before joining the workers, so a shutdown cannot sit
+                        // out the timeout.
+                        if (rx_event) {
+                            ::WaitForSingleObject(rx_event.get(), 1);
+                        } else {
+                            std::this_thread::sleep_for(
+                                std::chrono::microseconds(200));
+                        }
                     }
                 }
                 t_worker_index = kNoRing;
