@@ -546,6 +546,12 @@ namespace vgww {
             /// defaults over it - these two name the reason and the remedy.
             SettingsConfigUnreadableFmt,
             SettingsConfigUnreadableHint,
+            /// P3-9: the service start/stop failure used to hand the engine's
+            /// raw English error straight to the operator. The localized
+            /// sentence now carries that original text in placeholder 0, so
+            /// the diagnosis survives while the sentence is translated.
+            CmdServiceStartFailed,
+            CmdServiceStopFailed,
             _Count
         };
 

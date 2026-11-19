@@ -441,19 +441,26 @@ namespace vgww {
                             error = "dhcp.dns entry malformed ipv4";
                             return;
                         }
-                        // Skip the unspecified address: handing clients a
-                        // 0.0.0.0 resolver is a silent misconfiguration.
-                        if (ip != 0) {
-                            // C6: the same usability rule the programmatic
-                            // validator and the host-DNS fallback apply.
-                            if (const char* why = DnsResolverRejection(
-                                    ip, config.gateway.ipv4,
-                                    config.gateway.mask)) {
-                                error = std::string("dhcp.dns entry ") + why;
-                                return;
-                            }
-                            config.dhcp.dns.push_back(ip);
+                        // P3-6: the unspecified address is an ERROR, not a
+                        // value to skip. Skipping it silently fell through to
+                        // FillDefaultDns below, so an operator who wrote
+                        // "dns": ["0.0.0.0"] got the HOST's resolvers while the
+                        // file claimed otherwise - the same silent mismatch
+                        // every other malformed entry already refuses.
+                        if (0 == ip) {
+                            error = "dhcp.dns entry is the unspecified "
+                                    "address (0.0.0.0)";
+                            return;
                         }
+                        // C6: the same usability rule the programmatic
+                        // validator and the host-DNS fallback apply.
+                        if (const char* why = DnsResolverRejection(
+                                ip, config.gateway.ipv4,
+                                config.gateway.mask)) {
+                            error = std::string("dhcp.dns entry ") + why;
+                            return;
+                        }
+                        config.dhcp.dns.push_back(ip);
                     }
                 }
                 if (config.dhcp.dns.empty()) {
@@ -641,14 +648,21 @@ namespace vgww {
                                     "(no \"/length\" suffix)";
                             return;
                         }
-                        // Skip the unspecified address (::): an all-zero
-                        // RDNSS entry is a silent misconfiguration.
+                        // P3-6: the unspecified address (::) is an ERROR,
+                        // not a value to skip. An RDNSS option carrying ::
+                        // is not a valid recursive resolver (RFC 8106 sends
+                        // real unicast addresses), and skipping it silently
+                        // removed exactly one operator-requested entry while
+                        // the file kept claiming it - so the same silent
+                        // mismatch every malformed entry here refuses.
                         bool all_zero = true;
                         for (const uint8_t b : addr) {
                             all_zero = all_zero && (0 == b);
                         }
                         if (all_zero) {
-                            continue;
+                            error = "ipv6.dns[" + std::to_string(i) +
+                                    "] is the unspecified address (::)";
+                            return;
                         }
                         config.ipv6.dns.push_back(addr);
                     }
@@ -1558,6 +1572,16 @@ namespace vgww {
                 const uint32_t host_bits = ~hmask;
                 const uint32_t gw_host = HostOrder(config.gateway.ipv4);
                 for (const uint32_t ip : config.dhcp.dns) {
+                    // P3-6: DnsResolverRejection() treats 0 as the internal
+                    // "no resolver" sentinel (FillDefaultDns relies on that),
+                    // so the programmatic path must refuse the unspecified
+                    // address itself. Without this, SaveToFile wrote
+                    // "dns": ["0.0.0.0"] while the loader now rejects it.
+                    if (0 == ip) {
+                        error = "dhcp.dns entry is the unspecified address "
+                                "(0.0.0.0)";
+                        return false;
+                    }
                     // C6: one rule set for every source of dhcp.dns values.
                     if (const char* why = DnsResolverRejection(
                             ip, config.gateway.ipv4, config.gateway.mask)) {

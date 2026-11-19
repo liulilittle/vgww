@@ -439,22 +439,39 @@ namespace vgww {
                     error = "invalid mac";
                     return false;
                 }
-                if (!replace_mac.empty()) {
-                    vgww::core::MacAddress old{};
-                    if (vgww::core::ParseMac(replace_mac, old)) {
-                        std::string ignored;
-                        (void)vgww::core::DeleteDhcpBinding(config_path, old,
-                                                            ignored);
-                    }
-                }
                 bool parsed = false;
                 const uint32_t ip = vgww::core::ParseIpv4(ip_text, parsed);
                 if (!parsed) {
                     error = "invalid ip";
                     return false;
                 }
-                return vgww::core::UpsertDhcpBinding(config_path, mac, ip,
-                                                     hostname, error);
+                // P3-8: upsert BEFORE deleting the old key. The old order
+                // deleted first and ignored the delete's result, so an upsert
+                // failure (disk full, permission, validation) left the operator
+                // with neither binding - strictly worse than doing nothing.
+                // A MAC edit that fails now leaves the original row untouched;
+                // if the delete afterwards fails, the new row is already saved
+                // and the stale row is the smaller problem to report.
+                const bool saved = vgww::core::UpsertDhcpBinding(
+                    config_path, mac, ip, hostname, error);
+                if (!saved) {
+                    return false;
+                }
+                if (!replace_mac.empty()) {
+                    vgww::core::MacAddress old{};
+                    if (vgww::core::ParseMac(replace_mac, old)) {
+                        std::string ignored;
+                        if (!vgww::core::DeleteDhcpBinding(config_path, old,
+                                                           ignored)) {
+                            // The new row is already durable; the stale one is
+                            // only cosmetic, but say so instead of hiding it.
+                            error = "saved the new binding but could not remove "
+                                    "the old one";
+                            return true;
+                        }
+                    }
+                }
+                return true;
             }
 
             bool PersistBindV6(const std::string& config_path,
@@ -782,7 +799,11 @@ namespace vgww {
                 if (!dataplane.Start(error)) {
                     console_log::AppendAuditLine(
                         "service start failed (" + error + ")");
-                    return Fail(Widen(error));
+                    // P3-9: the engine error is English diagnostics. Keep it
+                    // (operators need the original), but wrap it in a localized
+                    // sentence instead of passing the raw text through.
+                    return Fail(I18n::Instance().FormatCopy(
+                        Str::CmdServiceStartFailed, {Widen(error)}));
                 }
                 console_log::AppendAuditLine("service started");
                 return Ok(I18n::Instance().Copy(Str::CmdServiceStarted));
@@ -796,7 +817,9 @@ namespace vgww {
                 if (!dataplane.Stop(error)) {
                     console_log::AppendAuditLine(
                         "service stop failed (" + error + ")");
-                    return Fail(Widen(error));
+                    // P3-9: same localization rule as the start path.
+                    return Fail(I18n::Instance().FormatCopy(
+                        Str::CmdServiceStopFailed, {Widen(error)}));
                 }
                 // batch100 semantics: a clean teardown whose lease dump failed
                 // returns true with a non-empty error. Reporting a plain

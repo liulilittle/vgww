@@ -555,17 +555,16 @@ namespace {
         if (empty_dns.config) {
             CHECK(empty_dns.config->ipv6.dns.empty());
         }
-        // An unspecified address (::) must be skipped, not advertised.
+        // P3-6: an unspecified address (::) is a hard error, not a value to
+        // skip - skipping it silently dropped one operator-requested RDNSS
+        // entry while the file still claimed it.
         const auto zero_dns = LoadFromText(
             ScratchFile("test_cfg_ipv6.json"),
             Skeleton(
                 R"("ipv6":{"enabled":true,"ula_prefix":"fd00::/64","dns":["::","fd00::1"]})"));
         CHECK(zero_dns.wrote);
-        CHECK(zero_dns.config.has_value());
-        if (zero_dns.config) {
-            CHECK(zero_dns.config->ipv6.dns.size() == 1);
-            CHECK(zero_dns.config->ipv6.dns[0][0] == 0xFD);
-        }
+        CHECK(!zero_dns.config.has_value());
+        CHECK(zero_dns.error.find("unspecified") != std::string::npos);
         // Reject: more than 3, a "/length" suffix, malformed, non-string.
         const auto reject_dns = [&](const std::string& dns) {
             const auto r = LoadFromText(
@@ -3204,6 +3203,89 @@ void TestB34mDhcpDnsMustBeUsable() {
     CHECK(normal.config.has_value());
 }
 
+// P3-6: an explicit unspecified resolver is an ERROR, never a value to skip.
+// The old parser dropped 0.0.0.0 from "dhcp.dns" and then fell through to
+// FillDefaultDns, so an operator who wrote ["0.0.0.0"] silently got the HOST's
+// resolvers while the file claimed otherwise.
+static void TestP36DhcpDnsUnspecifiedRejected() {
+    const auto zero = LoadFromText(
+        ScratchFile("test_cfg_p36_dhcp_zero.json"),
+        Skeleton(R"("dhcp":{"dns":["0.0.0.0"]})"));
+    CHECK(zero.wrote);
+    CHECK(!zero.config.has_value());
+    if (zero.error.find("unspecified") == std::string::npos &&
+        zero.error.find("0.0.0.0") == std::string::npos) {
+        std::fprintf(stderr, "p3-6: unexpected error text: %s\n",
+                     zero.error.c_str());
+    }
+    CHECK(zero.error.find("unspecified") != std::string::npos ||
+          zero.error.find("0.0.0.0") != std::string::npos);
+    // A zero entry poisons the whole list, even next to a usable resolver:
+    // skipping only the bad entry is exactly the silent mismatch being fixed.
+    const auto mixed = LoadFromText(
+        ScratchFile("test_cfg_p36_dhcp_mixed.json"),
+        Skeleton(R"("dhcp":{"dns":["8.8.8.8","0.0.0.0"]})"));
+    CHECK(mixed.wrote);
+    CHECK(!mixed.config.has_value());
+
+    // Regression: an ordinary resolver still loads untouched.
+    const auto normal = LoadFromText(
+        ScratchFile("test_cfg_p36_dhcp_ok.json"),
+        Skeleton(R"("dhcp":{"dns":["8.8.8.8"]})"));
+    CHECK(normal.wrote);
+    CHECK(normal.config.has_value());
+    if (normal.config) {
+        bool ok = false;
+        const uint32_t expected = vgww::core::ParseIpv4("8.8.8.8", ok);
+        CHECK(ok);
+        CHECK(normal.config->dhcp.dns.size() == 1);
+        CHECK(normal.config->dhcp.dns.front() == expected);
+    }
+
+    // Regression: an ABSENT dns key must still reach FillDefaultDns.
+    bool ok = false;
+    const uint32_t host_dns = vgww::core::ParseIpv4("9.9.9.9", ok);
+    CHECK(ok);
+    vgww::core::SetDefaultDnsProbeForTest(
+        [host_dns] { return std::vector<uint32_t>{host_dns}; });
+    const auto absent = LoadFromText(
+        ScratchFile("test_cfg_p36_dhcp_absent.json"),
+        Skeleton(R"("dhcp":{"enabled":true})"));
+    vgww::core::SetDefaultDnsProbeForTest({});
+    CHECK(absent.wrote);
+    CHECK(absent.config.has_value());
+    if (absent.config) {
+        CHECK(absent.config->dhcp.dns.size() == 1);
+        CHECK(absent.config->dhcp.dns.front() == host_dns);
+    }
+}
+
+// P3-6 (programmatic half): the UI settings draft builds a Config directly and
+// only passes ValidateConfig. DnsResolverRejection(0) is the internal "no
+// resolver" sentinel, so that function must not be the gate for 0 - the
+// validator has to refuse it on its own or SaveToFile writes a file the loader
+// now rejects.
+static void TestP36ValidateConfigRejectsUnspecifiedDns() {
+    vgww::core::Config c = MakeFullConfig();
+    c.dhcp.dns.clear();
+    c.dhcp.dns.push_back(0);
+    std::string error;
+    if (vgww::core::ValidateConfig(c, error)) {
+        std::fprintf(stderr,
+                     "p3-6: ValidateConfig accepted dhcp.dns = 0.0.0.0\n");
+    }
+    CHECK(!vgww::core::ValidateConfig(c, error));
+    CHECK(error.find("unspecified") != std::string::npos ||
+          error.find("0.0.0.0") != std::string::npos);
+
+    // And the same value must not survive a SaveToFile round trip.
+    std::string save_error;
+    CHECK(!c.SaveToFile(ScratchFile("test_cfg_p36_save.json"), save_error));
+    CHECK(save_error.find("unspecified") != std::string::npos ||
+          save_error.find("0.0.0.0") != std::string::npos);
+    std::remove(ScratchFile("test_cfg_p36_save.json").c_str());
+}
+
 // `perf.rx_batch` frames are produced per read, but they are buffered in a
 // ring of `perf.ring_capacity` entries (dataplane.cpp:859-861). When one batch
 // is larger than the ring, the producer can never enqueue a full batch, so
@@ -3433,6 +3515,8 @@ int main() {
     TestB34mVlanEnabledWithoutIdRejected();
     TestB34mDhcpv6RequiresIpv6();
     TestB34mDhcpDnsMustBeUsable();
+    TestP36DhcpDnsUnspecifiedRejected();
+    TestP36ValidateConfigRejectsUnspecifiedDns();
     TestB34mRxBatchMustFitRing();
     TestB84WebBindBounds();
     TestP147PortmapSection();

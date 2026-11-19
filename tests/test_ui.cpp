@@ -38934,6 +38934,184 @@ static void TestP148P22BindingChangeReachesConfigHook() {
     I18n::Instance().SetLang(Lang::ZhCN);
 }
 
+// P3-8 (red anchor): PersistBindV4 deleted the replaced MAC row BEFORE the
+// upsert and threw the delete verdict away. When the upsert fails the operator
+// is left with NEITHER row - an edit that fails is worse than an edit that was
+// never attempted. The upsert failure is injected honestly: a second process
+// seeds a disk-only row that occupies the address the edit wants, so the
+// document validator refuses the new row (duplicate bound address) while the
+// in-memory store still accepts the re-key.
+static void TestP38FailedEditKeepsOldBinding() {
+    using namespace vgww::ui;
+    FixTextMetrics();
+    I18n::Instance().SetLang(Lang::ZhCN);
+
+    const std::string cfg_path = TempDirNarrowUnique("p38_ui.json");
+    const std::string lease_path = TempDirNarrowUnique("p38_ui.leases.json");
+    std::remove(cfg_path.c_str());
+    std::remove(lease_path.c_str());
+
+    vgww::core::Config cfg;
+    cfg.adapter = "Ethernet";
+    cfg.mode = vgww::core::Mode::kMain;
+    cfg.dhcp.enabled = true;
+    bool ok = false;
+    cfg.gateway.ipv4 = vgww::core::ParseIpv4("192.168.49.1", ok);
+    cfg.gateway.mask = vgww::core::ParseIpv4("255.255.255.0", ok);
+    cfg.gateway.mac = {0x30, 0xFC, 0x68, 0x88, 0xB4, 0xC7};
+    cfg.dhcp.pool_start = vgww::core::ParseIpv4("192.168.49.100", ok);
+    cfg.dhcp.pool_end = vgww::core::ParseIpv4("192.168.49.200", ok);
+    cfg.dhcp.lease_seconds = 3600;
+    cfg.perf.workers = 2;
+    cfg.perf.ring_capacity = 64;
+    cfg.perf.max_conns = 64;
+    std::string err;
+    CHECK(cfg.SaveToFile(cfg_path, err));
+
+    vgww::runtime::Dataplane dataplane(cfg, lease_path);
+    dataplane.SetDriverClient(std::make_unique<B24AdapterDriver>());
+    CHECK(dataplane.Start(err));
+    CHECK(dataplane.DhcpActive());
+
+    DataplaneCommandExecutor executor(dataplane, cfg_path);
+
+    // The row a failed edit must NOT destroy.
+    const CommandResult added = executor.Execute(Command{AddDhcpBindingCmd{
+        "02:00:00:00:c7:01", "192.168.49.111", "old-host", ""}});
+    CHECK(added.ok);
+
+    const auto disk_has = [&cfg_path](const char* mac_text) {
+        std::string load_error;
+        const auto disk = vgww::core::Config::LoadFromFile(cfg_path, load_error);
+        CHECK(disk.has_value());
+        if (!disk) {
+            return false;
+        }
+        vgww::core::MacAddress want{};
+        if (!vgww::core::ParseMac(mac_text, want)) {
+            return false;
+        }
+        for (const auto& b : disk->dhcp.static_bindings) {
+            if (b.mac == want) {
+                return true;
+            }
+        }
+        return false;
+    };
+    CHECK(disk_has("02:00:00:00:C7:01"));
+
+    // Second process (simulated): seed a DISK-ONLY row on the address the edit
+    // below targets. The running dataplane's in-memory config does not know
+    // it, so the runtime store accepts the re-key; the document validator
+    // does not, so the upsert is refused.
+    {
+        std::string load_error;
+        auto disk = vgww::core::Config::LoadFromFile(cfg_path, load_error);
+        CHECK(disk.has_value());
+        CHECK(disk.has_value());
+        if (disk) {
+            vgww::core::StaticBinding foreign;
+            vgww::core::ParseMac("02:00:00:00:c7:99", foreign.mac);
+            foreign.ip = vgww::core::ParseIpv4("192.168.49.112", ok);
+            foreign.hostname = "disk-only";
+            disk->dhcp.static_bindings.push_back(foreign);
+            std::string save_error;
+            CHECK(disk->SaveToFile(cfg_path, save_error));
+        }
+    }
+    CHECK(disk_has("02:00:00:00:C7:99"));
+
+    // Edit of the OLD row onto the taken address: the re-key is accepted in
+    // memory, the persisted upsert must fail. The old key must survive on
+    // disk; before P3-8 it was deleted first and the document ended with
+    // neither the old row nor the new one.
+    const CommandResult edited = executor.Execute(Command{AddDhcpBindingCmd{
+        "02:00:00:00:c7:02", "192.168.49.112", "new-host",
+        "02:00:00:00:c7:01"}});
+    std::printf("P3-8 edit_ok=%d\n", edited.ok ? 1 : 0);
+    CHECK(!edited.ok);
+    CHECK(disk_has("02:00:00:00:C7:01"));
+    CHECK(disk_has("02:00:00:00:C7:99"));
+    // The failed new row must not be published either.
+    CHECK(!disk_has("02:00:00:00:C7:02"));
+
+    dataplane.Stop(err);
+    std::remove(cfg_path.c_str());
+    std::remove(lease_path.c_str());
+    std::remove((lease_path + ".leases6").c_str());
+    I18n::Instance().SetLang(Lang::ZhCN);
+}
+
+// P3-9 (red anchor): a failed service start/stop used to hand the engine's
+// raw English error straight to the operator (`Fail(Widen(error))`). The user
+// now sees a localized sentence with the engine text kept in {0}.
+static void TestP39ServiceFailureIsLocalized() {
+    using namespace vgww::ui;
+    FixTextMetrics();
+
+    // The i18n half: both keys exist in both languages, placeholder intact.
+    I18n::Instance().SetLang(Lang::ZhCN);
+    CHECK(std::wstring(I18n::Instance().T(Str::CmdServiceStartFailed)) != L"");
+    CHECK(std::wstring(I18n::Instance().T(Str::CmdServiceStopFailed)) != L"");
+    CHECK(std::wstring(I18n::Instance().T(Str::CmdServiceStartFailed)) !=
+          std::wstring(I18n::Instance().T(Str::CmdServiceStopFailed)));
+    const std::wstring zh_start = I18n::Instance().FormatCopy(
+        Str::CmdServiceStartFailed, {L"ENGINE-RAW"});
+    CHECK(zh_start.find(L"ENGINE-RAW") != std::wstring::npos);
+    CHECK(zh_start.find(L"Service failed to start") == std::wstring::npos);
+    CHECK(zh_start.find(L"失败") != std::wstring::npos);
+    const std::wstring zh_stop = I18n::Instance().FormatCopy(
+        Str::CmdServiceStopFailed, {L"ENGINE-RAW"});
+    CHECK(zh_stop.find(L"ENGINE-RAW") != std::wstring::npos);
+    CHECK(zh_stop.find(L"失败") != std::wstring::npos);
+
+    I18n::Instance().SetLang(Lang::En);
+    const std::wstring en_start = I18n::Instance().FormatCopy(
+        Str::CmdServiceStartFailed, {L"ENGINE-RAW"});
+    CHECK(en_start.find(L"ENGINE-RAW") != std::wstring::npos);
+    CHECK(en_start.find(L"Service failed to start") != std::wstring::npos);
+    const std::wstring en_stop = I18n::Instance().FormatCopy(
+        Str::CmdServiceStopFailed, {L"ENGINE-RAW"});
+    CHECK(en_stop.find(L"ENGINE-RAW") != std::wstring::npos);
+    CHECK(en_stop.find(L"Service failed to stop") != std::wstring::npos);
+
+    // The command half: a real Start() failure whose engine text is English
+    // must arrive at the operator wrapped in the localized sentence.
+    I18n::Instance().SetLang(Lang::ZhCN);
+    {
+        vgww::core::Config cfg;
+        cfg.adapter = "Ethernet";
+        cfg.mode = vgww::core::Mode::kMain;
+        bool parsed = false;
+        cfg.gateway.ipv4 = vgww::core::ParseIpv4("192.168.50.1", parsed);
+        cfg.gateway.mask = vgww::core::ParseIpv4("255.255.255.0", parsed);
+        cfg.gateway.mac = {0x30, 0xFC, 0x68, 0x88, 0xB4, 0xC8};
+        cfg.perf.workers = 2;
+        cfg.perf.ring_capacity = 64;
+        cfg.perf.max_conns = 64;
+        vgww::runtime::Dataplane dataplane(cfg);
+        dataplane.SetDriverClient(std::make_unique<B24AdapterDriver>());
+        // A throw after every thread is up: Start rolls back cleanly (the
+        // P148 A-6 path) and reports "dataplane start failed: <what>".
+        dataplane.SetStartPostThreadsProbeForTest(
+            [] { throw std::runtime_error("p39-injected-start"); });
+        const CommandResult verdict =
+            DataplaneCommandExecutor(dataplane, "")
+                .Execute(Command{StartServiceCmd{}});
+        CHECK(!verdict.ok);
+        std::printf("P3-9 start_msg_localized=%d\n",
+                    verdict.message.find(L"服务启动失败") != std::wstring::npos
+                        ? 1
+                        : 0);
+        CHECK(verdict.message.find(L"p39-injected-start") != std::wstring::npos);
+        CHECK(verdict.message.find(L"服务启动失败") != std::wstring::npos);
+        CHECK(verdict.message != L"dataplane start failed: p39-injected-start");
+        std::string stop_err;
+        (void)dataplane.Stop(stop_err);
+    }
+    I18n::Instance().SetLang(Lang::ZhCN);
+}
+
 static void TestP141B9BridgeRunningEmptyStateNotOff() {
     using namespace vgww::ui;
     FixTextMetrics();
@@ -39531,6 +39709,8 @@ int main() {
     TestP141B7FixedTimeTextWidthStable();
     TestP141B8QueueFullKeepsForm();
     TestP141B9BridgeRunningEmptyStateNotOff();
+    TestP38FailedEditKeepsOldBinding();
+    TestP39ServiceFailureIsLocalized();
     TestP147RollbackPreservesNewerBindings();
     TestP147P27FailedApplyKeepsEdits();
     TestP147C1SuccessfulSaveNotRolledBackByLaterFailure();
