@@ -144,11 +144,11 @@ namespace vgww {
         /// knobs the perf section names.
         struct PortmapConfig {
             /// P1-8: hard cap on concurrent relays. xtcp's `max_conns` is a
-            /// GLOBAL budget shared with ordinary outbound NAT flows (one
-            /// counter, third_party/xtcp/src/core/stack.cpp Connect), so an
-            /// unbounded accept side let a WAN SYN flood starve every normal
-            /// flow. Default matches perf.max_conns' default.
-            uint32_t max_relays = 4096;
+            /// shared budget: relays must leave headroom for the tunnel, so the
+            /// default is half of perf.max_conns' default (4096). An operator who
+            /// lowers perf.max_conns must lower this too - the runtime does not
+            /// second-guess an explicit choice.
+            uint32_t max_relays = 2048;
             /// P1-8: per-rule cap so a single flooded WAN port cannot consume
             /// the whole budget by itself. Must not exceed max_relays.
             uint32_t max_relays_per_rule = 1024;

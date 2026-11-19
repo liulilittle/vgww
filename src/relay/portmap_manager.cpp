@@ -625,6 +625,29 @@ namespace vgww {
                     ++it;
                 }
             }
+
+            // P148 P2-12: a removed rule must also drop the connections it
+            // already dialed. Closing only the acceptor left every established
+            // relay forwarding to a LAN target the user had just deleted, and
+            // the only reclaim path was the idle sweep (`idle_timeout_s`,
+            // 300 s by default). Collect first: CloseRelay erases from
+            // `relays_` and the teardown hook may re-enter the manager maps.
+            std::vector<uint64_t> orphaned;
+            for (const auto& kv : relays_) {
+                if (wanted.find(kv.second.rule_key) == wanted.end()) {
+                    orphaned.push_back(kv.first);
+                }
+            }
+            for (const uint64_t orphan_id : orphaned) {
+                const auto orphan_it = relays_.find(orphan_id);
+                if (relays_.end() == orphan_it) {
+                    continue;
+                }
+                // Graceful: the rule was deleted by the user, not because the
+                // flow failed. A RST here would look like a spurious reset to
+                // a LAN client whose service is still healthy.
+                CloseRelay(orphan_id, orphan_it->second, true);
+            }
         }
 
         void PortMapManager::PumpOne(uint64_t conn_id, Relay& relay) {

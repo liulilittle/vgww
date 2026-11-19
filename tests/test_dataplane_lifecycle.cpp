@@ -192,6 +192,21 @@ namespace {
             fail_send_packets_ = fail;
         }
 
+        /// P148 A-1: makes ArmRxEvent fail, i.e. Start() bails out AFTER
+        /// SetAdapterMode already put the adapter into LISTEN mode.
+        void FailArmRxEvent(bool fail) {
+            std::lock_guard<std::mutex> lock(mutex_);
+            fail_arm_rx_event_ = fail;
+        }
+
+        int SetAdapterModeCalls() const {
+            return set_mode_calls_.load(std::memory_order_relaxed);
+        }
+
+        int ResetAdapterModeCalls() const {
+            return reset_mode_calls_.load(std::memory_order_relaxed);
+        }
+
         // ----- IDriverClient ------------------------------------------
         const std::vector<AdapterEntry>& Adapters() const noexcept override {
             return adapters_;
@@ -211,6 +226,7 @@ namespace {
 
         bool SetAdapterMode(const AdapterEntry&, uint32_t,
                             std::string&) override {
+            set_mode_calls_.fetch_add(1, std::memory_order_relaxed);
             return true;
         }
 
@@ -242,7 +258,12 @@ namespace {
             return true;
         }
 
-        bool ArmRxEvent(const AdapterEntry&, void*, std::string&) override {
+        bool ArmRxEvent(const AdapterEntry&, void*, std::string& error) override {
+            std::lock_guard<std::mutex> lock(mutex_);
+            if (fail_arm_rx_event_) {
+                error = "injected arm rx event failure";
+                return false;
+            }
             return true;
         }
 
@@ -313,6 +334,7 @@ namespace {
         }
 
         bool ResetAdapterMode(const AdapterEntry&, std::string&) override {
+            reset_mode_calls_.fetch_add(1, std::memory_order_relaxed);
             return true;
         }
 
@@ -340,6 +362,9 @@ namespace {
         uint32_t hw_filters_[2] = {0, 0};
         bool fail_hw_filter_set_ = false;
         bool fail_send_packets_ = false;
+        bool fail_arm_rx_event_ = false;
+        std::atomic<int> set_mode_calls_{0};
+        std::atomic<int> reset_mode_calls_{0};
     };
 
     vgww::core::Config MakeConfig() {
@@ -1529,6 +1554,96 @@ namespace {
         std::remove((lease_path + ".leases6").c_str());
     }
 
+    /// P148 A-1: a start that fails between SetAdapterMode and the first
+    /// running thread must restore the adapter mode before returning. Without
+    /// the guard the NIC stays in LISTEN-only mode while the UI reports a
+    /// failed start, and ReleaseDataplaneContainers() nulls `adapter`, so the
+    /// later Stop() can never repair it. A successful start must NOT reset
+    /// early: Stop() owns exactly one reset.
+    void TestP148A1FailedStartResetsAdapterMode() {
+        {
+            const vgww::core::Config config = MakeConfig();
+            vgww::runtime::Dataplane dataplane(config);
+            auto fake = std::make_unique<FakeDriverClient>();
+            FakeDriverClient* raw = fake.get();
+            dataplane.SetDriverClient(std::move(fake));
+
+            // ArmRxEvent runs AFTER SetAdapterMode, so this failure happens
+            // while the adapter is already in LISTEN mode.
+            raw->FailArmRxEvent(true);
+            std::string error;
+            CHECK(!dataplane.Start(error));
+            CHECK(!error.empty());
+            CHECK(1 == raw->SetAdapterModeCalls());    // mode was applied
+            CHECK(1 == raw->ResetAdapterModeCalls());  // and rolled back
+            CHECK(!dataplane.IsRunning());
+        }
+
+        // Success path on a fresh object: the guard must stay disarmed and
+        // Stop performs the single reset.
+        {
+            const vgww::core::Config config = MakeConfig();
+            vgww::runtime::Dataplane dataplane(config);
+            auto fake = std::make_unique<FakeDriverClient>();
+            FakeDriverClient* raw = fake.get();
+            dataplane.SetDriverClient(std::move(fake));
+
+            std::string error;
+            CHECK(dataplane.Start(error));
+            CHECK(1 == raw->SetAdapterModeCalls());
+            CHECK(0 == raw->ResetAdapterModeCalls());  // no early reset
+            std::string stop_error;
+            CHECK(dataplane.Stop(stop_error));
+            CHECK(stop_error.empty());
+            CHECK(1 == raw->ResetAdapterModeCalls());  // Stop's reset
+            CHECK(CountsAreEmpty(dataplane.GetLifecycleCounts()));
+        }
+    }
+
+    /// P148 A-6: the StartAll catch path must wake the RX thread before
+    /// joining it, exactly like StopAll does. The poll interval is raised to
+    /// 60 s so a missing wake turns the join into the 5 s budget timeout and
+    /// the plane is left detached (shutdown_incomplete) - the CHECKs catch
+    /// that without relying on wall-clock luck.
+    void TestP148A6StartFailureWakesRxThread() {
+        vgww::core::Config config = MakeConfig();
+        config.perf.rx_poll_ms = 60000;
+        vgww::runtime::Dataplane dataplane(config);
+        dataplane.SetDriverClient(std::make_unique<FakeDriverClient>());
+
+        dataplane.SetStartPostThreadsProbeForTest([] {
+            // Every thread already exists at this point; give the RX loop
+            // ample time to reach its (60 s) event wait, then unwind.
+            std::this_thread::sleep_for(std::chrono::milliseconds(300));
+            throw std::bad_alloc();
+        });
+
+        const auto t0 = std::chrono::steady_clock::now();
+        std::string error;
+        CHECK(!dataplane.Start(error));
+        const auto elapsed_ms =
+            std::chrono::duration_cast<std::chrono::milliseconds>(
+                std::chrono::steady_clock::now() - t0)
+                .count();
+        CHECK(!error.empty());
+        // 5 s join budget vs. an instantly woken thread: anything near the
+        // budget means the RX thread was NOT woken.
+        CHECK(elapsed_ms < 4000);
+        CHECK(!dataplane.IsRunning());
+        CHECK(!dataplane.GetLifecycleCounts().shutdown_incomplete);
+        CHECK(CountsAreEmpty(dataplane.GetLifecycleCounts()));
+        std::fprintf(stderr, "[p148-a6] failed start joined in %lldms\n",
+                     static_cast<long long>(elapsed_ms));
+
+        // Clean rollback means a retry works from the same object.
+        dataplane.SetStartPostThreadsProbeForTest({});
+        std::string re_error;
+        CHECK(dataplane.Start(re_error));
+        std::string re_stop;
+        CHECK(dataplane.Stop(re_stop));
+        CHECK(re_stop.empty());
+    }
+
     /// P147 P1-3/P1-4: deterministic lifetime proof. A reader is parked INSIDE
     /// GetLeases()/GetLeases6() - after the null check, before the dereference
     /// - and a concurrent Stop() must not be able to free the server under it.
@@ -1743,6 +1858,8 @@ int main() {
     TestP13ConcurrentFacadeVsLifecycle();
     TestP13FacadeReaderCannotOutliveServer();
     TestP148P23IoctlWarnRace();
+    TestP148A1FailedStartResetsAdapterMode();
+    TestP148A6StartFailureWakesRxThread();
 
     if (0 == g_failures) {
         std::puts("test_dataplane_lifecycle: ALL PASS");

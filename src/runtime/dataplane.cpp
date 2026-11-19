@@ -926,6 +926,27 @@ namespace vgww {
                     return false;
                 }
 
+                // P148 A-1: the adapter is in LISTEN mode from here on. Every
+                // early return below must undo it, or the user's NIC stays
+                // intercept-listening while the UI reports a failed start -
+                // and ReleaseDataplaneContainers() nulls `adapter`, so the
+                // later Stop() cannot repair it either. The guard is declared
+                // inside the try block, so it runs during unwinding BEFORE
+                // the catch handler frees client/adapter.
+                struct AdapterModeGuard {
+                    driver::IDriverClient* client = nullptr;
+                    const driver::AdapterEntry* adapter = nullptr;
+                    bool armed = false;
+                    ~AdapterModeGuard() {
+                        if (!armed || nullptr == client || nullptr == adapter) {
+                            return;
+                        }
+                        std::string ignored;
+                        client->ResetAdapterMode(*adapter, ignored);
+                    }
+                } adapter_guard{client.get(), adapter};
+                adapter_guard.armed = true;
+
                 rx_event.reset(::CreateEventW(nullptr, FALSE, FALSE, nullptr));
                 if (!rx_event) {
                     error = "CreateEvent failed";
@@ -1240,6 +1261,9 @@ namespace vgww {
                     start_post_threads_probe_();
                 }
                 SetAdapterBinding(*adapter);
+                // P148 A-1: the start succeeded - Stop() owns the reset now
+                // (<=1577 guard). Disarm so the guard does not double-reset.
+                adapter_guard.armed = false;
                 return true;
             } catch (...) {
                 // P147 P1-1/P1-2: a throw from the last start steps (for
@@ -1251,6 +1275,13 @@ namespace vgww {
                 running.store(false);
                 const std::string what = DescribeCurrentException();
                 bool clean = true;
+                // P148 A-6: StopAll wakes the RX thread before joining it
+                // (:1466). Without the same wake here the join relies on the
+                // rx_poll_ms timeout, so a larger poll interval turns a clean
+                // shutdown into a detach.
+                if (rx_event) {
+                    ::SetEvent(rx_event.get());
+                }
                 if (rx_tx_thread.joinable() && !WaitThread(rx_tx_thread)) {
                     rx_tx_thread.detach();  // never TerminateThread (H2)
                     clean = false;

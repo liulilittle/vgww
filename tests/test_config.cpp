@@ -2903,7 +2903,7 @@ void TestP147PortmapSection() {
         CHECK(r.wrote);
         CHECK(r.config.has_value());
         if (r.config) {
-            CHECK(4096 == r.config->portmap.max_relays);
+            CHECK(2048 == r.config->portmap.max_relays);
             CHECK(1024 == r.config->portmap.max_relays_per_rule);
             CHECK(300 == r.config->portmap.idle_timeout_s);
         }
@@ -2953,6 +2953,59 @@ void TestP147PortmapSection() {
         }
     }
     std::fprintf(stderr, "[config] P147 portmap section ok\n");
+}
+
+// P148 A-4: portmap relays draw from xtcp's GLOBAL connection budget, so the
+// relay default must leave headroom for the tunnel instead of tying
+// perf.max_conns. The old default (4096 == perf.max_conns' default) meant
+// portmap alone could consume the whole budget, making perf.max_conns
+// unenforceable in practice. The fix is the default alone: a validation rule
+// that rejects max_relays >= max_conns was evaluated and REJECTED as
+// destructive, because it would refuse an existing file that carries only
+// "perf":{"max_conns":64} - the relay cap would still hold its 2048 default
+// and the gateway would fail to start after an upgrade. So the last case below
+// pins the opposite: a small explicit max_conns must still load.
+void TestP148RelayHeadroom() {
+    // (1) Defaults: half the connection cap, i.e. real headroom.
+    {
+        const vgww::core::Config d{};
+        CHECK(2048 == d.portmap.max_relays);
+        CHECK(d.portmap.max_relays < d.perf.max_conns);
+        CHECK(d.portmap.max_relays_per_rule < d.portmap.max_relays);
+    }
+    // (2) The shipped defaults must validate as-is. A bare Config{} is not a
+    //     valid gateway (zero address), so start from a complete config and
+    //     restore the two sections under test to their shipped defaults.
+    {
+        vgww::core::Config c = MakeFullConfig();
+        c.portmap = vgww::core::PortmapConfig{};
+        c.perf = vgww::core::PerfConfig{};
+        std::string error;
+        CHECK(vgww::core::ValidateConfig(c, error));
+        CHECK(error.empty());
+        if (!error.empty()) {
+            std::fprintf(stderr, "P148 A-4 default validate: %s\n",
+                         error.c_str());
+        }
+    }
+    // (3) Regression guard for the rejected hard rule: an operator file that
+    //     lowers perf.max_conns without touching portmap must keep loading
+    //     (max_relays default 2048 > max_conns 64 here on purpose).
+    {
+        const auto r = LoadFromText(
+            ScratchFile("test_cfg_p148_a4_smallconns.json"),
+            Skeleton(R"("perf":{"max_conns":64})"));
+        CHECK(r.wrote);
+        CHECK(r.config.has_value());
+        if (r.config) {
+            CHECK(64 == r.config->perf.max_conns);
+            CHECK(2048 == r.config->portmap.max_relays);
+        } else {
+            std::fprintf(stderr, "P148 A-4 small max_conns refused: %s\n",
+                         r.error.c_str());
+        }
+    }
+    std::fprintf(stderr, "[config] P148 A-4 relay headroom ok\n");
 }
 
 // A JSON boolean is not a number and must not be accepted as one.
@@ -3383,6 +3436,7 @@ int main() {
     TestB34mRxBatchMustFitRing();
     TestB84WebBindBounds();
     TestP147PortmapSection();
+    TestP148RelayHeadroom();
     if (0 == g_failures) {
         std::puts("test_config: ALL PASS");
         return 0;

@@ -21,8 +21,11 @@
 #include <atomic>
 #include <chrono>
 #include <cstdio>
+#include <map>
+#include <mutex>
 #include <stdexcept>
 #include <thread>
+#include <utility>
 
 namespace {
 
@@ -2184,6 +2187,155 @@ void TestB312ApplyRulesIsChangeDriven() {
         store.Clear();
     }
 
+    /// P148 P2-12: deleting a port-map rule used to close only its acceptor.
+    /// Every relay that rule had ALREADY dialed kept forwarding to the LAN
+    /// target the user had just removed; the only reclaim path was the idle
+    /// sweep (300 s by default). Here one relay is established per rule, the
+    /// rule set is re-applied with the rule gone, and the deleted rule's relay
+    /// must be closed GRACEFULLY (a RST would look like a spurious reset to a
+    /// LAN client whose service is still healthy) while the OTHER rule's
+    /// relay keeps forwarding.
+    void TestP148P212RemovedRuleClosesEstablishedRelays() {
+        xtcp::buf::InitPools();
+        NullBackend backend;
+        xtcp::XtcpStack stack(&backend);
+        stack.SetMaxConnections(16);
+
+        vgww::core::Config config;
+        config.gateway.ipv4 = kGatewayIp;
+        config.gateway.mask = (0u) | (0u << 8) | (255u << 16) | (255u << 24);
+        config.gateway.mac = {0x30, 0xFC, 0x68, 0x88, 0xB4, 0xA9};
+        // The idle sweep must NOT be the path that closes the relay: with it
+        // disabled, only the rule-removal branch can reclaim the connection.
+        config.portmap.idle_timeout_s = 0;
+
+        const uint16_t doomed_port = ProbeFreePort();
+        const uint16_t kept_port = ProbeFreePort();
+        CHECK(0 != doomed_port);
+        CHECK(0 != kept_port);
+        CHECK(doomed_port != kept_port);
+
+        auto& store = vgww::web::RuleStore::Instance();
+        auto& manager = vgww::relay::PortMapManager::Instance();
+        manager.Stop();
+        store.AttachFile("");   // no persistence side effects
+        store.Clear();
+        const uint64_t doomed_id = store.AddPortMapTracked(
+            {"tcp", doomed_port, "127.0.0.1", 45678});
+        const uint64_t kept_id = store.AddPortMapTracked(
+            {"tcp", kept_port, "127.0.0.1", 45678});
+        CHECK(0 != doomed_id);
+        CHECK(0 != kept_id);
+
+        std::atomic<uint64_t> lan_bytes{0};
+        auto send_to_lan = [&lan_bytes](uint64_t, const uint8_t*, uint32_t len) {
+            lan_bytes.fetch_add(len, std::memory_order_relaxed);
+            return true;
+        };
+        // conn_id -> graceful flag, so the assertions name WHICH relay was
+        // torn down and HOW, not merely "some teardown happened".
+        std::mutex torn_mutex;
+        std::map<uint64_t, bool> torn;
+        const auto teardown = [&torn_mutex, &torn](uint64_t conn_id, bool g) {
+            std::lock_guard<std::mutex> lock(torn_mutex);
+            torn[conn_id] = g;
+        };
+        const auto torn_count = [&torn_mutex, &torn]() {
+            std::lock_guard<std::mutex> lock(torn_mutex);
+            return torn.size();
+        };
+        const auto torn_graceful = [&torn_mutex, &torn](uint64_t conn_id) {
+            std::lock_guard<std::mutex> lock(torn_mutex);
+            const auto it = torn.find(conn_id);
+            return torn.end() != it && it->second;
+        };
+
+        manager.Start(&stack, config, send_to_lan, teardown);
+        CHECK(WaitFor([&] { return manager.LiveAcceptLoops() >= 2; }, 5000));
+
+        // Two DIFFERENT WAN peers, one per rule. Declaration order matters:
+        // the io_context must outlive every socket below.
+        asio::io_context io;
+        asio::ip::tcp::socket doomed_client(io);
+        asio::ip::tcp::socket kept_client(io);
+        std::error_code ec;
+        doomed_client.connect(asio::ip::tcp::endpoint(
+                                  asio::ip::make_address("127.0.0.1"),
+                                  doomed_port),
+                              ec);
+        CHECK(!ec);
+        CHECK(WaitFor([&] { return manager.RelayCountForTest() >= 1; }, 5000));
+        const uint64_t doomed_conn = manager.LastRelayConnId();
+        CHECK(0 != doomed_conn);
+
+        kept_client.connect(asio::ip::tcp::endpoint(
+                                asio::ip::make_address("127.0.0.1"),
+                                kept_port),
+                            ec);
+        CHECK(!ec);
+        CHECK(WaitFor([&] { return manager.RelayCountForTest() >= 2; }, 5000));
+        const uint64_t kept_conn = manager.LastRelayConnId();
+        CHECK(0 != kept_conn);
+        CHECK(kept_conn != doomed_conn);
+
+        // Drive both relays to a real forwarding state, then prove the KEPT
+        // one carries traffic BEFORE the rule is removed (the control that
+        // makes the post-removal assertion meaningful).
+        manager.OnStackState(doomed_conn, 4);
+        manager.OnStackState(kept_conn, 4);
+        std::this_thread::sleep_for(std::chrono::milliseconds(300));
+        CHECK(2 == manager.RelayCountForTest());
+        std::error_code send_ec;
+        kept_client.send(asio::buffer("before", 6), 0, send_ec);
+        CHECK(!send_ec);
+        CHECK(WaitFor([&] { return lan_bytes.load() >= 6; }, 5000));
+        const uint64_t lan_before_removal = lan_bytes.load();
+        CHECK(lan_before_removal >= 6);
+
+        // The user deletes ONE rule. The RunLoop's rule poll (RuleStore::Rev
+        // moved) must close the relay that rule had already dialed; the other
+        // rule's relay must survive untouched.
+        CHECK(store.RemovePortMapById(doomed_id));
+        CHECK(1 == store.PortMapCount());
+
+        const bool doomed_torn = WaitFor(
+            [&] { return 1 == torn_count(); }, 5000);
+        std::printf(
+            "P148 P2-12 rule removal: relays=%zu torn=%zu doomed=%llu "
+            "doomed_graceful=%d kept_live_in_store=%d\n",
+            manager.RelayCountForTest(), torn_count(),
+            static_cast<unsigned long long>(doomed_conn),
+            torn_graceful(doomed_conn) ? 1 : 0,
+            store.PortMapCount() == 1 ? 1 : 0);
+
+        // 1. The removed rule's established relay is gone, and gracefully.
+        CHECK(doomed_torn);
+        CHECK(torn_graceful(doomed_conn));
+        // 2. Exactly one relay was torn down - the surviving rule's relay was
+        //    NOT collateral damage (the boundary the fix must respect).
+        CHECK(1 == torn_count());
+        CHECK(1 == manager.RelayCountForTest());
+
+        // 3. The kept relay still FORWARDS, which proves the survivor is a
+        //    live relay and not a stale counter.
+        kept_client.send(asio::buffer("after", 5), 0, send_ec);
+        CHECK(!send_ec);
+        CHECK(WaitFor(
+            [&] { return lan_bytes.load() >= lan_before_removal + 5; }, 5000));
+        CHECK(lan_bytes.load() >= lan_before_removal + 5);
+
+        // 4. The removed rule is really gone from the data plane: its port no
+        //    longer has an acceptor, so a fresh WAN dial cannot be forwarded.
+        CHECK(!TryConnect(doomed_port));
+        // ... while the kept rule still accepts new connections.
+        CHECK(TryConnect(kept_port));
+
+        kept_client.close(ec);
+        doomed_client.close(ec);
+        manager.Stop();
+        store.Clear();
+    }
+
 }  // namespace
 
 int main() {
@@ -2210,6 +2362,7 @@ int main() {
     TestP147IdleSweepKeepsActiveRelay();
     TestP147RelayCapRefusesFlood();
     TestP147PerRuleCapIsolatesOnePort();
+    TestP148P212RemovedRuleClosesEstablishedRelays();
     TestP148FailedBindRetriesWithBackoff();
     TestB312ApplyRulesIsChangeDriven();   // last: it fails one bind on purpose
 
