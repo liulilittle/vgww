@@ -351,6 +351,10 @@ namespace vgww {
             std::vector<std::mutex> accept_mutexes;
             std::vector<std::vector<std::shared_ptr<xtcp::mimt::MimtFlow>>>
                 pending_accepts;
+            /// P3-3 test seam: the capacity reserved for pending_accepts at
+            /// Start() (captured when the reserve runs - the queue itself is
+            /// swapped by DrainAccepts(), which resets its capacity).
+            size_t pending_accept_reserve_ = 0;
 
             // Deferred teardowns (failed dials / finished relays). graceful=true
             // CLOSEs (FIN to the client); false ABORTs (RST).
@@ -573,6 +577,13 @@ namespace vgww {
             /// from tests after the flood has been drained).
             size_t PendingRateTableSize() const {
                 return live_rates_.size();
+            }
+
+            /// P3-3 test seam: capacity reserved for the accept queues at
+            /// Start(). Recorded at sizing time because DrainAccepts() swaps
+            /// each queue with a fresh local vector (resetting capacity).
+            size_t PendingAcceptReserveForTest() const {
+                return pending_accept_reserve_;
             }
 
             /// Last driver IOCTL failure text already reported, so a dead
@@ -1006,7 +1017,16 @@ namespace vgww {
                     const size_t per_worker =
                         runtime::PerWorkerReserve(config.perf.max_conns,
                                                  worker_count);
-                    pending_accepts[i].reserve(per_worker);
+                    // P3-3: pending_accepts is bounded by kMaxPendingAccepts
+                    // (enforced at the hand-off below), not by max_conns.
+                    // Reserving it at the per-worker connection share allocated
+                    // max_conns/workers+64 slots per worker that no code path
+                    // can ever fill (4096/8+64=576 reserved vs a hard cap of
+                    // 64 with the default config). The other three containers
+                    // DO grow with the connection count and keep the wider
+                    // reserve.
+                    pending_accepts[i].reserve(kMaxPendingAccepts);
+                    pending_accept_reserve_ = pending_accepts[i].capacity();
                     pending_teardowns_[i].reserve(per_worker);
                     relay_registry_[i].reserve(per_worker);
                     relay_index_[i].reserve(per_worker);
@@ -1065,9 +1085,10 @@ namespace vgww {
                         // Bound the backlog: each parked flow buffers up to
                         // 1 MiB while we dial (<=10 s). Beyond this we RST
                         // instead of letting a SYN flood pin gigabytes.
-                        static constexpr size_t kMaxPendingAccepts = 64;
+                        // P3-3: the cap lives at class scope so the reserve
+                        // above sizes pending_accepts for exactly this bound.
                         if (pending_accepts[idx].size() >=
-                            kMaxPendingAccepts) {
+                            Dataplane::kMaxPendingAccepts) {
                             flow->Close();
                             return;
                         }
@@ -3957,6 +3978,16 @@ namespace vgww {
                     ++stats->rx_dropped;
                     return;
                 }
+                // P3-1: the VLAN splice below copies the fixed 14-byte
+                // Ethernet header unconditionally and computes
+                // `len - kEthernetHeaderLen`, which underflows for a runt
+                // frame into a huge memcpy. No current builder emits one, but
+                // the two bounds belong together: above this line a frame is
+                // droppable, below it the arithmetic is also defined.
+                if (len < net::kEthernetHeaderLen) {
+                    ++stats->rx_dropped;
+                    return;
+                }
                 std::vector<INTERMEDIATE_BUFFER>& items = batch.items;
                 items.emplace_back();
                 INTERMEDIATE_BUFFER& ib = items.back();
@@ -4066,6 +4097,13 @@ namespace vgww {
                         last_ioctl_warn_ = err;
                         std::fprintf(stderr, "[vgww] driver: %s\n", err.c_str());
                     }
+                }
+                if (!ok) {
+                    // P3-2: the driver refused the batch; every frame in it is
+                    // lost. Count them so a failing IOCTL is visible instead of
+                    // silent.
+                    stats->tx_send_failed_frames.fetch_add(batch.size(),
+                                                           std::memory_order_relaxed);
                 }
                 batch.clear();
             }
@@ -4295,6 +4333,23 @@ namespace vgww {
                 return 0;
             }
             return impl_->PendingRateTableSize();
+        }
+
+        size_t Dataplane::AppendDownForTest(const uint8_t* frame, size_t len) {
+            if (!impl_) {
+                return 0;
+            }
+            Impl::PortBatch batch;
+            batch.handle = nullptr;
+            impl_->AppendDown(batch, frame, len);
+            return batch.items.size();
+        }
+
+        size_t Dataplane::PendingAcceptReserveForTest() const noexcept {
+            if (!impl_) {
+                return 0;
+            }
+            return impl_->PendingAcceptReserveForTest();
         }
 
         std::vector<Dataplane::ClientRate> Dataplane::ClientRates() const {
@@ -5055,3 +5110,4 @@ namespace vgww {
 
     }  // namespace runtime
 }  // namespace vgww
+// MARKER_TEST_12345

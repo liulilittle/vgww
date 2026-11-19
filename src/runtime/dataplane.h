@@ -254,6 +254,11 @@ namespace vgww {
                 /// 1-second window (memory and a per-tick scan in
                 /// ThroughputBps). Non-zero means the table is saturated.
                 std::atomic<uint64_t> rate_table_dropped{0};
+
+                /// P3-2: driver send failures used to drop the batch with no trace.
+                /// One count per frame (not per batch) so it is comparable with the
+                /// other frame-level counters.
+                std::atomic<uint64_t> tx_send_failed_frames{0};
             };
 
             const Stats& GetStats() const noexcept;
@@ -270,6 +275,30 @@ namespace vgww {
             /// bounded under a forged-source flood, where every frame would
             /// otherwise insert a brand-new key.
             size_t PendingRateTableSize() const noexcept;
+
+            /// P3-1 test seam: feeds ONE frame through the real AppendDown
+            /// choke point (including the 802.1Q splice when the access VLAN
+            /// is enabled) and returns how many batch items it produced.
+            /// 0 means the frame was refused. Needs no Start(); the dropped
+            /// count is visible through GetStats().rx_dropped. Production
+            /// never calls this.
+            size_t AppendDownForTest(const uint8_t* frame, size_t len);
+
+            /// P3-3: hard cap on the per-worker pending-accept backlog (each
+            /// parked flow buffers up to 1 MiB while its upstream dial runs).
+            /// pending_accepts can NEVER hold more than this many entries, so
+            /// it is also the only correct reserve for that container - NOT
+            /// the per-worker share of max_conns. Public so the sizing test
+            /// can assert the reserve and the enforcement agree.
+            static constexpr size_t kMaxPendingAccepts = 64;
+
+            /// P3-3 test seam: the capacity actually reserved for worker 0's
+            /// pending-accept queue at Start(). It must track
+            /// kMaxPendingAccepts (the hard cap enforced on insertion), not
+            /// PerWorkerReserve(max_conns, workers) - the wider share belongs
+            /// to the three containers that really grow with max_conns.
+            /// Returns 0 when the data plane has not been started.
+            size_t PendingAcceptReserveForTest() const noexcept;
 
             /// One second-window snapshot of a LAN client's throughput.
             struct ClientRate {

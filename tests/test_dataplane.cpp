@@ -20,6 +20,7 @@
 #include <asio.hpp>
 
 #include "runtime/dataplane.h"
+#include "runtime/worker_budget.h"
 
 #include "driver/ndisrd_client.h"
 #include "ndisapi/Common.h"
@@ -320,8 +321,14 @@ namespace {
         }
 
         bool SendPacketsToAdapter(void*, INTERMEDIATE_BUFFER* buffers,
-                                  uint32_t count, std::string&) override {
+                                  uint32_t count, std::string& error) override {
             std::lock_guard<std::mutex> lock(mutex_);
+            if (fail_send_down_) {
+                // P3-2: model a driver IOCTL that refuses the batch without
+                // throwing (see FailSendDown).
+                error = "injected send failure";
+                return false;
+            }
             for (uint32_t i = 0; i < count; ++i) {
                 sent_down_.emplace_back(
                     buffers[i].m_IBuffer,
@@ -329,6 +336,13 @@ namespace {
             }
             sent_down_count_.fetch_add(count, std::memory_order_release);
             return true;
+        }
+
+        /// P3-2 fault injection: every downstream IOCTL returns false with a
+        /// non-empty error text (no frames captured).
+        void FailSendDown(bool fail) {
+            std::lock_guard<std::mutex> lock(mutex_);
+            fail_send_down_ = fail;
         }
 
         bool SendPacketsToMstcp(void*, INTERMEDIATE_BUFFER* buffers,
@@ -360,6 +374,7 @@ namespace {
         bool arm_event_ = true;
         std::atomic<uint64_t> read_calls_{0};
         std::atomic<std::size_t> sent_down_count_{0};
+        bool fail_send_down_ = false;
     };
 
     /// RA-3/RA-4 seam (G-5): FindAdapter delegates to the PRODUCTION
@@ -2875,6 +2890,189 @@ namespace {
         CHECK(dataplane.Stop(stop_error));
     }
 
+    /// P3-1: AppendDown is the single choke point for every VGWW-generated
+    /// downstream frame. It checked only the UPPER bound. The 802.1Q splice
+    /// copies the fixed 14-byte Ethernet header unconditionally and then
+    /// memcpys `len - kEthernetHeaderLen` bytes: for a runt frame (len < 14)
+    /// that size_t subtraction UNDERFLOWS into a huge copy from the source
+    /// frame - an out-of-bounds read of the builder's buffer.
+    ///
+    /// Red anchor: feed 13 / 1 / 0-byte frames through the real AppendDown
+    /// with the access VLAN enabled (the splice path). Each must be refused
+    /// (no batch item) and counted once in rx_dropped. With the lower bound
+    /// removed the 13-byte case becomes a ~SIZE_MAX memcpy (observed as a
+    /// hard fault / wild copy), so the test cannot pass vacuously.
+    void TestP31AppendDownRejectsRuntFrames() {
+        vgww::core::Config cfg;
+        cfg.adapter = "TestNIC";
+        cfg.gateway.ipv4 = kGatewayIp;
+        cfg.gateway.mask = (0u) | (0u << 8) | (255u << 16) | (255u << 24);
+        cfg.gateway.mac = kGatewayMac;
+        cfg.vlan.id = 100;  // enables the tag splice (the underflow path)
+
+        // No Start(): AppendDown only touches config + stats.
+        vgww::runtime::Dataplane dataplane(cfg);
+
+        // A full 14-byte header must still go through - proves the seam is
+        // wired to the real splice path and the guard does not reject
+        // legitimate (if header-only) frames.
+        std::vector<uint8_t> header_only(14, 0);
+        header_only[12] = 0x08;
+        header_only[13] = 0x06;
+        const uint64_t before = dataplane.GetStats().rx_dropped.load();
+        const size_t accepted = dataplane.AppendDownForTest(
+            header_only.data(), header_only.size());
+        CHECK(1 == accepted);
+        CHECK(dataplane.GetStats().rx_dropped.load() == before);
+
+        // The runts: one below the header, one 1-byte, one empty.
+        const uint64_t runt_before = dataplane.GetStats().rx_dropped.load();
+        for (size_t len : {size_t{13}, size_t{1}, size_t{0}}) {
+            std::vector<uint8_t> runt(len, 0xAA);
+            const size_t items = dataplane.AppendDownForTest(
+                runt.empty() ? nullptr : runt.data(), runt.size());
+            std::fprintf(stderr, "[p3-1] len=%zu items=%zu\n", len, items);
+            CHECK(0 == items);
+        }
+        const uint64_t runt_dropped =
+            dataplane.GetStats().rx_dropped.load() - runt_before;
+        std::fprintf(stderr, "[p3-1] runt drops=%llu\n",
+                     static_cast<unsigned long long>(runt_dropped));
+        CHECK(3 == runt_dropped);
+    }
+
+    /// P3-2: FlushBatch cleared the batch unconditionally, so a driver IOCTL
+    /// that refused the send dropped every frame with no counter - a failing
+    /// driver was completely silent (only the once-per-text stderr warning).
+    ///
+    /// Red anchor: script enough ARP requests to produce a KNOWN number of
+    /// downstream replies in one RX batch, make the fake driver refuse every
+    /// downstream send (returns false with a non-empty error), and require
+    /// tx_send_failed_frames to advance by EXACTLY the number of frames that
+    /// were lost. The fake captures nothing (SentDown stays empty), so the
+    /// frames really are gone: the counter is the only trace left.
+    void RunTxSendFailureIsCountedScenario() {
+        vgww::core::Config cfg;
+        cfg.adapter = "TestNIC";
+        cfg.gateway.ipv4 = kGatewayIp;
+        cfg.gateway.mask = (0u) | (0u << 8) | (255u << 16) | (255u << 24);
+        cfg.gateway.mac = kGatewayMac;
+        cfg.perf.workers = 2;
+        cfg.perf.ring_capacity = 256;
+        cfg.perf.max_conns = 64;
+        cfg.perf.dial_timeout_ms = 400;
+        cfg.perf.rx_batch = 32;
+        cfg.perf.rx_flush_eager = true;  // replies flush within one batch
+
+        constexpr int kArpReplies = 4;
+        auto fake = std::make_unique<TestDriverClient>();
+        TestDriverClient* raw = fake.get();
+        for (int i = 0; i < kArpReplies; ++i) {
+            raw->InjectNow(BuildArpRequest());
+        }
+        // Every downstream IOCTL - including Start()'s gratuitous ARP - fails.
+        raw->FailSendDown(true);
+
+        vgww::runtime::Dataplane dataplane(cfg);
+        dataplane.SetDriverClient(std::move(fake));
+        std::string error;
+        CHECK(dataplane.Start(error));
+
+        // Wait until the RX thread has answered all kArpReplies requests; the
+        // replies are counted as built even though the IOCTL refused them.
+        CHECK(WaitFor(
+            [&] {
+                return dataplane.GetStats().arp_replies.load() >=
+                       static_cast<uint64_t>(kArpReplies);
+            },
+            5000));
+        // Give the RX thread time to flush the failing batch.
+        std::this_thread::sleep_for(std::chrono::milliseconds(300));
+
+        const uint64_t failed =
+            dataplane.GetStats().tx_send_failed_frames.load();
+        std::fprintf(stderr,
+                     "[p3-2] arp_replies=%llu tx_send_failed_frames=%llu\n",
+                     static_cast<unsigned long long>(
+                         dataplane.GetStats().arp_replies.load()),
+                     static_cast<unsigned long long>(failed));
+        // Not a single frame may have reached the wire.
+        CHECK(raw->SentDown().empty());
+        // Exactly the refused frames were counted: Start()'s gratuitous
+        // announcement (1) plus one ARP reply per request. The counter is
+        // PER FRAME, so a batch is counted at its true size, not as 1.
+        CHECK(dataplane.GetStats().arp_replies.load() ==
+              static_cast<uint64_t>(kArpReplies));
+        CHECK(failed == static_cast<uint64_t>(kArpReplies) + 1);
+
+        raw->FailSendDown(false);
+        dataplane.Stop();
+    }
+
+    /// P3-3: startup sizing. PerWorkerReserve is the per-worker share of
+    /// max_conns (plus slack) and is correct for the containers that DO grow
+    /// with the connection count (pending_teardowns_, relay_registry_,
+    /// relay_index_). It is NOT a bound for pending_accepts, which is
+    /// hard-capped at kMaxPendingAccepts: with the default config
+    /// (max_conns=4096, workers=8) the old code reserved 576 entries per
+    /// worker for a container no code path could ever fill past 64 - 4096
+    /// wasted slots across 8 workers. This test starts a real data plane at
+    /// those defaults and asserts the capacity that was actually reserved on
+    /// worker 0's queue (see PendingAcceptReserveForTest).
+    void TestP33PendingAcceptsReserveMatchesCap() {
+        using vgww::runtime::Dataplane;
+        using vgww::runtime::PerWorkerReserve;
+
+        const size_t cap = Dataplane::kMaxPendingAccepts;
+        // Opaque to the optimizer so the comparison is a real runtime check
+        // (a literal compare folds to `if (true)` and trips C4127).
+        std::atomic<size_t> expected_cap{64};
+        CHECK(cap == expected_cap.load());
+
+        // PerWorkerReserve behaviour is unchanged - the three containers that
+        // genuinely scale with max_conns still get the connection share.
+        // Defaults: 4096/8+64 = 576; zero workers still yields the slack floor;
+        // a zero max_conns still yields a non-zero reserve (no first-push
+        // reallocation).
+        CHECK(PerWorkerReserve(4096, 8) == 576);
+        CHECK(PerWorkerReserve(0, 8) == 64);
+        CHECK(PerWorkerReserve(4096, 0) == 64);
+        CHECK(PerWorkerReserve(64, 1) == 128);
+
+        vgww::core::Config config;
+        config.adapter = "TestNIC";
+        config.gateway.ipv4 = kGatewayIp;
+        config.gateway.mask = (0u) | (0u << 8) | (255u << 16) | (255u << 24);
+        config.gateway.mac = kGatewayMac;
+        // The production defaults that made the mismatch expensive.
+        config.perf.workers = 8;
+        config.perf.max_conns = 4096;
+
+        auto fake = std::make_unique<TestDriverClient>();
+        vgww::runtime::Dataplane dataplane(config);
+        dataplane.SetDriverClient(std::move(fake));
+        std::string start_error;
+        CHECK(dataplane.Start(start_error));
+        if (!start_error.empty()) {
+            std::fprintf(stderr, "p3-3 start error: %s\n", start_error.c_str());
+        }
+
+        // The RESERVED capacity must equal the hard cap, not the per-worker
+        // connection share. Before the fix this read 576 under these config
+        // values (a reserve 9x the only reachable size).
+        const size_t reserved = dataplane.PendingAcceptReserveForTest();
+        const size_t share = PerWorkerReserve(config.perf.max_conns,
+                                              config.perf.workers);
+        std::printf("P3-3 cap=%zu reserved=%zu connection_share=%zu\n", cap,
+                    reserved, share);
+        CHECK(reserved == cap);
+        CHECK(reserved != share);   // the old sizing, for contrast
+        CHECK(reserved < share);
+
+        std::string stop_error;
+        CHECK(dataplane.Stop(stop_error));
+    }
+
 // batch306: an idle worker must not rescan the TCP relay registry. The
 // sweep used to run on EVERY worker-loop iteration (the loop sleeps 200 us
 // when idle), walking every live relay (up to max_conns) under the registry
@@ -2912,12 +3110,16 @@ void TestB306IdleRegistrySweepIsFree() {
 }
 
 int main() {
+    std::setvbuf(stderr, nullptr, _IONBF, 0);
     SetUnhandledExceptionFilter(CrashFilter);
+    TestP31AppendDownRejectsRuntFrames();
+    RunTxSendFailureIsCountedScenario();
     TestUdpRelaySyncSend();
     TestB31RxPollQuantized();
     TestB31RxPollFast();
     TestB31RxPollConfigHonored();
     TestB306IdleRegistrySweepIsFree();
+    TestP33PendingAcceptsReserveMatchesCap();
     RunAdapterHintWideningScenario();
     RunFriendlyNameEndToEndScenario();
     RunAdapterDiagnosticsScenario();

@@ -2404,6 +2404,13 @@ namespace vgww {
                                   << ",\"rate_limited\":"
                                   << stats.rate_limited.load()
                                   << ",\"rx_dropped\":" << stats.rx_dropped.load()
+                                  // P3-10: the per-window rate table refuses
+                                  // new source MACs once saturated (one /20
+                                  // scan hits it 4096 keys/s). The counter is
+                                  // non-zero exactly when an operator needs to
+                                  // see it; it was never on any status surface.
+                                  << ",\"rate_table_dropped\":"
+                                  << stats.rate_table_dropped.load()
                                   << ",\"host_passthrough\":"
                                   << stats.host_passthrough.load()
                                   << ",\"rx_vlan_frames\":"

@@ -9999,6 +9999,11 @@ int main(int argc, char** argv) {
         CHECK(body.find("\"host_passthrough\"") != std::string::npos);
         CHECK(body.find("\"rx_vlan_frames\"") != std::string::npos);
         CHECK(body.find("\"tx_vlan_frames\"") != std::string::npos);
+        // P3-10: the rate-table refusal counter was incremented on the RX
+        // path (saturated 1 s window under a forged-source flood) but the
+        // serializer never carried it, so saturation was invisible: the
+        // counter existed only in memory. It must be part of the payload.
+        CHECK(body.find("\"rate_table_dropped\"") != std::string::npos);
 
         // /api/clients drives the device table (IP/MAC/per-second rates) and
         // the LAN column (batch22 A8-1) - the column must come from the API's
