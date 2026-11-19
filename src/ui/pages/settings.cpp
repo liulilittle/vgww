@@ -56,6 +56,31 @@ namespace vgww {
                 return value;
             }
 
+            /// P148 P2-8: "is the document at `path` DEFINITELY absent?" - the
+            /// same probe Config::LoadFromFile uses (config.cpp:1783
+            /// GetFileAttributesW), and the same distinction batch84 drew there:
+            /// a missing file is reported apart from one that exists but cannot
+            /// be opened. Only the two definitive not-found codes count as
+            /// missing; every other inconclusive result (access denied on the
+            /// directory, a malformed path) is treated as "may exist" so the
+            /// save is refused rather than overwriting an unreadable document.
+            /// Missing is the first-run case: nothing on disk to protect.
+            bool ConfigFileIsMissing(const std::string& path) {
+                if (path.empty()) {
+                    return false;  // a save without a path is refused elsewhere
+                }
+                const std::wstring wide = Widen(path);
+                if (wide.empty()) {
+                    return false;  // cannot verify -> assume it exists
+                }
+                ::SetLastError(ERROR_SUCCESS);
+                if (INVALID_FILE_ATTRIBUTES != ::GetFileAttributesW(wide.c_str())) {
+                    return false;  // present (or a directory) -> not missing
+                }
+                const DWORD code = ::GetLastError();
+                return code == ERROR_FILE_NOT_FOUND || code == ERROR_PATH_NOT_FOUND;
+            }
+
             /// Immediate local relayout after a dialog opens/closes (T8 D2).
             /// batch26: shared definition (page_util.h) - the local duplicate
             /// made the unqualified call ambiguous once both were included.
@@ -1783,9 +1808,36 @@ void SettingsPage::RefreshDirty() {
                 vgww::core::Config config;
                 if (!config_path_.empty()) {
                     std::string load_error;
-                    if (auto loaded =
-                            vgww::core::Config::LoadFromFile(config_path_, load_error)) {
+                    auto loaded =
+                        vgww::core::Config::LoadFromFile(config_path_, load_error);
+                    if (loaded) {
                         config = *loaded;
+                    } else if (!ConfigFileIsMissing(config_path_)) {
+                        // P148 P2-8: the file is THERE but could not be loaded
+                        // (bad JSON, denied read, another process holding it).
+                        // Continuing here would seed the SaveConfigCmd with a
+                        // DEFAULT-constructed Config, so every section the form
+                        // does not show (web.bind, web.token, perf.*,
+                        // ui_language, static bindings, portmap.*) would be
+                        // written back as its default - a silent wipe of the
+                        // operator's file. Refuse instead: nothing is posted,
+                        // the file on disk is untouched, and the dialog names
+                        // the load error plus the remedy.
+                        //
+                        // A MISSING file is still allowed through with defaults:
+                        // that is the first-run case, where there is nothing on
+                        // disk to protect (the save creates the document).
+                        save_guard_armed_ = false;
+                        const I18n& i18n = I18n::Instance();
+                        const std::wstring reason =
+                            load_error.empty() ? std::wstring() : Widen(load_error);
+                        std::wstring error = i18n.Format(
+                            Str::SettingsConfigUnreadableFmt, {reason});
+                        error += L"\n";
+                        error += i18n.T(Str::SettingsConfigUnreadableHint);
+                        dialog_->ShowMessage(Str::CommonError, error, Str::CommonOk);
+                        RelayoutHost(*host_);
+                        return false;
                     }
                 }
                 const SettingsDraft draft = ReadDraft();

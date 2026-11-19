@@ -2,6 +2,7 @@
 // http_server.cpp - Embedded HTTP server implementation.
 // ============================================================================
 #include "web/http_server.h"
+#include "core/config.h"
 #include "core/limits.h"
 
 #include <chrono>
@@ -162,6 +163,11 @@ namespace vgww {
             write_guard_ = std::move(guard);
         }
 
+        void HttpServer::SetReadGuard(
+            std::function<Response(const Request&)> guard) {
+            read_guard_ = std::move(guard);
+        }
+
         void HttpServer::ServeStatic(const std::string& root) {
             static_root_ = root;
         }
@@ -217,6 +223,17 @@ namespace vgww {
                 acceptor_.reset();
                 io_.reset();
                 return false;
+            }
+            // P148 P2-5: the read guard is only meaningful when this listener
+            // can be reached from another host. Ask the socket itself (not the
+            // caller's string) so "localhost", a hostname or a wildcard bind
+            // are all classified by what was actually bound. Set per Start(),
+            // so a live re-apply that moves the listener off loopback arms it.
+            {
+                std::error_code local_err;
+                const auto local = acceptor_->local_endpoint(local_err);
+                bind_is_loopback_.store(
+                    !local_err && local.address().is_loopback());
             }
             port_ = port;
             running_.store(true);
@@ -710,6 +727,20 @@ namespace vgww {
             if ("GET" != request.method && "HEAD" != request.method &&
                 write_guard_) {
                 Response denied = write_guard_(request);
+                if (denied.status != 200) {
+                    return denied;
+                }
+            }
+            // P148 P2-5: reads are normally open (a loopback-bound listener is
+            // only reachable from the operator's own machine), but a bind the
+            // operator pointed at the LAN must not hand the whole topology,
+            // the console ring and the configuration to any neighbour. The
+            // guard is supplied by the API layer and is consulted only while
+            // the CURRENT listener is bound off-loopback, so the everyday
+            // deployment is untouched.
+            if (("GET" == request.method || "HEAD" == request.method) &&
+                read_guard_ && !bind_is_loopback_.load()) {
+                Response denied = read_guard_(request);
                 if (denied.status != 200) {
                     return denied;
                 }

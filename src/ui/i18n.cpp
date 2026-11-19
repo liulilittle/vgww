@@ -417,6 +417,8 @@ namespace vgww {
                 L"粘贴失败",  // ClipboardPasteFailed
                 L"控制台输出未捕获(当前进程未开启控制台捕获)",  // ConsoleEmptyHintNoCapture
                 L"桥接已启用但尚未学习到设备",  // BridgeEmptyHintRunning
+                L"配置文件无法读取,已取消保存,以免覆盖原配置:{0}",  // SettingsConfigUnreadableFmt
+                L"请先修复该文件(JSON 语法/权限)或将其移走后重试;磁盘上的原文件未被改动。",  // SettingsConfigUnreadableHint
             };
 
 
@@ -818,6 +820,8 @@ namespace vgww {
                 L"Paste failed",  // ClipboardPasteFailed
                 L"Console capture is not active in this process",  // ConsoleEmptyHintNoCapture
                 L"Bridging is on, but no device has been learned yet",  // BridgeEmptyHintRunning
+                L"The config file could not be read, so the save was cancelled to avoid overwriting it: {0}",  // SettingsConfigUnreadableFmt
+                L"Fix that file (JSON syntax or permissions) or move it away, then try again. The file on disk was left untouched.",  // SettingsConfigUnreadableHint
             };
 
 

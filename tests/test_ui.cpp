@@ -38578,6 +38578,255 @@ static void TestP147C1SuccessfulSaveNotRolledBackByLaterFailure() {
     I18n::Instance().SetLang(Lang::ZhCN);
 }
 
+// ---------------------------------------------------------------------------
+// P148 P2-8: `SettingsPage::Save()` seeds its Config from the on-disk file so
+// the sections the FORM does not expose (web.bind, web.token, perf.*,
+// ui_language, dhcp static bindings, portmap.*) survive a UI save. When
+// LoadFromFile FAILED the old code kept the default-constructed Config and
+// still posted SaveConfigCmd, so every one of those hidden sections was written
+// back as its default - the operator's file was silently destroyed (an
+// authentication token wiped, LAN bind reset to loopback, DHCP static bindings
+// erased).
+//
+// Contract pinned here (three branches, one save each, no controller ticks so
+// nothing can re-seed the page behind our back):
+//   * file EXISTS but is unparseable -> the save is REFUSED: no SaveConfigCmd,
+//     the file's bytes are untouched, the error dialog names the reason;
+//   * the RETRY after the operator fixes that same path -> posts and the
+//     recovered (non-default) sections ride along in the command;
+//   * file MISSING (first run) -> still allowed: the hello save writes the
+//     document, because there is nothing on disk to protect.
+static void TestP148P28CorruptConfigSaveRefused() {
+    using namespace vgww::ui;
+    FixTextMetrics();
+    I18n::Instance().SetLang(Lang::ZhCN);
+
+    const std::string cfg_path =
+        TempDirNarrowUnique("p148_p28_corrupt_config.json");
+    {
+        std::error_code ec;
+        std::filesystem::create_directories(
+            std::filesystem::path(cfg_path).parent_path(), ec);
+    }
+    // Deliberately invalid JSON (trailing comma + unterminated object): this is
+    // the "file exists, cannot be loaded" case, not the first-run case.
+    const char* const kCorrupt = "{\n  \"mode\": \"main\",\n  \"web\": {,\n";
+    {
+        std::FILE* file = nullptr;
+        CHECK(::fopen_s(&file, cfg_path.c_str(), "wb") == 0);
+        CHECK(file != nullptr);
+        if (file != nullptr) {
+            CHECK(std::fwrite(kCorrupt, 1, std::strlen(kCorrupt), file) ==
+                  std::strlen(kCorrupt));
+            std::fclose(file);
+        }
+    }
+    const auto read_file = [](const std::string& path) {
+        std::ifstream in(path, std::ios::binary);
+        return std::string((std::istreambuf_iterator<char>(in)),
+                           std::istreambuf_iterator<char>());
+    };
+    CHECK(read_file(cfg_path) == kCorrupt);  // sanity: the fixture landed
+
+    ShellFakeSource source;
+    RecordingExecutor executor;
+    UiController controller(source, executor);
+    std::string start_error;
+    CHECK(controller.Start(start_error));
+
+    UiSnapshot snapshot = MakeRulesSnapshot(1, 1);
+    ConfigView& view = snapshot.config;
+    view.adapter = "Ethernet 2";
+    view.mode = "bypass";
+    view.gateway_ip = "192.168.1.1";
+    view.gateway_mask = "255.255.255.0";
+    view.gateway_mac = "02:00:00:00:00:01";
+    view.dhcp_pool_start = "192.168.1.100";
+    view.dhcp_pool_end = "192.168.1.200";
+    view.dhcp_lease_s = 86400;
+    view.ula_prefix = "fd00:0000:0000:0000:0000:0000:0000:0000";
+    view.prefix_len = 64;
+    view.ra_lifetime_s = 1800;
+    view.dhcp6_pool_start = "fd00:0000:0000:0000:0000:0000:0000:1000";
+    view.dhcp6_pool_end = "fd00:0000:0000:0000:0000:0000:0000:1fff";
+    view.dhcp6_lease_s = 3600;
+    view.web_bind = "127.0.0.1";
+    view.web_port = 8080;
+    view.web_enabled = true;
+    view.ui_scale = "auto";
+    view.theme = "dark";
+    view.perf_workers = 4;
+    view.perf_max_conns = 2048;
+    view.perf_dial_timeout_ms = 5000;
+    view.vlan_id = 0;
+    view.bridge_table_size = 4096;
+    view.config_path = cfg_path;
+
+    UiApp app;
+    app.Compose(controller, snapshot);
+    app.root().Arrange({0.0f, 0.0f, 1280.0f, 1000.0f});
+    app.router().Navigate("settings");
+    app.Update(snapshot);
+    app.root().Arrange({0.0f, 0.0f, 1280.0f, 1000.0f});
+
+    auto* save = dynamic_cast<Button*>(FindById(app.root(), "settings.save"));
+    auto* port = dynamic_cast<TextInputElement*>(
+        FindById(app.root(), "settings.web_port"));
+    auto* dialog =
+        dynamic_cast<DialogHost*>(FindById(app.root(), "settings.dialog"));
+    CHECK(save != nullptr && port != nullptr && dialog != nullptr);
+    if (save == nullptr || port == nullptr || dialog == nullptr) {
+        controller.Stop();
+        I18n::Instance().SetLang(Lang::ZhCN);
+        return;
+    }
+    CHECK(port->value() == L"8080");
+
+    // (1) Branch "exists but corrupt": a real edit, then Save.
+    TypeInto(*port, L"9090");
+    app.root().Arrange({0.0f, 0.0f, 1280.0f, 1000.0f});
+    executor.commands.clear();
+    ClickElement(*save);
+    // A refusal posts NOTHING. The command queue is drained by the controller's
+    // worker, so "empty" must be re-checked over a bounded window: a single
+    // immediate read would pass even when the buggy path queued the command a
+    // few microseconds later (the mutation run proved exactly that).
+    {
+        const auto deadline = std::chrono::steady_clock::now() +
+                              std::chrono::milliseconds(300);
+        while (std::chrono::steady_clock::now() < deadline) {
+            controller.DrainResults();
+            std::this_thread::sleep_for(std::chrono::milliseconds(5));
+        }
+    }
+    // RED before the fix: the default-constructed Config was posted, so this
+    // command list was NOT empty and the file below got rewritten with
+    // web.bind="127.0.0.1", web.token="", perf defaults, no static bindings.
+    std::printf("P148P28 corrupt_save posted=%zu dialog_open=%d\n",
+                executor.commands.size(), dialog->open() ? 1 : 0);
+    CHECK(executor.commands.empty());
+    CHECK(read_file(cfg_path) == kCorrupt);  // the operator's bytes survive
+    CHECK(dialog->open() && dialog->mode() == DialogHost::Mode::Message);
+    CHECK(DialogHasSubtext(*dialog, L"JSON"));
+    CHECK(DialogHasSubtext(*dialog,
+                           I18n::Instance().T(Str::SettingsConfigUnreadableHint)));
+    CHECK(dialog->OnKeyDown(0x0D));  // OK closes; the edits stay on the form
+    CHECK(port->value() == L"9090");
+
+    // (2) The operator repairs the SAME path and retries: the save posts and
+    // carries the recovered non-default sections (the very fields the corrupt
+    // path would have defaulted away).
+    {
+        const char* json =
+            "{\n"
+            "  \"mode\": \"bypass\",\n"
+            "  \"adapter\": \"Ethernet 2\",\n"
+            "  \"gateway\": {\"ipv4\": \"192.168.1.1\", \"mask\": \"255.255.255.0\","
+            " \"mac\": \"02:00:00:00:00:01\"},\n"
+            "  \"dhcp\": {\"enabled\": true, \"pool_start\": \"192.168.1.100\","
+            " \"pool_end\": \"192.168.1.200\", \"lease_hours\": 24,"
+            " \"static_bindings\": [{\"mac\": \"AA:BB:CC:DD:EE:FF\","
+            " \"ip\": \"192.168.1.50\", \"hostname\": \"nas\"}]},\n"
+            "  \"ipv6\": {\"enabled\": true, \"ula_prefix\": \"fd00::/64\","
+            " \"ra_lifetime_s\": 1800, \"dns\": [],"
+            " \"dhcpv6\": {\"enabled\": true, \"pool_start\": \"fd00::1000\","
+            " \"pool_end\": \"fd00::1fff\", \"lease_seconds\": 3600}},\n"
+            "  \"perf\": {\"workers\": 2, \"max_conns\": 1024,"
+            " \"rx_batch\": 16, \"udp_flow_cap\": 1024, \"ring_capacity\": 1024,"
+            " \"dial_timeout_ms\": 7000, \"rx_flush_eager\": false,"
+            " \"rx_poll_ms\": 4},\n"
+            "  \"web\": {\"enabled\": true, \"port\": 8080, "
+            "\"bind\": \"192.168.1.1\", \"token\": \"keep-me\"},\n"
+            "  \"ui_language\": \"en\",\n"
+            "  \"portmap\": {\"max_relays\": 512, \"max_relays_per_rule\": 128,"
+            " \"idle_timeout_s\": 120},\n"
+            "  \"bridge\": {\"enabled\": false, \"upstream\": \"NIC 1\","
+            " \"downstream\": \"NIC 2\", \"mac_table_size\": 4096}\n"
+            "}\n";
+        std::FILE* file = nullptr;
+        CHECK(::fopen_s(&file, cfg_path.c_str(), "wb") == 0);
+        CHECK(file != nullptr);
+        if (file != nullptr) {
+            CHECK(std::fwrite(json, 1, std::strlen(json), file) ==
+                  std::strlen(json));
+            std::fclose(file);
+        }
+    }
+    executor.commands.clear();
+    ClickElement(*save);
+    CHECK(WaitForCommands(executor, 1, controller));
+    CHECK(executor.commands.size() == 1);
+    if (executor.commands.size() == 1) {
+        const auto* cmd = std::get_if<SaveConfigCmd>(&executor.commands[0]);
+        CHECK(cmd != nullptr);
+        if (cmd != nullptr) {
+            std::printf(
+                "P148P28 recovered bind=%s token=%s workers=%u max_conns=%u "
+                "rx_batch=%u dial=%u eager=%d poll=%u lang=%s bindings=%zu "
+                "relays=%u\n",
+                cmd->config.web.bind.c_str(), cmd->config.web.token.c_str(),
+                cmd->config.perf.workers, cmd->config.perf.max_conns,
+                cmd->config.perf.rx_batch, cmd->config.perf.dial_timeout_ms,
+                cmd->config.perf.rx_flush_eager ? 1 : 0,
+                cmd->config.perf.rx_poll_ms, cmd->config.ui_language.c_str(),
+                cmd->config.dhcp.static_bindings.size(),
+                cmd->config.portmap.max_relays);
+            CHECK(cmd->config.web.bind == "192.168.1.1");  // not the default
+            CHECK(cmd->config.web.token == "keep-me");     // credential kept
+            // workers / max_conns / dial_timeout_ms ARE form fields, so the
+            // draft (snapshot values) legitimately wins there. Everything the
+            // form does NOT expose must come from the recovered file.
+            CHECK(cmd->config.perf.workers == 4u);        // form wins
+            CHECK(cmd->config.perf.max_conns == 2048u);   // form wins
+            CHECK(cmd->config.perf.rx_batch == 16u);      // disk wins
+            CHECK(cmd->config.perf.udp_flow_cap == 1024u);
+            CHECK(cmd->config.perf.ring_capacity == 1024u);
+            CHECK(cmd->config.perf.dial_timeout_ms == 5000u);  // form wins
+            CHECK(!cmd->config.perf.rx_flush_eager);
+            CHECK(cmd->config.perf.rx_poll_ms == 4u);
+            CHECK(cmd->config.ui_language == "en");
+            CHECK(cmd->config.dhcp.static_bindings.size() == 1);
+            CHECK(cmd->config.portmap.max_relays == 512u);
+            CHECK(cmd->config.portmap.max_relays_per_rule == 128u);
+            CHECK(cmd->config.portmap.idle_timeout_s == 120u);
+            CHECK(cmd->config.web.port == 9090);  // the form edit still wins
+        }
+    }
+
+    // (3) Branch "missing" (first run): a save must still be allowed, because
+    // there is nothing on disk to protect.
+    {
+        // Let the step-2 success land so the page's in-flight state settles,
+        // then make a real edit: that re-arms the Save button (batch39).
+        const std::size_t toast_base = app.toasts().active_count();
+        const auto deadline = std::chrono::steady_clock::now() +
+                              std::chrono::seconds(3);
+        while (app.toasts().active_count() == toast_base &&
+               std::chrono::steady_clock::now() < deadline) {
+            app.DrainCommandResultsForTest();
+            std::this_thread::sleep_for(std::chrono::milliseconds(5));
+        }
+        std::error_code ec;
+        std::filesystem::remove(cfg_path, ec);
+        CHECK(!std::filesystem::exists(cfg_path));
+        TypeInto(*port, L"9191");
+        app.root().Arrange({0.0f, 0.0f, 1280.0f, 1000.0f});
+    }
+    executor.commands.clear();
+    ClickElement(*save);
+    CHECK(WaitForCommands(executor, 1, controller));
+    CHECK(executor.commands.size() == 1);
+    CHECK(std::get_if<SaveConfigCmd>(&executor.commands[0]) != nullptr);
+    CHECK(!dialog->open());  // no refusal for the first-run case
+
+    {
+        std::error_code ec;
+        std::filesystem::remove(cfg_path, ec);
+    }
+    controller.Stop();
+    I18n::Instance().SetLang(Lang::ZhCN);
+}
+
 static void TestP141B9BridgeRunningEmptyStateNotOff() {
     using namespace vgww::ui;
     FixTextMetrics();
@@ -39178,6 +39427,7 @@ int main() {
     TestP147RollbackPreservesNewerBindings();
     TestP147P27FailedApplyKeepsEdits();
     TestP147C1SuccessfulSaveNotRolledBackByLaterFailure();
+    TestP148P28CorruptConfigSaveRefused();
     TestB33jCurveIsContinuous();
     TestB33kGradientAndAxisTicks();
     if (g_failures == 0) {

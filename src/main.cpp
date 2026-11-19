@@ -783,15 +783,67 @@ namespace {
         serve_done:;
         }
 
+        // P148 P2-6: the headless WebUI config save cannot run on the HTTP
+        // worker (http.Stop() would self-join), so it runs on a thread of its
+        // own. That thread executes `apply_config_live`, which reaches
+        // RunVgww's LOCALS through this lambda's `[&]` capture: `http`,
+        // `config`, `web_running`, `apply_mutex`, `web_auth`, `dataplane`,
+        // `config_mutex`. It used to be DETACHED, so closing the window (or
+        // Ctrl+C in headless mode) could return from RunVgww and destroy those
+        // locals while the worker was inside them - a use-after-free.
+        //
+        // The lifetime rule enforced here: every such worker is TRACKED, and
+        // every exit path first stops the listener (no new request can start
+        // one) and then joins the tracked workers before RunVgww can return.
+        // `apply_drained` is the barrier for the inline (native UI / command
+        // thread) path, so an apply that starts after the join is refused
+        // instead of touching objects that are about to be destroyed.
+        struct ApplyWorker final {
+            std::thread thread;
+            // Set by the worker as its last action, so an already-finished
+            // worker can be reclaimed on the next save instead of keeping its
+            // handle until shutdown (a headless gateway may save many times).
+            std::shared_ptr<std::atomic<bool>> done;
+        };
+        std::mutex apply_workers_mutex;
+        std::vector<ApplyWorker> apply_workers;
+        std::atomic<bool> apply_drained{false};
+
+        // Joins every config-apply worker started so far and closes the
+        // apply gate. Called on both exit paths (UI and headless) and safe to
+        // call more than once. May block while an in-flight apply finishes
+        // (bounded: the apply is a dataplane stop/start plus an HTTP restart).
+        const auto stop_apply_workers = [&apply_workers, &apply_workers_mutex,
+                                         &apply_drained]() noexcept {
+            std::vector<ApplyWorker> pending;
+            {
+                std::lock_guard<std::mutex> lock(apply_workers_mutex);
+                apply_drained.store(true);
+                pending.swap(apply_workers);
+            }
+            for (ApplyWorker& worker : pending) {
+                if (worker.thread.joinable()) {
+                    worker.thread.join();
+                }
+            }
+        };
+
         // batch37u: one shared live-apply path for both entry points. The
         // native settings command calls it from the command thread; the
-        // headless WebUI config save calls it from a detached worker (never
+        // headless WebUI config save calls it from a tracked worker (never
         // from an HTTP worker, which http.Stop would self-join). The mutex
         // serializes concurrent Web saves.
         std::mutex apply_mutex;
         auto apply_config_live = [&](const Config& next,
                                      std::wstring& error) -> bool {
             std::lock_guard<std::mutex> apply_lock(apply_mutex);
+            if (apply_drained.load()) {
+                // P148 P2-6: shutdown already joined the workers; refusing is
+                // the only safe answer (the objects this lambda captures are
+                // about to be destroyed).
+                error = L"config apply refused (shutting down)";
+                return false;
+            }
             const Config previous = *config;
             const bool was_running = dataplane.IsRunning();
             const bool was_web_running = web_running;
@@ -960,11 +1012,13 @@ namespace {
             },
             // batch37t/u: Web POST /api/config applies immediately. With the
             // native UI it goes through the UI thread + command queue; in
-            // headless/web-only mode a detached worker applies it after the
-            // response is flushed (never on the HTTP worker itself). batch38:
-            // every apply outcome (from either path) is recorded so the Web
-            // page can report success/failure truthfully.
-            [&apply_config_live, config_apply_status](
+            // headless/web-only mode a worker applies it after the response
+            // is flushed (never on the HTTP worker itself). batch38: every
+            // apply outcome (from either path) is recorded so the Web page can
+            // report success/failure truthfully. P148 P2-6: the worker is
+            // tracked (see stop_apply_workers) instead of detached.
+            [&apply_config_live, config_apply_status, &apply_workers,
+             &apply_workers_mutex, &apply_drained](
                 const vgww::core::Config& cfg, uint64_t attempt_id) {
                 auto sink = [config_apply_status, attempt_id](
                                 bool ok, const std::string& err) {
@@ -975,32 +1029,55 @@ namespace {
                     app->QueueConfigSaveFromWeb(cfg, std::move(sink));
                     return true;
                 }
-                std::thread([&apply_config_live, cfg, sink] {
-                    ::vgww::core::RunDetachedBodyGuarded(
-                        config_apply_errors,
-                        [&] {
-                            ::Sleep(150);
-                            std::wstring error;
-                            const bool ok = apply_config_live(cfg, error);
-                            std::string utf8;
-                            if (!error.empty()) {
-                                const int need = ::WideCharToMultiByte(
-                                    CP_UTF8, 0, error.c_str(),
-                                    static_cast<int>(error.size()), nullptr, 0,
-                                    nullptr, nullptr);
-                                if (need > 0) {
-                                    utf8.resize(
-                                        static_cast<std::size_t>(need));
-                                    ::WideCharToMultiByte(
+                std::lock_guard<std::mutex> lock(apply_workers_mutex);
+                if (apply_drained.load()) {
+                    // P148 P2-6: RunVgww is tearing down; a worker started now
+                    // would outlive the locals it reads.
+                    return false;
+                }
+                for (auto it = apply_workers.begin();
+                     it != apply_workers.end();) {
+                    if (it->done != nullptr && it->done->load()) {
+                        if (it->thread.joinable()) {
+                            it->thread.join();
+                        }
+                        it = apply_workers.erase(it);
+                    } else {
+                        ++it;
+                    }
+                }
+                auto done = std::make_shared<std::atomic<bool>>(false);
+                apply_workers.push_back(ApplyWorker{
+                    std::thread([&apply_config_live, cfg, sink, done] {
+                        ::vgww::core::RunDetachedBodyGuarded(
+                            config_apply_errors,
+                            [&] {
+                                ::Sleep(150);
+                                std::wstring error;
+                                const bool ok =
+                                    apply_config_live(cfg, error);
+                                std::string utf8;
+                                if (!error.empty()) {
+                                    const int need = ::WideCharToMultiByte(
                                         CP_UTF8, 0, error.c_str(),
-                                        static_cast<int>(error.size()),
-                                        utf8.data(), need, nullptr, nullptr);
+                                        static_cast<int>(error.size()), nullptr,
+                                        0, nullptr, nullptr);
+                                    if (need > 0) {
+                                        utf8.resize(
+                                            static_cast<std::size_t>(need));
+                                        ::WideCharToMultiByte(
+                                            CP_UTF8, 0, error.c_str(),
+                                            static_cast<int>(error.size()),
+                                            utf8.data(), need, nullptr,
+                                            nullptr);
+                                    }
                                 }
-                            }
-                            sink(ok, utf8);
-                        },
-                        [&] { sink(false, "config apply failed"); });
-                }).detach();
+                                sink(ok, utf8);
+                            },
+                            [&] { sink(false, "config apply failed"); });
+                        done->store(true);
+                    }),
+                    done});
                 return true;
             },
             config_apply_status,
@@ -1176,6 +1253,13 @@ namespace {
                 }
                 ui_controller.Stop();
                 g_ui_app.store(nullptr);
+                // P148 P2-6: tear the WebUI down BEFORE RunVgww's locals are
+                // destroyed, and let the last in-flight config apply finish.
+                // Order matters: stopping the listener stops any NEW apply
+                // from being started, then the join waits out the running one.
+                http.Stop();
+                web_running = false;
+                stop_apply_workers();
                 return exit_code;
             }
         }
@@ -1210,6 +1294,13 @@ namespace {
                 static_cast<unsigned long long>(stats.host_passthrough.load()),
                 static_cast<unsigned long long>(stats.mac_misses.load()));
         }
+
+        // P148 P2-6: same teardown contract as the UI path - the listener
+        // goes down first (no new apply can start), then the tracked apply
+        // workers are joined before RunVgww returns and destroys its locals.
+        http.Stop();
+        web_running = false;
+        stop_apply_workers();
 
         return 0;
     }

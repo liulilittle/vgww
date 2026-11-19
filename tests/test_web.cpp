@@ -1294,6 +1294,356 @@ static void TestP147A3PortmapConfigEchoed() {
     std::remove(rules.c_str());
 }
 
+// P148 P2-5: GET/HEAD skipped the token check entirely (HttpServer::Dispatch
+// consulted the guard for non-GET/HEAD only), so a WebUI bound to a
+// LAN-reachable address leaked the whole topology, the console ring and the
+// configuration (bind/port, DHCP pools, static bindings) to anyone on the
+// segment without a credential. The read guard registered by RegisterApi is
+// consulted only while the live listener is bound off-loopback: the operator's
+// local browser keeps working without a token and every existing
+// loopback-bound test keeps its 200s.
+static void TestP148P25ReadRoutesNeedTokenOffLoopback() {
+    using namespace vgww::core;
+
+    // The listener classifies its own local endpoint (HttpServer::Start), so
+    // an off-loopback case needs a REAL non-loopback address of this machine.
+    // Probing the host keeps the test meaningful on any box; when none exists
+    // the loopback half below still runs (and its 200s are what guards the
+    // "do not break local use" requirement).
+    std::string lan_addr;
+    {
+        // asio (already the suite's only socket library) enumerates the host's
+        // own addresses. Winsock is initialised by its first use, so no
+        // WSAStartup dance is needed here. IPv4 preferred: the loopback helpers
+        // in this suite are IPv4-only, and a link-local IPv6 address with a
+        // scope id cannot be parsed by make_address().
+        asio::io_context probe_io;
+        asio::ip::tcp::resolver probe(probe_io);
+        std::error_code probe_err;
+        const std::string host = asio::ip::host_name();
+        const auto entries = probe.resolve(
+            host, "", asio::ip::tcp::resolver::passive, probe_err);
+        if (!probe_err) {
+            std::string fallback;
+            for (auto it = entries.begin(); it != entries.end(); ++it) {
+                const auto addr = it->endpoint().address();
+                if (addr.is_loopback() ||
+                    WebBindIsLoopback(addr.to_string())) {
+                    continue;
+                }
+                if (addr.is_v4()) {
+                    lan_addr = addr.to_string();
+                    break;
+                }
+                if (fallback.empty() && addr.to_string().find('%') ==
+                                            std::string::npos) {
+                    fallback = addr.to_string();
+                }
+            }
+            if (lan_addr.empty()) lan_addr = fallback;
+        }
+    }
+    std::printf("p148p25 off-loopback candidate: [%s]\n", lan_addr.c_str());
+
+    // The shared HTTP helpers dial 127.0.0.1 unconditionally, which cannot
+    // reach a listener bound to the LAN address. These two dial the address
+    // the listener actually bound.
+    const auto http_at = [](const std::string& addr, uint16_t port,
+                            const std::string& request,
+                            std::string& body) -> int {
+        asio::io_context io;
+        asio::ip::tcp::socket socket(io);
+        std::error_code err;
+        socket.connect(asio::ip::tcp::endpoint(
+                           asio::ip::make_address(addr, err), port), err);
+        if (err) return -1;
+        asio::write(socket, asio::buffer(request), err);
+        if (err) return -1;
+        std::ostringstream raw;
+        char buf[4096];
+        for (;;) {
+            const size_t n = socket.read_some(asio::buffer(buf), err);
+            if (err) break;
+            raw.write(buf, static_cast<std::streamsize>(n));
+        }
+        const std::string text = raw.str();
+        const size_t body_at = text.find("\r\n\r\n");
+        if (std::string::npos != body_at) body = text.substr(body_at + 4);
+        const size_t space = text.find(' ');
+        return (std::string::npos == space) ? -1
+                                            : atoi(text.c_str() + space + 1);
+    };
+    const auto get_at = [&http_at](const std::string& addr, uint16_t port,
+                                   const std::string& path,
+                                   std::string& body) -> int {
+        return http_at(addr, port,
+                       "GET " + path +
+                           " HTTP/1.1\r\nHost: t\r\nConnection: close\r\n\r\n",
+                       body);
+    };
+
+    const char* const kReads[] = {"/api/config",        "/api/status",
+                                  "/api/console",       "/api/system",
+                                  "/api/clients",       "/api/dhcp/leases",
+                                  "/api/dhcp6/leases",  "/api/portmap",
+                                  "/api/bans",          "/api/ratelimit",
+                                  "/api/autostart"};
+
+    // (1) LAN-reachable bind: every read route needs the credential. The
+    // listener really binds the LAN address, so the classification under test
+    // is the production one (HttpServer::Start's local_endpoint), not a flag
+    // the test sets itself.
+    if (!lan_addr.empty()) {
+        Config cfg;
+        cfg.web.bind = lan_addr;
+        cfg.web.token = "p148secret";
+        vgww::runtime::Dataplane dp(cfg);
+        HttpServer api;
+        vgww::web::RegisterApi(api, dp, cfg, ScratchFile("p148p25.json"),
+                               "p148secret");
+        const uint16_t kPort = UniquePort();
+        std::string err;
+        CHECK(api.Start(lan_addr, kPort, err));
+
+        std::string body;
+        for (const char* const path : kReads) {
+            const int no_token = get_at(lan_addr, kPort, path, body);
+            std::printf("p148p25 off-loopback %s without token: status=%d\n",
+                        path, no_token);
+            CHECK(401 == no_token);
+            CHECK(std::string::npos == body.find("\"web\""));
+        }
+        // HEAD rides the GET handler, so it must be refused too (otherwise it
+        // is an unauthenticated header/Content-Length oracle).
+        {
+            const int head_status = http_at(
+                lan_addr, kPort,
+                "HEAD /api/config HTTP/1.1\r\nHost: t\r\n"
+                "Connection: close\r\n\r\n",
+                body);
+            std::printf("p148p25 off-loopback HEAD without token: %d\n",
+                        head_status);
+            CHECK(401 == head_status);
+        }
+        // A wrong credential is still a refusal, never a 200.
+        CHECK(401 == http_at(lan_addr, kPort,
+                             "GET /api/config HTTP/1.1\r\nHost: t\r\n"
+                             "X-Auth-Token: p148wrong\r\n"
+                             "Connection: close\r\n\r\n",
+                             body));
+        // The correct credential opens the read (header form).
+        CHECK(200 == http_at(lan_addr, kPort,
+                             "GET /api/config HTTP/1.1\r\nHost: t\r\n"
+                             "X-Auth-Token: p148secret\r\n"
+                             "Connection: close\r\n\r\n",
+                             body));
+        CHECK(body.find("\"web\"") != std::string::npos);
+        // ... and so does the standard Bearer form.
+        CHECK(200 == http_at(lan_addr, kPort,
+                             "GET /api/status HTTP/1.1\r\nHost: t\r\n"
+                             "Authorization: Bearer p148secret\r\n"
+                             "Connection: close\r\n\r\n",
+                             body));
+        // The write guard is untouched: an unauthenticated POST still 401s.
+        CHECK(401 == http_at(lan_addr, kPort,
+                             "POST /api/portmap HTTP/1.1\r\nHost: t\r\n"
+                             "Content-Length: 2\r\nConnection: close\r\n\r\n{}",
+                             body));
+
+        api.Stop();
+    }
+
+    // (2) Loopback bind: the local browser loads the UI and every read with no
+    // token - the operator's existing experience is unchanged.
+    {
+        Config cfg;
+        cfg.web.bind = "127.0.0.1";
+        cfg.web.token = "p148secret";
+        vgww::runtime::Dataplane dp(cfg);
+        HttpServer api;
+        vgww::web::RegisterApi(api, dp, cfg, ScratchFile("p148p25b.json"),
+                               "p148secret");
+        const uint16_t kPort = UniquePort();
+        std::string err;
+        CHECK(api.Start("127.0.0.1", kPort, err));
+
+        std::string body;
+        CHECK(200 == HttpGet("/api/config", kPort, body));
+        CHECK(body.find("\"web\"") != std::string::npos);
+        CHECK(200 == HttpGet("/api/status", kPort, body));
+        CHECK(200 == HttpGet("/api/console", kPort, body));
+        // Arming the read guard must not have disarmed the write guard.
+        CHECK(401 == HttpPost(kPort, "/api/portmap", "", "{}", body));
+        api.Stop();
+    }
+
+    // (3) The live path: a listener that comes up on loopback and is then
+    // restarted on the LAN address (exactly what apply_config_live does when
+    // the operator moves the bind) must start gating reads without the API
+    // being re-registered. This is the case a registration-time arm cannot
+    // cover, so it pins the per-Start() classification.
+    if (!lan_addr.empty()) {
+        Config cfg;
+        cfg.web.bind = "127.0.0.1";
+        cfg.web.token = "p148secret";
+        vgww::runtime::Dataplane dp(cfg);
+        HttpServer api;
+        vgww::web::RegisterApi(api, dp, cfg, ScratchFile("p148p25c.json"),
+                               "p148secret");
+        const uint16_t kPort = UniquePort();
+        std::string err;
+        CHECK(api.Start("127.0.0.1", kPort, err));
+        std::string body;
+        CHECK(200 == HttpGet("/api/config", kPort, body));
+        api.Stop();
+        CHECK(api.Start(lan_addr, kPort, err));
+        const int after_rebind = get_at(lan_addr, kPort, "/api/config", body);
+        std::printf("p148p25 after loopback->LAN rebind: status=%d\n",
+                    after_rebind);
+        CHECK(401 == after_rebind);
+        CHECK(200 == http_at(lan_addr, kPort,
+                             "GET /api/config HTTP/1.1\r\nHost: t\r\n"
+                             "X-Auth-Token: p148secret\r\n"
+                             "Connection: close\r\n\r\n",
+                             body));
+        api.Stop();
+    }
+}
+
+// P148 P2-6: in headless/web-only mode POST /api/config applies on a thread of
+// its own (it must run long enough to flush the HTTP response, so it cannot
+// ride the connection worker that http.Stop would self-join). That worker
+// touches RunVgww's LOCALS through apply_config_live's `[&]` capture: `http`,
+// `config`, `web_running`, `apply_mutex`, `web_auth`, `dataplane`. main.cpp
+// used to `.detach()` it and return from RunVgww (UI window closed, or Ctrl+C
+// headless) without waiting: ~HttpServer then ran under a live thread, so the
+// worker's `http.Stop()`/`*config = next` hit destroyed members - UB/UAF.
+//
+// Two independent checks pin the contract:
+//   (1) BEHAVIOUR: HttpServer::Stop() must join its connection workers, not
+//       only the accept thread - a handler that is still running after Stop()
+//       returned is exactly the "Stop is not a lifetime barrier" hole.
+//   (2) PRODUCTION (source anchor; main.cpp is an exe-only TU no test binary
+//       links, same technique as TestP147RollbackPreservesNewerBindings):
+//       the detached apply is gone and every exit path joins the tracked
+//       workers before returning.
+static void TestP148P26ExitWaitsForDetachedApply() {
+    using namespace vgww::web;
+
+    // (1) Stop() is a barrier for the handler that is already executing.
+    {
+        std::atomic<bool> entered{false};
+        std::atomic<bool> release{false};
+        std::atomic<bool> finished{false};
+        std::atomic<bool> stop_returned{false};
+        HttpServer srv;
+        srv.Route("POST", "/api/p26-stop-joins", [&](const Request&) {
+            entered.store(true);
+            const auto deadline = std::chrono::steady_clock::now() +
+                                  std::chrono::milliseconds(5000);
+            while (!release.load() &&
+                   std::chrono::steady_clock::now() < deadline) {
+                ::Sleep(2);
+            }
+            finished.store(true);
+            return Response::Json("{\"ok\":true}");
+        });
+        std::string err;
+        const uint16_t kP = UniquePort();
+        CHECK(srv.Start("127.0.0.1", kP, err));
+        std::thread poster([kP] {
+            std::string body;
+            HttpPostWithin(kP, "/api/p26-stop-joins", "{}", body, 5000);
+        });
+        const auto entered_deadline = std::chrono::steady_clock::now() +
+                                      std::chrono::milliseconds(5000);
+        while (!entered.load() &&
+               std::chrono::steady_clock::now() < entered_deadline) {
+            ::Sleep(2);
+        }
+        CHECK(entered.load());
+        std::thread stopper([&] {
+            srv.Stop();
+            stop_returned.store(true);
+        });
+        ::Sleep(200);
+        // While a handler is blocked, Stop() must NOT have returned. If it
+        // only joined the accept thread this is already true and the handler
+        // is running against a server whose caller may free it at any moment.
+        std::printf("P148P26 stop_returned_while_handler_blocked=%d\n",
+                    stop_returned.load() ? 1 : 0);
+        CHECK(!stop_returned.load());
+        release.store(true);
+        stopper.join();
+        poster.join();
+        CHECK(finished.load());
+    }
+
+    // (2) The production exit paths.
+    {
+        wchar_t exe_path[MAX_PATH * 2] = {0};
+        const DWORD exe_len =
+            ::GetModuleFileNameW(nullptr, exe_path, MAX_PATH * 2);
+        CHECK(exe_len > 0 && exe_len < MAX_PATH * 2);
+        if (exe_len > 0 && exe_len < MAX_PATH * 2) {
+            namespace fs = std::filesystem;
+            fs::path dir =
+                fs::path(std::wstring(exe_path, exe_len)).parent_path();
+            fs::path root;
+            for (int i = 0; i < 8 && !dir.empty(); ++i) {
+                std::error_code mec;
+                if (fs::exists(dir / "scripts" / "native-i18n-t2" / "ar.json",
+                               mec)) {
+                    root = dir;
+                    break;
+                }
+                if (!dir.has_parent_path()) break;
+                dir = dir.parent_path();
+            }
+            CHECK(!root.empty());
+            const fs::path src = root / "src" / "main.cpp";
+            std::ifstream in(src, std::ios::binary);
+            CHECK(in.good());
+            std::string text((std::istreambuf_iterator<char>(in)),
+                             std::istreambuf_iterator<char>());
+            // No config-apply worker may be detached any more.
+            std::printf("P148P26 detached_bodies=%d\n",
+                        static_cast<int>(text.find("}).detach();") !=
+                            std::string::npos));
+            CHECK(text.find("}).detach();") == std::string::npos);
+            // The workers are tracked and joined.
+            CHECK(text.find("apply_workers") != std::string::npos);
+            const size_t join_calls = [&text] {
+                size_t n = 0;
+                for (size_t at = text.find("stop_apply_workers()");
+                     at != std::string::npos;
+                     at = text.find("stop_apply_workers()", at + 1)) {
+                    ++n;
+                }
+                return n;
+            }();
+            std::printf("P148P26 stop_apply_workers_calls=%d\n",
+                        static_cast<int>(join_calls));
+            CHECK(join_calls >= 2);  // UI exit path and headless exit path
+            const size_t ui_return = text.find("return exit_code;");
+            CHECK(ui_return != std::string::npos);
+            const size_t ui_join =
+                ui_return == std::string::npos
+                    ? std::string::npos
+                    : text.rfind("stop_apply_workers()", ui_return);
+            CHECK(ui_join != std::string::npos && ui_join < ui_return);
+            // ... and the listener is stopped on that path before returning,
+            // so no NEW request can start a worker after the join.
+            const size_t ui_http_stop =
+                ui_return == std::string::npos
+                    ? std::string::npos
+                    : text.rfind("http.Stop();", ui_return);
+            CHECK(ui_http_stop != std::string::npos && ui_http_stop < ui_return);
+            CHECK(ui_join != std::string::npos && ui_http_stop < ui_join);
+        }
+    }
+}
+
 // batch37t (user: settings must apply immediately): POST /api/config must
 // hand the parsed config to the applier and answer "applied" when accepted.
 static void TestB37tWebConfigAppliesLive() {
@@ -11026,6 +11376,8 @@ int main(int argc, char** argv) {
     TestH1WebConfigPreservesNativePrefs();
     TestP147P24WebConfigEchosEnabled();
     TestP147A3PortmapConfigEchoed();
+    TestP148P25ReadRoutesNeedTokenOffLoopback();
+    TestP148P26ExitWaitsForDetachedApply();
     TestB37tWebConfigAppliesLive();
     TestB38WebApplyStatus();
     TestB111ApplyStatusIgnoresStaleCompletion();

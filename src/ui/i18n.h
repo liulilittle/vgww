@@ -539,6 +539,13 @@ namespace vgww {
             /// P141 B-9: the bridge is RUNNING but the MAC table has no
             /// entries yet; the empty state must not claim bridging is off.
             BridgeEmptyHintRunning,
+            /// P148 P2-8: the settings save seeds its Config from the on-disk
+            /// file so sections the form does not show survive. A file that
+            /// EXISTS but cannot be loaded (bad JSON, permissions, another
+            /// process holding it) must refuse the save instead of writing
+            /// defaults over it - these two name the reason and the remedy.
+            SettingsConfigUnreadableFmt,
+            SettingsConfigUnreadableHint,
             _Count
         };
 

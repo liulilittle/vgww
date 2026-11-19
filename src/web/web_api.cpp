@@ -2323,6 +2323,46 @@ namespace vgww {
                         return pass;
                     });
             }
+            // P148 P2-5: reads skipped the token check entirely, so a listener
+            // the operator pointed at the LAN (web.bind = 0.0.0.0 / a LAN IP)
+            // served /api/config (bind/port, DHCP pools, static bindings),
+            // /api/console, /api/status and the rule lists to any neighbour
+            // with no credential. A loopback listener stays open on purpose
+            // (only the operator's own machine can reach it, and the page has
+            // to paint before a token exists), so this guard is registered
+            // unconditionally and HttpServer::Dispatch consults it ONLY while
+            // the live listener is bound off-loopback (classified in Start()
+            // from the socket itself). That keeps a live re-apply honest: a
+            // settings save that moves the bind from 127.0.0.1 to the LAN
+            // starts gating reads without re-registering the API.
+            //
+            // Refusals are deliberately NOT audited: the page polls
+            // /api/status every 2 s, so one unauthenticated tab would flush
+            // the ring - and the ring is itself a read route.
+            server.SetReadGuard([auth_token](const Request& request) -> Response {
+                const AuthTokenSnapshot state =
+                    auth_token != nullptr ? auth_token->Get()
+                                          : AuthTokenSnapshot{};
+                if (!state.configured || state.token.empty()) {
+                    return Response::Error(403, "forbidden");
+                }
+                static constexpr char kHeader[] = "x-auth-token";
+                const auto it = request.headers.find(kHeader);
+                bool ok = request.headers.end() != it &&
+                          ConstantTimeEquals(it->second, state.token);
+                if (!ok) {
+                    const auto auth = request.headers.find("authorization");
+                    ok = request.headers.end() != auth &&
+                         auth->second.size() == 7 + state.token.size() &&
+                         0 == auth->second.compare(0, 7, "Bearer ") &&
+                         ConstantTimeEquals(auth->second.substr(7),
+                                            state.token);
+                }
+                if (!ok) {
+                    return Response::Error(401, "unauthorized");
+                }
+                return Response::Json("{\"ok\":true}");
+            });
             // batch207: read-only credential probe. The WebUI must answer "is
             // this token right?" BEFORE it stores the token and reports
             // success, but every GET route is deliberately unauthenticated

@@ -118,6 +118,17 @@ namespace vgww {
             /// the handler (used for token auth on mutating API calls).
             void SetWriteGuard(std::function<Response(const Request&)> guard);
 
+            /// Read guard: applied to GET/HEAD before the route lookup, but
+            /// ONLY while this listener is bound to a non-loopback address.
+            /// The decision is taken from the address Start() was given, so a
+            /// live re-apply that moves the listener from 127.0.0.1 to the LAN
+            /// arms it without re-registering the API. A loopback listener
+            /// leaves reads unauthenticated, which is the operator's local
+            /// browser experience (and the page must paint before a token can
+            /// be stored anywhere). HEAD is checked too: it rides the GET
+            /// handler, so gating only GET would leave a header oracle open.
+            void SetReadGuard(std::function<Response(const Request&)> guard);
+
             /// Serves files from `root` for GET requests not matched by any
             /// route ("/" maps to "/index.html"). Path traversal is blocked.
             void ServeStatic(const std::string& root);
@@ -187,6 +198,10 @@ namespace vgww {
             Response ServeFile(const std::string& path);
 
             std::function<Response(const Request&)> write_guard_;
+            std::function<Response(const Request&)> read_guard_;
+            /// True when this listener is bound to a loopback address (taken
+            /// from the Start() argument): the read guard is then dormant.
+            std::atomic<bool> bind_is_loopback_{true};
 
             // P2: the io_context and acceptor are recreated per Start() so a
             // Stop() can tear the whole async accept machinery down with no
