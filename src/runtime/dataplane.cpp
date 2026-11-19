@@ -1,4 +1,4 @@
-// ============================================================================
+﻿// ============================================================================
 // dataplane.cpp - Data plane implementation (pimpl; xtcp types stay here).
 // ============================================================================
 #include <winsock2.h>
@@ -296,6 +296,12 @@ namespace vgww {
             /// closed - the pre-fix code leaked one event per failed start.
             std::unique_ptr<void, decltype(&::CloseHandle)> rx_event{
                 nullptr, &::CloseHandle};
+            /// Per-worker wake events. An idle worker waits on its own handle so
+            /// a frame routed to worker i wakes worker i; a single shared event
+            /// would release only one waiter, and a waiter that owns no frame
+            /// would swallow the signal. Created with the rings and released
+            /// after the workers are joined, so no thread can outlive its handle.
+            std::vector<std::unique_ptr<void, decltype(&::CloseHandle)>> worker_events;
 
             // ----- L2 bridge (S3-Task3) ----------------------------------
             // Upstream is the primary adapter (config.adapter unless the
@@ -1004,6 +1010,17 @@ namespace vgww {
                     tx_rings.push_back(
                         dsp::SpscRing<TxFrame>::Create(config.perf.ring_capacity));
                     io_contexts.push_back(std::make_unique<asio::io_context>());
+                    worker_events.emplace_back(
+                        ::CreateEventW(nullptr, FALSE, FALSE, nullptr),
+                        &::CloseHandle);
+                    if (!worker_events.back()) {
+                        error = "CreateEventW(worker) failed";
+                        worker_events.clear();
+                        rx_rings.clear();
+                        tx_rings.clear();
+                        io_contexts.clear();
+                        return false;
+                    }
                 }
                 accept_mutexes = std::vector<std::mutex>(worker_count);
                 pending_accepts.resize(worker_count);
@@ -1404,6 +1421,11 @@ namespace vgww {
                     // this, which left the catch path with them set.
                     rx_event.reset();
                     bridge_event_.reset();
+                    for (auto& event : worker_events) {
+                        if (event) {
+                            ::SetEvent(event.get());  // release idle workers
+                        }
+                    }
                     stack.reset();
                     // H2/H3 order: every socket-owning container must die BEFORE
                     // the io_context that owns its asio service. Destroying an
@@ -1439,6 +1461,7 @@ namespace vgww {
                     registry_mutexes.clear();
                     rx_rings.clear();
                     tx_rings.clear();
+                    worker_events.clear();
                     portmap_send_queue_.reset();
                     worker_count = 0;
                     // Bridge counts reset so the next Start begins empty (H3).
@@ -1487,6 +1510,7 @@ namespace vgww {
                        !control_thread.joinable() && nullptr == stack &&
                        !portmap_send_queue_ && nullptr == adapter &&
                        nullptr == up_client && nullptr == rx_event &&
+                       worker_events.empty() &&
                        nullptr == dhcp_ &&
                        nullptr == dhcp6_ && !bridge_thread_.joinable() &&
                        nullptr == bridge_event_ && !bridge_broken_ &&
@@ -2808,6 +2832,8 @@ namespace vgww {
                                 if (!rx_rings[worker]->Push(
                                         RxItem{std::move(buf), FrameClass::kIcmpV4})) {
                                     ++stats->rx_dropped;  // ring full: drop-not-grow
+                                } else {
+                                    ::SetEvent(worker_events[worker].get());
                                 }
                                 break;
                             }
@@ -2836,6 +2862,8 @@ namespace vgww {
                         if (!rx_rings[worker]->Push(
                                 RxItem{std::move(buf), FrameClass::kTcpV4})) {
                             ++stats->rx_dropped;  // ring full: drop-not-grow
+                        } else {
+                            ::SetEvent(worker_events[worker].get());
                         }
                         break;
                     }
@@ -2857,6 +2885,8 @@ namespace vgww {
                         if (!rx_rings[worker]->Push(
                                 RxItem{std::move(buf), FrameClass::kUdpV4})) {
                             ++stats->rx_dropped;  // ring full: drop-not-grow
+                        } else {
+                            ::SetEvent(worker_events[worker].get());
                         }
                         break;
                     }
@@ -2880,6 +2910,8 @@ namespace vgww {
                         if (!rx_rings[worker]->Push(
                                 RxItem{std::move(buf), FrameClass::kUdpV6})) {
                             ++stats->rx_dropped;  // ring full: drop-not-grow
+                        } else {
+                            ::SetEvent(worker_events[worker].get());
                         }
                         break;
                     }
@@ -3207,8 +3239,12 @@ namespace vgww {
                         last_sweep = now;
                     }
                     if (0 == n) {
-                        std::this_thread::sleep_for(
-                            std::chrono::microseconds(200));
+                        // Wait on this worker's own event so a frame routed here
+                        // wakes this worker, then bound the wait so the control
+                        // work below still runs on a schedule when the driver
+                        // stops signalling. The event is set after a successful
+                        // push on the RX thread.
+                        ::WaitForSingleObject(worker_events[index].get(), 1);
                     }
                 }
                 t_worker_index = kNoRing;
