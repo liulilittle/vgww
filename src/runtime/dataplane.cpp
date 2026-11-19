@@ -2645,11 +2645,13 @@ namespace vgww {
                     ++stats->host_passthrough;
                     return;
                 }
+                proto::ArpView arp{};
+                bool arp_valid = false;
                 if (!inbound) {
                     if (FrameClass::kArp == view.cls) {
-                        proto::ArpView arp;
                         std::array<uint8_t, proto::kArpFrameLen> reply{};
-                        if (proto::ParseArpFrame(data, len, arp)) {
+                        arp_valid = proto::ParseArpFrame(data, len, arp);
+                        if (arp_valid) {
                             neighbors.Learn(net::IpAddress::FromV4NetOrder(arp.sender_ip),
                                             arp.sender_mac);
                             if (proto::BuildGatewayArpReply(arp, config.gateway.ipv4,
@@ -2747,8 +2749,10 @@ namespace vgww {
 
                 // Passive learning: sender MAC/IP pairs cover static clients.
                 if (FrameClass::kArp == view.cls) {
-                    proto::ArpView arp;
-                    if (proto::ParseArpFrame(data, len, arp)) {
+                    if (!arp_valid) {
+                        arp_valid = proto::ParseArpFrame(data, len, arp);
+                    }
+                    if (arp_valid) {
                         neighbors.Learn(net::IpAddress::FromV4NetOrder(arp.sender_ip),
                                         arp.sender_mac);
                     }
@@ -2780,9 +2784,11 @@ namespace vgww {
 
                 switch (view.cls) {
                     case FrameClass::kArp: {
-                        proto::ArpView arp;
                         std::array<uint8_t, proto::kArpFrameLen> reply{};
-                        if (proto::ParseArpFrame(data, len, arp) &&
+                        if (!arp_valid) {
+                            arp_valid = proto::ParseArpFrame(data, len, arp);
+                        }
+                        if (arp_valid &&
                             proto::BuildGatewayArpReply(arp, config.gateway.ipv4,
                                                         config.gateway.mac, reply)) {
                             AppendDown(down.For(in_port), reply.data(), reply.size());
