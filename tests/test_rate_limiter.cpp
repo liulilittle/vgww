@@ -365,6 +365,38 @@ namespace {
         CHECK(1 == lr.BucketCount());
     }
 
+    /// PERF-2: Active() is the data-plane gate that lets the RX/TX loop skip
+    /// the per-frame steady_clock::now() read when no rate-limit rule exists.
+    /// It must track the published rule index exactly: a stale `true` only
+    /// costs a clock read, but a stale `false` would silently disable the
+    /// rate limiter for traffic that IS capped.
+    void TestActiveGateTracksRules() {
+        RateLimiter lr;
+        CHECK(!lr.Active());   // constructed with no policy
+        lr.SetRules(nullptr);
+        CHECK(!lr.Active());
+        lr.SetRules(std::make_shared<const std::vector<RateLimitRule>>());
+        CHECK(!lr.Active());
+
+        auto rules = std::make_shared<const std::vector<RateLimitRule>>();
+        const_cast<std::vector<RateLimitRule>&>(*rules).push_back({kMac, 8, 8});
+        lr.SetRules(rules);
+        CHECK(lr.Active());
+
+        // A configured rule with zero caps still lives in the index: the gate
+        // is about "is there a rule set at all", not about its kbps values.
+        auto zero = std::make_shared<const std::vector<RateLimitRule>>();
+        const_cast<std::vector<RateLimitRule>&>(*zero).push_back({kMac, 0, 0});
+        lr.SetRules(zero);
+        CHECK(lr.Active());
+
+        // Clearing the rules must close the gate again.
+        lr.SetRules(std::make_shared<const std::vector<RateLimitRule>>());
+        CHECK(!lr.Active());
+        // ... and the empty policy still passes everything.
+        CHECK(lr.AllowUplink(kMac, 100000, clock::now()));
+    }
+
 }  // namespace
 
 int main() {
@@ -382,6 +414,7 @@ int main() {
     TestAllocationFailureFailsOpen();
     TestDuplicateRulesFirstWins();
     TestSetRulesAllocationFailureKeepsOldIndex();
+    TestActiveGateTracksRules();
     if (0 == g_failures) {
         std::puts("test_rate_limiter: ALL PASS");
         return 0;

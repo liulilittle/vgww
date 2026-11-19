@@ -624,6 +624,122 @@ namespace {
     }
 
     // ------------------------------------------------------------------
+    // PERF-1: the per-frame firewall check used to call
+    // std::atomic_load(&ban_index_snapshot_) on EVERY frame, which is a
+    // process-wide SRWLOCK in MSVC - paid even when no ban existed. The fix
+    // is a plain atomic<bool> gate read first. The gate is a pure
+    // short-circuit, so it must:
+    //   * be FALSE while no ban exists (start, and again after the only ban
+    //     is removed) - otherwise the optimisation is dead weight;
+    //   * be TRUE while a ban exists;
+    //   * never suppress enforcement: a banned client must still be dropped.
+    // ------------------------------------------------------------------
+    void TestPerf1BanGateTracksEnforcement() {
+        auto& store = vgww::web::RuleStore::Instance();
+        store.AttachFile("");   // persistence disabled: no disk I/O
+        store.Clear();
+
+        vgww::core::Config cfg = MakeConfig();
+        auto drv = std::make_unique<MediumDriver>();
+        MediumDriver* raw = drv.get();
+        vgww::runtime::Dataplane dp(cfg);
+        dp.SetDriverClient(std::move(drv));
+        std::string error;
+        CHECK(dp.Start(error));
+
+        // No bans: the gate must be closed (the common case being fast).
+        CHECK(WaitFor([&] { return dp.RuleSnapshotRefreshCount() >= 1; },
+                      3000));
+        CHECK(!dp.BansActiveForTest());
+
+        // Baseline: the client is served, so a later drop is attributable.
+        raw->InjectNow(BuildArpRequest(kClientMac, kClientIp));
+        CHECK(WaitFor([&] { return HasFrameTo(raw->SentDownCopy(), kClientMac); },
+                      2000));
+
+        // A ban opens the gate AND is enforced.
+        store.AddBan(vgww::web::BanEntry{"mac", "aa:bb:cc:dd:ee:01"});
+        CHECK(WaitFor([&] { return dp.BansActiveForTest(); }, 3000));
+        // The counter is bumped before the publish, so wait one extra tick:
+        // the injected frame must be judged by the NEW snapshot.
+        std::this_thread::sleep_for(std::chrono::milliseconds(200));
+        const uint64_t drops_before = dp.GetStats().rx_dropped.load();
+        raw->InjectNow(BuildArpRequest(kClientMac, kClientIp));
+        CHECK(WaitFor(
+            [&] { return dp.GetStats().rx_dropped.load() > drops_before; },
+            2000));
+
+        // Removing the ban closes the gate again and enforcement stops.
+        const size_t replies_before = raw->SentDownCopy().size();
+        store.RemoveBan(0);
+        CHECK(WaitFor([&] { return !dp.BansActiveForTest(); }, 3000));
+        std::this_thread::sleep_for(std::chrono::milliseconds(200));
+        raw->InjectNow(BuildArpRequest(kClientMac, kClientIp));
+        CHECK(WaitFor(
+            [&] { return raw->SentDownCopy().size() > replies_before; }, 2000));
+
+        store.AttachFile("");
+        store.Clear();
+        std::string stop_error;
+        dp.Stop(stop_error);
+    }
+
+    // ------------------------------------------------------------------
+    // PERF-2: the uplink check passed std::chrono::steady_clock::now() into
+    // AllowUplink on EVERY data frame, even with no rate-limit rule. The
+    // Active() gate must be FALSE while no rule exists (so the clock read is
+    // skipped) and TRUE while one exists, and a configured cap must still
+    // drop frames.
+    // ------------------------------------------------------------------
+    void TestPerf2RateGateTracksEnforcement() {
+        auto& store = vgww::web::RuleStore::Instance();
+        store.AttachFile("");
+        store.Clear();
+
+        vgww::core::Config cfg = MakeConfig();
+        auto drv = std::make_unique<MediumDriver>();
+        MediumDriver* raw = drv.get();
+        vgww::runtime::Dataplane dp(cfg);
+        dp.SetDriverClient(std::move(drv));
+        std::string error;
+        CHECK(dp.Start(error));
+
+        CHECK(WaitFor([&] { return dp.RuleSnapshotRefreshCount() >= 1; },
+                      3000));
+        CHECK(!dp.RateLimiterActiveForTest());
+
+        // A very small uplink cap for this client: the first frames spend the
+        // bucket, then the cap starts dropping. ARP/DHCP/ICMP are exempt, so
+        // the burst must be UDP data frames. The bucket capacity is floored at
+        // RateLimiterParams::min_capacity_bytes (1500 B), so the burst has to
+        // carry MORE than that: three 1442-byte frames = 4326 B.
+        CHECK(store.SetRateLimitChecked(
+            vgww::web::RateLimitRule{"aa:bb:cc:dd:ee:01", 8, 0}));
+        CHECK(WaitFor([&] { return dp.RateLimiterActiveForTest(); }, 3000));
+        std::this_thread::sleep_for(std::chrono::milliseconds(200));
+
+        const std::array<uint8_t, 4> kUnroutable{192, 0, 2, 1};
+        const std::string kBigPayload(1400, 'B');
+        const uint64_t limited_before = dp.GetStats().rate_limited.load();
+        for (int i = 0; i < 3; ++i) {
+            raw->InjectNow(BuildUdpRequest(static_cast<uint16_t>(51020 + i), 9,
+                                           kUnroutable, kBigPayload));
+        }
+        CHECK(WaitFor(
+            [&] { return dp.GetStats().rate_limited.load() > limited_before; },
+            5000));
+
+        // Clearing the rule closes the gate.
+        CHECK(store.RemoveRateLimit("aa:bb:cc:dd:ee:01"));
+        CHECK(WaitFor([&] { return !dp.RateLimiterActiveForTest(); }, 3000));
+
+        store.AttachFile("");
+        store.Clear();
+        std::string stop_error;
+        dp.Stop(stop_error);
+    }
+
+    // ------------------------------------------------------------------
     // M4b: per-frame heap traffic must NOT scale with the ban count. The
     // differential (4096 bans vs 64 bans, same burst) cancels the constant
     // control-loop noise. Pre-fix: ~2 allocations per ban per frame =>
@@ -1599,6 +1715,8 @@ int main() {
     TestThreadExceptionFirewall();
     TestBanMatching();
     TestB146RuleRefreshIsChangeDriven();
+    TestPerf1BanGateTracksEnforcement();
+    TestPerf2RateGateTracksEnforcement();
     TestBanZeroAllocPerFrame();
     TestB295UdpForwardInstallsHandlerOnce();
     TestB296NeighborTickIsIdleFree();

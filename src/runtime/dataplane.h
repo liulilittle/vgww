@@ -484,6 +484,18 @@ namespace vgww {
             /// while the rule set is idle means that gate regressed.
             uint64_t RuleSnapshotRefreshCount() const noexcept;
 
+            /// PERF-1 test seam: the published "any ban exists" gate the
+            /// per-frame firewall check short-circuits on. Must be false
+            /// exactly when the published ban index is empty - a true value
+            /// with no bans (or false with bans) silently disables the
+            /// firewall. Returns false before Start().
+            bool BansActiveForTest() const noexcept;
+
+            /// PERF-2 test seam: the published "any rate-limit rule exists"
+            /// gate the per-frame uplink check short-circuits on. Must track
+            /// the rate-limit rule set, not the bucket bookkeeping.
+            bool RateLimiterActiveForTest() const noexcept;
+
             /// batch306 diagnostics: how many times a worker actually scanned
             /// the TCP relay registry to reclaim finished relays. The scan is
             /// gated on a "a relay finished" flag, so an idle data plane must

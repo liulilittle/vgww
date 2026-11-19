@@ -39,6 +39,9 @@ namespace vgww {
             std::atomic_store(
                 &index_,
                 std::shared_ptr<const RuleIndex>(std::move(index)));
+            // PERF-2: published AFTER index_ so a data-plane reader that sees
+            // `true` also sees the rules that justify it.
+            active_.store(!index_->empty(), std::memory_order_release);
         }
 
         double RateLimiter::RateBps(uint32_t kbps) const noexcept {

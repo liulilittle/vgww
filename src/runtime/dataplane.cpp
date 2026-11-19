@@ -443,6 +443,12 @@ namespace vgww {
             };
             std::shared_ptr<const BanIndex> ban_index_snapshot_ =
                 std::make_shared<const BanIndex>();
+            /// PERF-1: true once at least one ban exists. The per-frame
+            /// atomic_load below is a process-wide SRWLOCK in MSVC, so the
+            /// common "no bans configured" case must not pay it at all.
+            /// Published AFTER ban_index_snapshot_ (release) so a reader that
+            /// observes `true` also observes the matching ban index.
+            std::atomic<bool> bans_active_{false};
 
             // Rate-limit rules (parsed once per refresh so the hot path never
             // parses text) + the token-bucket engine. Buckets live only on the
@@ -1452,6 +1458,7 @@ namespace vgww {
                                       std::make_shared<ClientRatesSnapshot>());
                     std::atomic_store(&ban_index_snapshot_,
                                       std::make_shared<const BanIndex>());
+                    bans_active_.store(false, std::memory_order_release);
                     if (!client_injected_) {
                         client.reset();
                     }
@@ -2675,7 +2682,7 @@ namespace vgww {
                 // loop performs no heap allocations at all). batch305: the
                 // snapshot is a hash index - the old code scanned every ban
                 // per frame (kMaxBans = 4096).
-                {
+                if (bans_active_.load(std::memory_order_acquire)) {
                     auto bans = std::atomic_load(&ban_index_snapshot_);
                     if (!bans->Empty()) {
                         if (!bans->macs.empty() &&
@@ -2736,7 +2743,8 @@ namespace vgww {
                 // toward the gateway. Control frames (ARP/DHCP/ICMP) are exempt
                 // so clients never lose their network configuration while a
                 // data cap is active.
-                if (FrameClass::kArp != view.cls &&
+                if (rate_limiter_.Active() &&
+                    FrameClass::kArp != view.cls &&
                     FrameClass::kDhcpV4 != view.cls &&
                     FrameClass::kIcmpV4 != view.cls &&
                     FrameClass::kIcmpV6 != view.cls &&
@@ -3892,10 +3900,13 @@ namespace vgww {
                                         net::IpAddress::FromV6(bytes.data()));
                                 }
                             }
+                            const bool any_bans = !index->Empty();
                             std::shared_ptr<const BanIndex> immutable =
                                 std::move(index);
                             std::atomic_store(&ban_index_snapshot_,
                                               std::move(immutable));
+                            bans_active_.store(any_bans,
+                                               std::memory_order_release);
                         }
                         // Refresh rate-limit rules: convert web text rules to MAC
                         // bytes once here so the data plane never parses strings.
@@ -4708,6 +4719,20 @@ namespace vgww {
                 return 0;
             }
             return impl_->registry_sweeps_.load(std::memory_order_relaxed);
+        }
+
+        bool Dataplane::BansActiveForTest() const noexcept {
+            if (!impl_) {
+                return false;
+            }
+            return impl_->bans_active_.load(std::memory_order_acquire);
+        }
+
+        bool Dataplane::RateLimiterActiveForTest() const noexcept {
+            if (!impl_) {
+                return false;
+            }
+            return impl_->rate_limiter_.Active();
         }
 
         std::size_t Dataplane::RegistryIndexSize() {

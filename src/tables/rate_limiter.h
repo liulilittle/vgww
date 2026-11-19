@@ -17,6 +17,7 @@
 #include "net/eth.h"
 
 #include <chrono>
+#include <atomic>
 #include <cstdint>
 #include <memory>
 #include <unordered_map>
@@ -74,6 +75,16 @@ namespace vgww {
                 return up_buckets_.size() + down_buckets_.size();
             }
 
+            /// PERF-2: true when at least one rule can actually cap traffic
+            /// (non-empty rule index). The per-frame uplink check passes
+            /// `steady_clock::now()` into AllowUplink, and the clock read is
+            /// unconditional on the hot path - with no rules configured the
+            /// data plane must skip both the read and the admission call.
+            /// Safe from any thread (relaxed load of a publish-ordered flag).
+            bool Active() const noexcept {
+                return active_.load(std::memory_order_relaxed);
+            }
+
         private:
             enum class Direction : uint8_t { Uplink, Downlink };
 
@@ -110,6 +121,9 @@ namespace vgww {
 
             const RateLimiterParams params_;
             std::shared_ptr<const RuleIndex> index_;
+            /// PERF-2: published AFTER index_ (release in SetRules) so the
+            /// data-plane gate never sees `true` with a stale/absent index.
+            std::atomic<bool> active_{false};
             std::unordered_map<net::WireMac, Bucket, net::WireMacHash> up_buckets_;
             std::unordered_map<net::WireMac, Bucket, net::WireMacHash> down_buckets_;
         };
