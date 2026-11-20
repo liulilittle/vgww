@@ -37722,6 +37722,65 @@ static void TestB333PortmapLiveSummaryRendersBothCounters() {
     controller.Stop();
 }
 
+// P152: a rule whose bind failed is not the only silent way to stop
+// forwarding. The relay counts five swallowed failures (accept/handler/
+// loop/re-arm/escaped handler); while the port was merely busy the page
+// reported only the port, so "traffic was dropped" was indistinguishable
+// from "no traffic ever arrived". The status line must carry the fault
+// breakdown under the busy line.
+static void TestP152PortmapFaultsReachStatusLine() {
+    using namespace vgww::ui;
+    FixTextMetrics();
+    I18n& i18n = I18n::Instance();
+    i18n.SetLang(Lang::ZhCN);
+
+    ShellFakeSource source;
+    RecordingExecutor executor;
+    UiController controller(source, executor);
+
+    UiSnapshot snapshot = MakeRulesSnapshot(1, 1);
+    snapshot.portmaps.push_back(
+        vgww::web::PortMappingRule{"tcp", 8081, "192.168.1.10", 80, 7});
+    snapshot.portmap_stats.accept_errors = 1;
+    snapshot.portmap_stats.handler_errors = 2;
+    snapshot.portmap_stats.loop_errors = 3;
+    snapshot.portmap_stats.rearm_errors = 4;
+    snapshot.portmap_stats.escaped_handler_errors = 5;
+    snapshot.portmap_stats.bind_failed = 1;
+    snapshot.portmap_stats.failed_ports = {8081};
+
+    UiApp app;
+    app.Compose(controller, snapshot);
+    app.router().Navigate("portmap");
+    app.root().Arrange({0.0f, 0.0f, 1280.0f, 800.0f});
+
+    // The controller is deliberately NOT started: its publisher thread would
+    // republish the fake source's empty snapshot every 500 ms and overwrite the
+    // line under test. Without it the rendered text is deterministic.
+    app.Update(snapshot);
+    app.root().Arrange({0.0f, 0.0f, 1280.0f, 800.0f});
+    const std::wstring faults_line = i18n.Format(
+        Str::PortmapFaultSummary, {L"1", L"2", L"3", L"4", L"5"});
+
+    auto* status =
+        dynamic_cast<Text*>(FindById(app.root(), "portmap.status"));
+    CHECK(status != nullptr);
+    if (status == nullptr) {
+        i18n.SetLang(Lang::ZhCN);
+        return;
+    }
+    const std::wstring text = status->text();
+    const std::wstring busy =
+        i18n.T(Str::PortmapPortBusy) + std::wstring(L" (8081)");
+    // Both facts at once: the busy port first, the fault breakdown after it.
+    CHECK(text == busy + L"\n" + faults_line);
+    // No placeholder may leak into the rendered line.
+    CHECK(text.find(L"{0}") == std::wstring::npos);
+    CHECK(text.find(L"{4}") == std::wstring::npos);
+
+    i18n.SetLang(Lang::ZhCN);
+}
+
 // P141 B-4: saving a NEW web token clears the input field; the baseline
 // (`applied_`) must follow, or RefreshDirty right after the save sees
 // ReadDraft().web_token (empty) != applied_.web_token (the typed value) and
@@ -39183,6 +39242,7 @@ int main() {
     TestB333RatelimitEditVanishedRuleOpensNoForm();
     TestB333ConsoleEmptyHintFollowsLanguageSwitch();
     TestB333PortmapLiveSummaryRendersBothCounters();
+    TestP152PortmapFaultsReachStatusLine();
     TestWndProcThrowIsContained();
     TestConsoleReaderThrowIsContained();
     TestB79SparklineOpsBoundedByDataNotWidth();
