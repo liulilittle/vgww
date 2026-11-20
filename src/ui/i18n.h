@@ -148,6 +148,10 @@ namespace vgww {
             ConsoleDropped,
             /// batch34f: a port-map rule whose WAN port could not be bound.
             PortmapPortBusy,
+            /// P152: the port-map relay's own swallowed failures. A rule can sit
+            /// in the table while nothing is forwarded; these counters are the
+            /// only difference between "no traffic" and "traffic was lost".
+            PortmapFaultSummary,
             /// batch34f: forwarding is live; summary line.
             PortmapLiveSummary,
             FormMac,

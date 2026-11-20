@@ -320,6 +320,24 @@ namespace vgww {
                         busy_line += L" (";
                         busy_line += ports;
                         busy_line += L")";
+                        // P152: a busy port is not the only way a rule can
+                        // silently stop forwarding. The relay's own swallowed
+                        // failures are summed here so "no traffic" is never
+                        // indistinguishable from "traffic was dropped".
+                        const uint64_t faults =
+                            st.accept_errors + st.handler_errors +
+                            st.loop_errors + st.rearm_errors +
+                            st.escaped_handler_errors;
+                        if (faults > 0) {
+                            busy_line += L"\n";
+                            busy_line += i18n.Format(
+                                Str::PortmapFaultSummary,
+                                {std::to_wstring(st.accept_errors),
+                                 std::to_wstring(st.handler_errors),
+                                 std::to_wstring(st.loop_errors),
+                                 std::to_wstring(st.rearm_errors),
+                                 std::to_wstring(st.escaped_handler_errors)});
+                        }
                         status_->SetText(busy_line);
                         status_->SetColor(ColorToken::Warning);
                     } else if (!snapshot.portmaps.empty()) {
