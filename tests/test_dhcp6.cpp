@@ -3538,10 +3538,30 @@ static void TestB81DumpLeasesDoesNotStallLockHolders() {
         }
     }
 
+    // W11-3: a SOLICIT without IA_NA must neither allocate a lease nor
+    // answer with IA_NA (RFC 8415 18.3.1: addresses are only assigned in
+    // response to an IA_NA / IA_TA option).
+    void TestSolicitWithoutIaNaDoesNotLease() {
+        Dhcp6Server server(MakeConfig());
+        const auto now = std::chrono::steady_clock::now();
+        auto frame = BuildRequest(kDhcp6MsgSolicit, 0x200001, kClientDuid,
+                                  /*with_ia=*/false, 0, false, nullptr, false);
+        Dhcp6View view;
+        CHECK(ParseDhcp6Frame(frame.data(), frame.size(), view));
+        CHECK(!view.has_ia_na);
+        std::vector<uint8_t> reply;
+        CHECK(server.HandleFrame(view, kClientMac, kClientLl, now, reply));
+        CHECK(server.LeaseCount() == 0);
+        ParsedReply parsed;
+        CHECK(ParseReply(reply, parsed));
+        CHECK(!parsed.has_ia);
+    }
+
 int main() {
     TestParseDhcp6Malformed();
     TestBuildReplyLayout();
     TestSolicitAdvertise();
+    TestSolicitWithoutIaNaDoesNotLease();
     TestAcquireWalkSanitizesHostname();
     TestRapidCommit();
     TestParseDhcp6RejectsNonEmptyRapidCommit();

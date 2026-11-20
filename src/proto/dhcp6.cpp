@@ -1834,14 +1834,16 @@ namespace vgww {
             switch (view.msg_type) {
                 case proto::kDhcp6MsgSolicit: {
                     const bool rapid = view.rapid_commit;
-                    const auto addr = Acquire(
-                        view.client_duid, view.iaid, now,
-                        rapid ? OfferStage::kAck : OfferStage::kOffer,
-                        std::string(), requested);
                     reply.msg_type = rapid ? proto::kDhcp6MsgReply
                                            : proto::kDhcp6MsgAdvertise;
                     reply.rapid_commit = rapid;
-                    fill_ia(addr);
+                    if (view.has_ia_na) {
+                        const auto addr = Acquire(
+                            view.client_duid, view.iaid, now,
+                            rapid ? OfferStage::kAck : OfferStage::kOffer,
+                            std::string(), requested);
+                        fill_ia(addr);
+                    }
                     break;
                 }
                 case proto::kDhcp6MsgRequest:
