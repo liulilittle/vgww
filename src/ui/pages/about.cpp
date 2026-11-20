@@ -163,7 +163,6 @@ namespace vgww {
                 // cursor, hover underline, Tab + Enter/Space). A ShellExecuteW
                 // failure (return <= 32) surfaces as an in-app toast instead of
                 // silently doing nothing.
-#if 1  // batch19 terminal: Telegram row enabled (was #if 0 for the red probe).
                 auto telegram_row =
                     std::make_unique<StackPanel>(Orientation::Horizontal, 8.0f);
                 telegram_label_ = static_cast<Text*>(
@@ -185,7 +184,6 @@ namespace vgww {
                         }
                     };
                 host.Add(std::move(telegram_row));
-#endif  // RED-PROBE
 
                 auto row = std::make_unique<StackPanel>(Orientation::Horizontal, 8.0f);
                 autostart_label_ = static_cast<Text*>(row->Add(std::make_unique<Text>(
