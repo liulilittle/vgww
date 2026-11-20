@@ -34,3 +34,6 @@ COMMITMSG.txt
 
 # Internal audit reports (agent working artifacts, not product docs)
 docs/audit/
+
+# Local verification scratch (build logs, mutation copies, probe snapshots)
+temp/
