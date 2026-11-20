@@ -190,6 +190,11 @@ namespace vgww {
             BridgeMacTableFull,
             /// batch34i: tooltip breakdown of the "dropped packets" tile.
             DashDropsBreakdown,
+            /// P152: the losses that are deliberate or fault-like rather than a
+            /// packet the gateway failed to route. Shown on their own tile so a
+            /// rate-limited client is never mistaken for a network fault.
+            DashFaults,
+            DashFaultsBreakdown,
             AboutLicense,
             AboutVersion,
             AboutMemory,

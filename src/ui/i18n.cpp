@@ -148,6 +148,8 @@ namespace vgww {
                 L"桥接需在设置页启用或修改后重启生效",  // BridgeRestartHint
                 L"MAC 表已满,新设备会挤掉最久未活动的设备(被挤掉的设备流量会暂时广播)。可调大 MAC 表容量。",  // BridgeMacTableFull
                 L"异常丢包 %s 个:接收丢弃 %s,端口映射队列满 %s,找不到邻居 %s,邻居表拒绝 %s,UDP 流被挤出 %s",  // DashDropsBreakdown
+                L"异常与限速",  // DashFaults
+                L"异常 %s 个:主动限速 %s,ICMP 标签池耗尽 %s,应答超长被拒 %s,邻居表满拒绝 %s,驱动发送失败 %s",  // DashFaultsBreakdown
                 L"AGPL-3.0 自由软件;第三方组件许可见 README",  // AboutLicense
                 L"版本",  // AboutVersion
                 L"内存管理",  // AboutMemory
@@ -553,6 +555,8 @@ namespace vgww {
                 L"Enable or change bridging on the Settings page; a restart is required",  // BridgeRestartHint
                 L"The MAC table is full; new devices evict the least recently active one (its traffic floods until it speaks again). Raise the table size.",  // BridgeMacTableFull
                 L"Dropped packets: %s total (rx %s, port-map queue %s, no neighbour %s, neighbour-table refusals %s, UDP flows evicted %s)",  // DashDropsBreakdown
+                L"Limits and faults",  // DashFaults
+                L"Limits and faults: %s total (rate limited %s, ICMP tag pool exhausted %s, reply too large %s, neighbour-table refusals %s, driver send failures %s)",  // DashFaultsBreakdown
                 L"AGPL-3.0 free software; third-party licenses in the README",  // AboutLicense
                 L"Version",  // AboutVersion
                 L"Memory management",  // AboutMemory

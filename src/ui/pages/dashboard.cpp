@@ -986,6 +986,10 @@ namespace vgww {
                 Tile* ipv6_ = nullptr;
                 Tile* tcp_ = nullptr;
                 Tile* drops_ = nullptr;
+                /// P152: the deliberate/fault losses (rate cap, ICMP tag pool,
+                /// oversized reply, neighbour-table refusal, driver send
+                /// failure) kept apart from the routing drops tile.
+                Tile* faults_ = nullptr;
                 Tile* pass_ = nullptr;
                 Tile* vlan_rx_ = nullptr;
                 Tile* vlan_tx_ = nullptr;
@@ -1224,6 +1228,8 @@ namespace vgww {
                     std::make_unique<Tile>(Str::DashTcp, "dash.tcp")));
                 drops_ = static_cast<Tile*>(details_grid->Add(
                     std::make_unique<Tile>(Str::DashDrops, "dash.drops")));
+                faults_ = static_cast<Tile*>(details_grid->Add(
+                    std::make_unique<Tile>(Str::DashFaults, "dash.faults")));
                 pass_ = static_cast<Tile*>(details_grid->Add(
                     std::make_unique<Tile>(Str::DashPass, "dash.pass")));
                 vlan_rx_ = static_cast<Tile*>(details_grid->Add(
@@ -1754,6 +1760,34 @@ namespace vgww {
                     }
                     drops_->SetValueTooltip(tip);
                 }
+                // P152: the deliberate/fault losses. Rate limiting is a policy
+                // decision, not a routing failure, so it is reported here rather
+                // than folded into the drop total; a non-zero send-failure count
+                // means the driver refused whole batches.
+                const uint64_t faults =
+                    snapshot.counters.rate_limited +
+                    snapshot.counters.icmp_tag_exhausted +
+                    snapshot.counters.icmp_too_big +
+                    snapshot.counters.rate_table_dropped +
+                    snapshot.counters.tx_send_failed_frames;
+                faults_->SetValue(FormatCount(faults));
+                {
+                    std::wstring tip = i18n.T(Str::DashFaultsBreakdown);
+                    const std::wstring parts[6] = {
+                        std::to_wstring(faults),
+                        std::to_wstring(snapshot.counters.rate_limited),
+                        std::to_wstring(snapshot.counters.icmp_tag_exhausted),
+                        std::to_wstring(snapshot.counters.icmp_too_big),
+                        std::to_wstring(snapshot.counters.rate_table_dropped),
+                        std::to_wstring(snapshot.counters.tx_send_failed_frames)};
+                    for (const std::wstring& value : parts) {
+                        const size_t at = tip.find(L"%s");
+                        if (at != std::wstring::npos) {
+                            tip.replace(at, 2, value);
+                        }
+                    }
+                    faults_->SetValueTooltip(tip);
+                }
                 pass_->SetValue(FormatCount(snapshot.counters.host_passthrough));
                 vlan_rx_->SetValue(FormatCount(snapshot.counters.rx_vlan_frames));
                 vlan_tx_->SetValue(FormatCount(snapshot.counters.tx_vlan_frames));
@@ -1966,6 +2000,7 @@ namespace vgww {
                 ipv6_->SetCaption(Str::DashIpv6Status);
                 tcp_->SetCaption(Str::DashTcp);
                 drops_->SetCaption(Str::DashDrops);
+                faults_->SetCaption(Str::DashFaults);
                 pass_->SetCaption(Str::DashPass);
                 vlan_rx_->SetCaption(Str::DashVlanRx);
                 vlan_tx_->SetCaption(Str::DashVlanTx);

@@ -65,6 +65,14 @@ namespace vgww {
             /// effective AppendDown cap (VLAN-tagged). Never counted as
             /// answered (icmp_replies stays truthful).
             uint64_t icmp_too_big = 0;
+            /// P152: frames lost because the driver refused the send. A count,
+            /// not a policy decision, and the one signal that the adapter is
+            /// failing rather than the traffic being unwanted.
+            uint64_t tx_send_failed_frames = 0;
+            /// batch94: per-window source-MAC rate table refused a new key
+            /// because it was saturated. Counted by the data plane but mirrored
+            /// here so the dashboard can show it.
+            uint64_t rate_table_dropped = 0;
         };
 
         /// Immutable copy of the effective configuration (formatted strings).

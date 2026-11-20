@@ -4922,6 +4922,13 @@ static void TestA7DashboardCards() {
     snapshot.config.ipv6_enabled = true;
     snapshot.counters.tcp_accepted = 1234;
     snapshot.counters.rx_dropped = 7;
+    // P152: five counters that were mirrored but never shown. Their sum is the
+    // faults tile, so a value here is what makes the tile's arithmetic visible.
+    snapshot.counters.rate_limited = 1;
+    snapshot.counters.icmp_tag_exhausted = 2;
+    snapshot.counters.icmp_too_big = 3;
+    snapshot.counters.rate_table_dropped = 4;
+    snapshot.counters.tx_send_failed_frames = 2;
     snapshot.counters.host_passthrough = 42;
     snapshot.counters.rx_vlan_frames = 11;
     snapshot.counters.tx_vlan_frames = 22;
@@ -4933,6 +4940,15 @@ static void TestA7DashboardCards() {
     app.router().Navigate("dashboard");
     app.Update(snapshot);
     app.root().Arrange({0.0f, 0.0f, 1280.0f, 1200.0f});
+    // P152: the faults tile lives in the collapsed details block; expand it so
+    // the assertion reads the value the operator would see.
+    if (auto* toggle = dynamic_cast<Button*>(
+            FindById(app.root(), "dash.details.toggle"))) {
+        if (toggle->on_click) {
+            toggle->on_click();
+        }
+    }
+    app.root().Arrange({0.0f, 0.0f, 1280.0f, 1200.0f});
 
     const auto text_of = [&](const char* id) -> std::wstring {
         auto* text = dynamic_cast<Text*>(FindById(app.root(), id));
@@ -4942,6 +4958,9 @@ static void TestA7DashboardCards() {
     CHECK(text_of("dash.ipv6") == I18n::Instance().T(Str::CommonYes));
     CHECK(text_of("dash.tcp") == FormatCount(1234));  // thousands separators
     CHECK(text_of("dash.drops") == L"7");
+    // P152: the deliberate/fault losses get their own tile, summed from five
+    // counters the data plane keeps but nothing showed.
+    CHECK(text_of("dash.faults") == L"12");
     CHECK(text_of("dash.pass") == L"42");
     CHECK(text_of("dash.vlan.rx") == L"11");
     CHECK(text_of("dash.vlan.tx") == L"22");
