@@ -3844,6 +3844,66 @@ static void TestB81DumpLeasesDoesNotStallLockHolders() {
     // so the final CHECK fails. Falsifiability: moving the inner walk out of
     // the guard (or rejecting a second IA_NA) makes ParseDhcp6Frame return
     // false and turns that CHECK green.
+    // P156 (user-decided plan B): IA_TA and IA_PD are IA containers just like
+    // IA_NA (RFC 8415 21.23: IAID + T1 + T2 + IA_PD-options). Only their
+    // presence is recorded, but a container shorter than its 12-byte fixed
+    // part, or one whose inner options do not consume it exactly, is
+    // malformed and must be discarded rather than silently accepted.
+    void TestP156IaTaIaPdInnerStructureIsChecked() {
+        Dhcp6View view;
+
+        // A short IA_PD (fewer than 12 bytes) is rejected.
+        {
+            std::vector<uint8_t> p = {kDhcp6MsgSolicit, 0, 0, 0x71};
+            PushOption(p, kDhcp6OptClientId, kClientDuid);
+            PushOption(p, kDhcp6OptIaPd, std::vector<uint8_t>(11, 0));
+            auto f = BuildFrameRaw(p, kClientLl, kDhcp6ClientPort,
+                                   kDhcp6ServerPort);
+            std::fprintf(stderr, "[p156-ia] short ia_pd parsed=%d\n",
+                         ParseDhcp6Frame(f.data(), f.size(), view) ? 1 : 0);
+            CHECK(!ParseDhcp6Frame(f.data(), f.size(), view));
+        }
+
+        // A short IA_TA is rejected too (same container shape).
+        {
+            std::vector<uint8_t> p = {kDhcp6MsgSolicit, 0, 0, 0x72};
+            PushOption(p, kDhcp6OptClientId, kClientDuid);
+            PushOption(p, kDhcp6OptIaTa, std::vector<uint8_t>(11, 0));
+            auto f = BuildFrameRaw(p, kClientLl, kDhcp6ClientPort,
+                                   kDhcp6ServerPort);
+            CHECK(!ParseDhcp6Frame(f.data(), f.size(), view));
+        }
+
+        // An IA_PD whose inner option length runs past the container is
+        // rejected (the inner walk must run for IA_PD as it does for IA_NA).
+        {
+            std::vector<uint8_t> pd;
+            PushU32(pd, 1);    // IAID
+            PushU32(pd, 0);    // T1
+            PushU32(pd, 0);    // T2
+            PushU16(pd, kDhcp6OptIaAddr);
+            PushU16(pd, 40);   // claims 40 bytes, none follow
+            std::vector<uint8_t> p = {kDhcp6MsgSolicit, 0, 0, 0x73};
+            PushOption(p, kDhcp6OptClientId, kClientDuid);
+            PushOption(p, kDhcp6OptIaPd, pd);
+            auto f = BuildFrameRaw(p, kClientLl, kDhcp6ClientPort,
+                                   kDhcp6ServerPort);
+            std::fprintf(stderr, "[p156-ia] overlong ia_pd inner parsed=%d\n",
+                         ParseDhcp6Frame(f.data(), f.size(), view) ? 1 : 0);
+            CHECK(!ParseDhcp6Frame(f.data(), f.size(), view));
+        }
+
+        // Positive control: a bare 12-byte IA_PD (no inner options) parses.
+        {
+            std::vector<uint8_t> p = {kDhcp6MsgSolicit, 0, 0, 0x74};
+            PushOption(p, kDhcp6OptClientId, kClientDuid);
+            PushOption(p, kDhcp6OptIaPd, IaNaPayload(3, false, nullptr));
+            auto f = BuildFrameRaw(p, kClientLl, kDhcp6ClientPort,
+                                   kDhcp6ServerPort);
+            CHECK(ParseDhcp6Frame(f.data(), f.size(), view));
+        }
+    }
+
     void TestP155O2SecondIaNaInnerBypass() {
         Dhcp6View view;
 
@@ -3936,6 +3996,7 @@ static void TestB81DumpLeasesDoesNotStallLockHolders() {
     TestBuildReplyFrameByteOrder();
     TestP154ServerIdAndIaRules();
     TestClassifierDhcpV6();
+    TestP156IaTaIaPdInnerStructureIsChecked();
     TestP155O2SecondIaNaInnerBypass();
     if (0 == g_failures) {
         std::puts("test_dhcp6: ALL PASS");

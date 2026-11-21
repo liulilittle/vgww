@@ -236,12 +236,34 @@ namespace vgww {
                         out.server_duid.assign(value, value + olen);
                         break;
                     case kDhcp6OptIaTa:
-                    case kDhcp6OptIaPd:
+                    case kDhcp6OptIaPd: {
                         // RFC 8415 16.12: any IA option makes an
                         // INFORMATION-REQUEST discardable; stateful frames
                         // here carry IA_NA, so only the presence is recorded.
+                        // P156: IA_TA/IA_PD are IA containers with the same
+                        // 12-byte fixed part as IA_NA (RFC 8415 21.23), so a
+                        // short container or one whose inner options do not
+                        // consume it exactly is malformed and discarded.
+                        if (olen < kDhcp6IaNaMin) {
+                            return fail();
+                        }
                         has_any_ia = true;
+                        size_t inner = kDhcp6IaNaMin;
+                        while (inner + 4 <= olen) {
+                            const uint16_t icode = ReadU16(value + inner);
+                            const uint16_t ilen = ReadU16(value + inner + 2);
+                            (void)icode;
+                            inner += 4;
+                            if (inner + ilen > olen) {
+                                return fail();
+                            }
+                            inner += ilen;
+                        }
+                        if (inner != olen) {
+                            return fail();
+                        }
                         break;
+                    }
                     case kDhcp6OptIaNa: {
                         if (olen < kDhcp6IaNaMin) {
                             return fail();
