@@ -504,7 +504,8 @@ namespace vgww {
     }
 
     /// OnPeerFin after teardown must be a harmless no-op. The stack posts it
-    /// from another worker (dataplane.cpp:3158), so a FIN can arrive after the
+    /// from another worker (the dataplane's NDP/ICMP path), so a FIN can arrive
+    /// after the
     /// relay already finished. Touching the closed socket is not fatal (the
     /// error is ignored) but the finished_ guard keeps it from re-entering.
     int TestPeerFinAfterTeardownIsHarmless() {

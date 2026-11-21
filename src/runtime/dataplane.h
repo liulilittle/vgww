@@ -15,7 +15,7 @@
 // Scope: ARP + ICMP answering/relay (relay::IcmpRelay), and the transparent
 // TCP relay: accepted flows are dialled upstream and bridged to the client by
 // relay::TcpRelay (relay/tcp_relay.{h,cpp}, wired in
-// runtime/dataplane.cpp:2036-2100 DrainAccepts).
+// Dataplane::DrainAccepts).
 // ============================================================================
 #pragma once
 

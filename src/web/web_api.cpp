@@ -87,7 +87,8 @@ namespace vgww {
             ///
             /// The data plane matches IPv4 bans with an exact strcmp against
             /// the canonical dotted quad it builds per frame
-            /// (dataplane.cpp:2330), so a stored spelling that differs from
+            /// (Dataplane's ban-index canonical dotted-quad comparison), so a stored
+            /// spelling that differs from
             /// this form is a rule that enforces nothing.
             bool CanonicalBanIp(const std::string& text, std::string& out) {
                 bool v4_ok = false;
@@ -108,8 +109,8 @@ namespace vgww {
 
             /// batch144: the IDENTITY of a ban target, independent of
             /// spelling. The data plane never compares ban text - it parses
-            /// each entry once per refresh (dataplane.cpp:3343 MAC bytes,
-            /// :3370 IPv6 bytes) and matches the frame's parsed value - so
+            /// each entry once per refresh (Dataplane's ICMP relay path, MAC and
+            /// IPv6 bytes) and matches the frame's parsed value - so
             /// "AA:BB:CC:DD:EE:44", "aa-bb-cc-dd-ee-44" and "aabbccddee44"
             /// are ONE ban. Storing them as separate rows produced a list the
             /// operator cannot read (three identical-looking entries) and,
@@ -1251,7 +1252,7 @@ namespace vgww {
                     // batch131: the POST route refuses a SECOND rule for the
                     // same WAN endpoint (:1806), but this loader used to keep
                     // it. PortMapManager keys acceptors by "proto:wan_port"
-                    // (portmap_manager.cpp:215), so the later copy can never
+                    // (the acceptor key in PortMapManager), so the later copy can never
                     // bind: the UI listed a rule that was silently dead. The
                     // file contract is "the same contract the POST route
                     // enforces", so drop the duplicate and count it.
@@ -1374,7 +1375,7 @@ namespace vgww {
                     }
                     // P8 deviation 1 (audit B): same legacy-MAC migration as
                     // bans. batch87: a MAC the data plane cannot parse is a
-                    // rule that throttles nobody (dataplane.cpp:3348 skips it),
+                    // rule that throttles nobody (Dataplane::ControlLoop skips it),
                     // so it must be dropped and counted here instead of being
                     // echoed by GET /api/ratelimit as if it were live. POST
                     // /api/ratelimit enforces the same gate at :1724.
@@ -1424,7 +1425,7 @@ namespace vgww {
                     // batch131: SetRateLimitChecked upserts by MAC, so the
                     // write API can never hold two rules for one client. The
                     // loader appended both, and RateLimiter::Allow() takes the
-                    // FIRST match (rate_limiter.cpp:95-100), so the file's
+                    // FIRST match (RateLimiter::SetRules), so the file's
                     // later (newer) values were silently ignored while the
                     // stale cap stayed in force. Mirror the upsert and count
                     // the collapse.
@@ -3065,18 +3066,18 @@ namespace vgww {
                          << ",\"dial_timeout_ms\":"
                          << config.perf.dial_timeout_ms
                          // batch206: rx_poll_ms was persisted and validated
-                         // (config.cpp:2194) but never emitted here, so the
+                         // (Config::ToJsonString) but never emitted here, so the
                          // settings form loaded it as absent and a save wrote
                          // the default back over the operator value.
                          << ",\"rx_poll_ms\":" << config.perf.rx_poll_ms
                          // batch206: same contract gap for rx_flush_eager -
-                         // Config::ToJsonString emits it (config.cpp:2193),
+                         // Config::ToJsonString emits it,
                          // this GET did not, so a Web save silently reset an
                          // operator's `false` back to the default `true`.
                          << ",\"rx_flush_eager\":"
                          << (config.perf.rx_flush_eager ? "true" : "false")
                          // P147 P2-4: Config::ToJsonString persists
-                         // web.enabled (config.cpp:2268) but this GET never
+                         // web.enabled (Config::ToJsonString) but this GET never
                          // emitted it, and POST is a full replacement, so any
                          // Web save wrote the default `true` back over an
                          // operator's `false` and silently re-enabled the UI.

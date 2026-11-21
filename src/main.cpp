@@ -837,8 +837,8 @@ namespace {
         // P148 P2-2: a DHCP binding route changes the runtime store and the
         // file, but used to leave the authoritative Config (this lambda's
         // `*config`) untouched. `apply_config_live` snapshots that Config
-        // before an apply (main.cpp:847) and restores it on failure
-        // (main.cpp:903) - so a failed apply rolled a DELETED binding back
+        // before an apply (apply_config_live's `previous` snapshot) and restores
+        // it on failure (the rollback) - so a failed apply rolled a DELETED binding back
         // into memory and onto disk. The runtime store is the source of
         // truth for bindings; every successful add/remove mirrors the whole
         // v4 binding set into *config under config_mutex.
@@ -935,7 +935,8 @@ namespace {
                 // persist their rows to the file WITHOUT writing back *config.
                 // A whole-document save here therefore erased every binding
                 // added since the snapshot. Merge the disk-only rows back, the
-                // same way DoSaveConfig's own save does (config.cpp:2595).
+                // same way DoSaveConfig's own save does
+                // (Config::SaveToFilePreservingBindings).
                 if (!previous.SaveToFilePreservingBindings(config_path,
                                                            file_error)) {
                     rollback_text +=

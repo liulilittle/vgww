@@ -782,7 +782,7 @@ namespace vgww {
             }
             // batch111: 253 bytes is the DHCP option-value ceiling (one length
             // octet), which is exactly where BuildDhcpReplyFrame clamps. The
-            // loader (config.cpp:464) and ValidateConfig (:1501) both refuse a
+            // loader (Config::ParseDhcp) and Config::ValidateConfig both refuse a
             // longer hostname, so a runtime entry that accepts one makes the
             // two stores disagree about what a legal hostname is. It is also a
             // memory amplification: the HTTP body cap is kMaxConfigBytes
@@ -888,7 +888,7 @@ namespace vgww {
             // except this one - the choke point both runtime writes funnel
             // through (Web POST /api/dhcp/bindings and the UI add-binding form
             // both end up in Dataplane::SetDhcpBinding -> here). The loader
-            // (config.cpp:457) and ValidateConfig (:1393) cap, and the web
+            // (Config::ParseDhcp) and Config::ValidateConfig cap, and the web
             // route caps out-of-lock, but nothing capped this store, so the UI
             // path could grow it without bound.
             //

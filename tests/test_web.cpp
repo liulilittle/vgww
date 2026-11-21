@@ -1127,7 +1127,8 @@ static void TestH1WebConfigPreservesNativePrefs() {
 }
 
 // P147 P2-4: GET /api/config omitted web.enabled while Config::ToJsonString
-// persists it (config.cpp:2268) and POST /api/config replaces the WHOLE config.
+// persists it (Config::ToJsonString) and POST /api/config replaces the WHOLE
+// config.
 // The settings panel therefore loaded `web.enabled` as undefined, and every
 // unrelated save wrote the default `true` back over an operator's `false`,
 // silently re-enabling the management UI. GET must echo the live value.
@@ -1210,7 +1211,7 @@ static void TestP147P24WebConfigEchosEnabled() {
 // P147 A-3 (W11-5 dual audit): GET /api/config echoed a `portmap` section
 // (max_relays / max_relays_per_rule / idle_timeout_s) that no test observed,
 // so deleting the whole echo block left the suite green. Config::ToJsonString
-// persists the same three keys (config.cpp:2281) and POST /api/config is a
+// persists the same three keys (Config::ToJsonString) and POST /api/config is a
 // full replacement, so a GET that omits the section silently resets an
 // operator's tuned accept-side bounds on the next Web save (same defect class
 // as P2-4 for web.enabled). The values below are deliberately NON-default
@@ -5815,7 +5816,7 @@ static void TestP148P22WebBindingChangeMirrorsConfig() {
         CHECK(!in_live);
 
         // Failed apply -> rollback restores `previous` and rewrites the file
-        // with the merge-preserving save (main.cpp:920).
+        // with the merge-preserving save (Config::SaveToFilePreservingBindings).
         CHECK(previous.SaveToFilePreservingBindings(cfg_path, err));
         std::string load_err;
         const auto disk = Config::LoadFromFile(cfg_path, load_err);
@@ -7175,7 +7176,7 @@ static void TestB88RemoveBanCheckedIsAtomic() {
 // route does (proto == tcp, dotted-quad lan_ip, non-zero ports) and REPORTS how
 // many entries it dropped. The rate-limit and ban loaders did not: a rule whose
 // MAC cannot be parsed was migrated-if-possible and then pushed anyway, so
-// GET /api/ratelimit echoed a rule that dataplane.cpp:3348 has always skipped
+// GET /api/ratelimit echoed a rule that Dataplane::ControlLoop always skipped
 // ("malformed rule: skip"). The operator sees a mounted cap; nothing is
 // throttled - the same plausible-but-broken fake the POST route rejects at
 // :1724.
@@ -7901,7 +7902,8 @@ static void TestB121WebApiEscapeKeepsControlCharacters() {
     // batch141: the rule FILE is the other write entry for bans, and it used
     // to keep the operator's raw spelling while the data plane matches IP bans
     // with an exact strcmp against the canonical dotted quad
-    // (dataplane.cpp:2330). A file holding "192.168.001.050" therefore loaded
+    // (the ban index's canonical dotted-quad comparison). A file holding
+    // "192.168.001.050" therefore loaded
     // "successfully" and then never dropped a single packet - a firewall rule
     // that looks active and enforces nothing. The loader must store the same
     // canonical form the POST route does.
@@ -7944,7 +7946,7 @@ static void TestB121WebApiEscapeKeepsControlCharacters() {
     }
 
     // batch144: a ban list is a SET of targets. The data plane matches bans by
-    // PARSED value (dataplane.cpp:2308 for MAC bytes, :3343 for IPv4 text), so
+    // PARSED value (the ban index: MAC bytes and IPv4 text), so
     // two entries naming the same target are two rows the operator cannot tell
     // apart - and unblocking one leaves the other enforcing: the toast says
     // "unblocked" while the client is still dropped. The port-forward loader

@@ -738,7 +738,7 @@ namespace vgww {
         private:
             static constexpr UINT kUiDebugMessage = WM_APP + 5;
             /// M1 (batch2, plan C): never a real generation, so the first
-            /// cache access always rebuilds (mirrors controls.h:545 UINT32_MAX).
+            /// cache access always rebuilds (mirrors TableElement::cached_gen_ UINT32_MAX).
             static constexpr uint64_t kOverlayCacheSentinel =
                 ~static_cast<uint64_t>(0);
 

@@ -1285,7 +1285,7 @@ namespace vgww {
             }
 
             // batch34m: the stateful DHCPv6 server only runs when IPv6 itself
-            // is enabled (dataplane.cpp:977 gates assembly on both), and the
+            // is enabled (Dataplane::StartAll gates assembly on both), and the
             // documentation states the requirement. A config that enables the
             // server while IPv6 is off asks for a service that never starts;
             // accepting it hides the mismatch until a client fails to get an
@@ -1414,10 +1414,10 @@ namespace vgww {
             }
             // batch34m: one RX read produces up to `rx_batch` frames, but they
             // are buffered in a ring of `ring_capacity` entries
-            // (dataplane.cpp:859-861). If a batch cannot fit, the producer can
+            // (created in Dataplane::StartAll). If a batch cannot fit, the producer can
             // never drain a full read into the ring, and the RX push sites
-            // ignore Push()'s false return (dataplane.cpp:2367/2393/2412/2433)
-            // - so the overflow is silently dropped under load. Refuse the
+            // count Push()'s false return as rx_dropped, so the overflow is
+            // never silent. Refuse the
             // combination instead of shipping an invisible throughput cap.
             if (config.perf.rx_batch > config.perf.ring_capacity) {
                 error = "perf.rx_batch must not exceed perf.ring_capacity "
@@ -1660,14 +1660,15 @@ namespace vgww {
             //
             // batch135: the v4 loop above also enforces BOTH uniqueness rules
             // (one address, one DUID); this block only checked the DUID bounds.
-            // The JSON parser rejects duplicates (ParseDhcp, :698-710), but a
-            // PROGRAMMATIC config - the UI settings draft (settings.cpp:463) and
-            // SaveConfigCmd (controller.cpp:312) - reaches only this validator.
+            // The JSON parser rejects duplicates (ParseDhcp, the dhcp.static_bindings
+            // duplicate scan), but a
+            // PROGRAMMATIC config - the UI settings draft (SettingsDraft::ToConfig) and
+            // SaveConfigCmd (UiController::DoSaveConfig) - reaches only this validator.
             // Without the rules here a UI save could persist two bindings on one
             // address or two addresses for one DUID, and the next start would
             // refuse the file the product had just written and called "saved".
-            // Placement is NOT re-checked here: :1253 already refuses a binding
-            // outside the ULA prefix; a second copy of that rule (with a
+            // Placement is NOT re-checked here: the DHCPv6 static_bindings loop
+            // already refuses a binding outside the ULA prefix; a second copy of that rule (with a
             // different enabling condition) would be two sources of truth for
             // one invariant (C6).
             for (std::size_t i = 0;

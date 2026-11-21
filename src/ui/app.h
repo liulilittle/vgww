@@ -27,7 +27,7 @@ namespace vgww {
         /// point wires it): writes HKCU Run through the tray and keeps the
         /// tray menu check mark in sync, so a page-issued SetAutostartCmd
         /// writes HKCU and syncs the tray check mark through the command
-        /// queue (controller.cpp:728-749 records the audit line on both the
+        /// queue (UiController::DoSaveConfig records the audit line on both the
         /// success and failure paths). The tray menu item is a DIRECT path
         /// (tray.cpp:364-374 calls SetAutostart + UpdateMenu inline, outside
         /// the queue) and therefore does NOT produce that audit line.
@@ -83,7 +83,7 @@ namespace vgww {
             /// (shared ownership, NO deep copy). The OnTick path passes the
             /// controller's freshly loaded shared_ptr, eliminating the second
             /// whole-snapshot copy that used to run on the UI thread on every
-            /// new seq (former app.cpp:390). The const& overload above stays
+            /// new seq (UiApp::Update). The const& overload above stays
             /// as the copy path (tests and one-off callers); the snapshot is
             /// immutable by contract, so sharing is safe.
             void Update(std::shared_ptr<const UiSnapshot> snapshot);

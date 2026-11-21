@@ -13157,12 +13157,12 @@ static void TestM9RelayoutHostCoreDelta() {
 // ===========================================================================
 // W11 batch4 (2026-10-15): M10-lite - UiApp adopts the controller's
 // shared snapshot instead of deep-copying it a second time on the UI thread
-// (app.cpp:390).
+// (UiApp::Update).
 // ===========================================================================
 
 /// W11 batch4 M10-lite red anchor (interface-level): the OnTick path
 /// already holds a shared_ptr<const UiSnapshot>, but the only Update entry
-/// point takes `const UiSnapshot&` and deep-copies (app.cpp:390), so the
+/// point takes `const UiSnapshot&` and deep-copies (UiApp::Update), so the
 /// adopted object can never be the caller's object. The identity assertion
 /// is the red - the passing form requires the new shared_ptr overload. The
 /// const& path keeps its private-copy semantics (asserted below after the
@@ -21308,7 +21308,7 @@ static void TestXT1OverlayFramePartialVerdictEqualsFullOps() {
     root->Arrange({0.0f, 0.0f, 200.0f, 160.0f});
 
     // Strictly-interior narrow dirty rect: never touches a client edge, else
-    // ShouldFullClear's edge clause (window.cpp:1341-1343) forces full and
+    // VgwwWindow::ShouldFullClear's edge clause forces full and
     // pollutes the evidence.
     const RECT client{0, 0, 200, 160};
     const RECT narrow{40, 45, 60, 10};
@@ -23062,7 +23062,8 @@ static void TestLanguagePickerSearchEditorImeCaretAndBounds() {
     VgwwWindow window;
     window.SetRoot(root.get());
     // Clicking the picker focuses the LanguagePicker container, NOT its
-    // internal search editor (C9, tests/test_ui.cpp:18039).
+    // internal search editor
+    // (C9, TestLanguagePickerSearchEditorImeCaretAndBounds).
     window.SetFocusForTest(picker);
     CHECK(window.FocusedForTest() == picker);
     CHECK(window.FocusedForTest() != picker->search_editor());
@@ -25545,7 +25546,8 @@ static void TestB282FirewallRowMenuCopiesItsOwnRow() {
 // batch281: a FAILED start/stop must release the dashboard's busy guard.
 //
 // `busy_` is cleared only when a snapshot finally reports the state the click
-// asked for (`dashboard.cpp:1559`). When the command itself fails - driver
+// asked for (the dashboard's busy_ snapshot check). When the command itself
+// fails - driver
 // missing, adapter gone, SCM refused - the state never changes, so the busy
 // flag, the disabled button and the "Starting..." label stayed FOREVER: the
 // dashboard's only power button became permanently unusable after one failed
@@ -35068,12 +35070,12 @@ static void TestB79SparklineOpsBoundedByDataNotWidth() {
     // Three insertion paths accepted different character sets:
     //   * OnChar            - ASCII printable only (by design: WM_CHAR racing
     //                         means non-ASCII arrives via the IME commit path)
-    //   * CommitComposition - ANY Unicode (documented at controls.cpp:6364:
+    //   * CommitComposition - ANY Unicode (documented in
     //                         "the IME path must not go through the ASCII
     //                         filter")
     //   * InsertText        - ASCII printable only  <-- the bug
     //
-    // InsertText is what PasteFromClipboard calls (controls.cpp:3047), so a CJK
+    // InsertText is what TextInputElement::PasteFromClipboard calls, so a CJK
     // user who copies a name from another window and presses Ctrl+V got an
     // EMPTY field: CopySelectionToClipboard copies the full Unicode selection
     // and PasteFromClipboard hands it straight to a filter that drops it. The
@@ -35124,7 +35126,7 @@ static void TestB79SparklineOpsBoundedByDataNotWidth() {
 
     // batch115: regression guard for the undo/redo history bounds.
     //
-    // PushUndo (controls.cpp:3291) trims `undo_stack_` to 100 entries, but the
+    // TextInputElement::PushUndo trims `undo_stack_` to 100 entries, but the
     // two OTHER writers push directly: UndoEdit appends to `redo_stack_` and
     // RedoEdit appends to `undo_stack_`. The total is therefore bounded by the
     // 100-entry cap only because a redo entry can only exist after an undo
@@ -35425,9 +35427,9 @@ void TestB118CommandFailureToastShowsReason() {
 // batch229: three code paths restore the saved window geometry after a DPI
 // change, and only ONE of them clamps the re-scaled size to the monitor work
 // area:
-//   DecideDpiChangedSize  (window.cpp:359-371) clamps.
-//   TickDpiSyncFallback   (window.cpp:391-394) does NOT.
-//   Create                (window.cpp:548-558) does NOT.
+//   VgwwWindow::DecideDpiChangedSizeForTest clamps.
+//   VgwwWindow::TickDpiSyncFallbackForTest does NOT.
+//   VgwwWindow::Create does NOT.
 // ui_state::RestoreWindowState clamps at LOAD time against the scale in
 // effect THEN (:202-203); a later DPI raise multiplies the stored LOGICAL
 // size by the new scale and the window can end up taller/wider than the
@@ -35697,7 +35699,8 @@ static void TestB227PageIntentHandoff() {
 
     // --- ratelimit: an unusable MAC must NOT open a form ---
     // "navigate, never a form full of garbage": this is the guard at
-    // ratelimit.cpp:188. Without it the operator would be handed a form whose
+    // (the ParseMac guard in the ratelimit page). Without it the operator would
+    // be handed a form whose
     // MAC box holds whatever text the intent carried.
     for (const wchar_t* bad : { L"mac=not-a-mac", L"mac=", L"mac=AA:BB:CC:00:00:01:02" }) {
         const std::wstring wide(bad);
@@ -38176,12 +38179,12 @@ static void TestP141B8QueueFullKeepsForm() {
 // it is learning, just nothing has spoken yet.
 // P147 P1-6: a failed live apply used to restore the previous document with
 // the whole-document SaveToFile. `previous` is snapshotted BEFORE any binding
-// route can run (main.cpp:795), and the binding routes persist only the file
-// (controller.cpp:456 UpsertDhcpBinding) - they never write back *config
-// (main.cpp assigns *config only at :833 and :851). So a rollback after
+// route can run (apply_config_live), and the binding routes persist only the
+// file (UiController's UpsertDhcpBinding) - they never write back *config
+// (main.cpp assigns *config only in apply_config_live). So a rollback after
 // add-binding -> settings-save -> apply-failure erased the new binding from
 // disk. The rollback must merge disk-only bindings back
-// (SaveToFilePreservingBindings, config.cpp:2595-2627).
+// (Config::SaveToFilePreservingBindings).
 //
 // The rollback is a local lambda inside src/main.cpp, an exe-only TU that no
 // test binary links, so the call site itself is out of reach. This test pins

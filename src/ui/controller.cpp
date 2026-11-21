@@ -828,7 +828,7 @@ namespace vgww {
                 // returns true with a non-empty error. Reporting a plain
                 // "stopped" hides the lost lease snapshot from the operator -
                 // the same verdict main.cpp checks with
-                // `!stop_error.empty()` (src/main.cpp:830) and the leases page
+                // `!stop_error.empty()` (apply_config_live's `!stop_error.empty()` check) and the leases page
                 // shows via UiSnapshot.lease_persist_failed.
                 if (!error.empty()) {
                     console_log::AppendAuditLine("service stopped (lease save failed)");

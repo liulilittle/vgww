@@ -2236,7 +2236,7 @@ namespace vgww {
         // NOT a tree child, so focused_ names the picker container rather than
         // the editor. While that search row is active, TextInput-specific window
         // paths (IME commit, caret phase, edit shortcuts, IME anchor) must
-        // resolve to the internal editor. C9 (tests/test_ui.cpp:18039) forbids
+        // resolve to the internal editor. C9 (TestLanguagePickerSearchEditorImeCaretAndBounds) forbids
         // pointing focused_ at the editor, so this read-only resolver is the
         // single choke point instead. search_active() gates it: OnFocus alone
         // does not hand the picker IME focus.

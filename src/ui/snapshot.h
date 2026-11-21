@@ -284,7 +284,7 @@ namespace vgww {
             /// Wakes the publisher to collect early (e.g. right after a
             /// command ran); a new seq is published immediately on the wake;
             /// the UI observes it within one 200 ms snapshot-timer period
-            /// (window.cpp:23).
+            /// (VgwwWindow::kSnapshotTimerId, 200 ms).
             void RequestRefreshAfter(std::chrono::milliseconds delay);
 
         private:

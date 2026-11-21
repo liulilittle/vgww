@@ -76,8 +76,8 @@ namespace vgww {
 
         private:
             /// M9 (batch4): per-child measurement memo consulted by BOTH
-            /// StackPanel sites - MeasureCore's child probe (controls.cpp:92)
-            /// and ArrangeCore's placement probe (controls.cpp:129). A hit
+            /// StackPanel sites - MeasureCore's child probe (StackPanel::FlowMemoLookup)
+            /// and ArrangeCore's placement probe (StackPanel::FlowMemoLookup). A hit
             /// means: the child cache is valid, no MeasureCore ran since the
             /// entry was stored or refreshed, the measure-hook generation is
             /// unchanged and the FULL available size equals the key, so the
@@ -1098,11 +1098,11 @@ namespace vgww {
         /// Single-line editor. IME composition input is accepted end to end:
         /// WM_IME_* is handled in window.cpp (WM_IME_REQUEST /
         /// WM_IME_SETCONTEXT / WM_IME_STARTCOMPOSITION / WM_IME_COMPOSITION /
-        /// WM_IME_ENDCOMPOSITION, window.cpp:3871-3967) and the candidate list
+        /// WM_IME_ENDCOMPOSITION, VgwwWindow::WndProc) and the candidate list
         /// is anchored under the caret by PlaceImeWindows
-        /// (window.cpp:2295-2329); the preedit is drawn inline by
+        /// (VgwwWindow::PlaceImeWindows); the preedit is drawn inline by
         /// SetCompositionForTest and committed as any Unicode through
-        /// CommitComposition (controls.h:1204-1207), bypassing the ASCII-only
+        /// TextInputElement::CommitComposition, bypassing the ASCII-only
         /// WM_CHAR path. The caret is the tail position.
         class TextInputElement : public Element {
         public:

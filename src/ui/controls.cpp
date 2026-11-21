@@ -7028,7 +7028,7 @@ namespace vgww {
                                         : ColorFor(ColorToken::Text);
                 text_color.a *= e;
                 // Text ellipsis for comparison: Text::RenderCore
-                // (controls.cpp:6019-6036) single-line path runs
+                // (Text::RenderCore) single-line path runs
                 // EllipsizeToWidth + DrawTextSingleLine. ToastHost paints
                 // with ctx.DrawText below: no EllipsizeToWidth and no clip,
                 // so an over-long toast label is NOT ellipsized and can paint

@@ -581,8 +581,8 @@ void TestStaticBindingReservesPoolAddress() {
     // clients - hand-edited, or written by two instances sharing a lease file.
     // Every other entry point already refuses that:
     //   * UpsertBinding rejects a runtime binding on an address another client
-    //     holds (dhcp.cpp:748-752, the "two owners for one address" class from
-    //     batch109/112),
+    //     holds (DhcpServer::ReplaceBinding's live-lease scan, the "two owners
+    //     for one address" class from batch109/112),
     //   * Acquire's occupancy map is keyed by address, so it can only ever
     //     consider one owner per address.
     // The loader was the one entry that let both in. The result is not a
@@ -2798,18 +2798,18 @@ void TestLeaseHostnameLearnt() {
     // batch110: the kMaxStaticBindings cap existed at every entry EXCEPT the
     // one every runtime write funnels through.
     //
-    //   * loader (config.cpp ParseDhcp, :457)            - capped
-    //   * ValidateConfig (:1393)                          - capped
-    //   * POST /api/dhcp/bindings (web_api.cpp:1974)      - capped, but OUTSIDE
+    //   * loader (Config::ParseDhcp)                      - capped
+    //   * Config::ValidateConfig                          - capped
+    //   * POST /api/dhcp/bindings (the Web route)         - capped, but OUTSIDE
     //                                                      the lock (a TOCTOU:
     //                                                      two concurrent POSTs
     //                                                      both read "below cap")
-    //   * UI form -> Dataplane::SetDhcpBinding (controller.cpp:243)
+    //   * UI form -> Dataplane::SetDhcpBinding (UiController::DoAddDhcpBinding)
     //     -> DhcpServer::UpsertBinding                    - NOT capped at all
     //
     // DhcpServer::UpsertBinding is the single choke point both runtime entries
-    // call (grep: dhcp.cpp:3874 is the only UpsertBinding call from the
-    // dataplane, and Dataplane::SetDhcpBinding is the only caller of that).
+    // call (grep: DhcpServer::UpsertBinding is the only UpsertBinding call from
+    // the dataplane, and Dataplane::SetDhcpBinding is the only caller of that).
     // Whatever it does not enforce, nothing enforces. Unbounded growth here is
     // not theoretical: the UI "add binding" form writes one entry per submit
     // and the cap is what keeps the per-tick merged view, the O(N) duplicate
@@ -2901,8 +2901,8 @@ void TestLeaseHostnameLearnt() {
     // batch111: the 253-byte hostname bound existed wherever a *Config* was
     // built, but not on the runtime binding entry.
     //
-    //   * loader (config.cpp:464, :720)          - capped at 253
-    //   * ValidateConfig (config.cpp:1501, :1533) - capped at 253
+    //   * loader (Config::ParseDhcp, ParseIpv6) - capped at 253
+    //   * Config::ValidateConfig                 - capped at 253
     //   * UI settings Save (SettingsDraft::ToConfig) - goes through
     //     ValidateConfig, so capped too
     //   * POST /api/dhcp/bindings -> Dataplane::SetDhcpBinding
@@ -2911,7 +2911,8 @@ void TestLeaseHostnameLearnt() {
     //
     // 253 is not a cosmetic number: it is the largest value a DHCP option can
     // carry (the TLV length octet), which is why BuildDhcpReplyFrame clamps
-    // there (dhcp.cpp:186-191). The clamp keeps the FRAME correct, so this is
+    // there (BuildDhcpReplyFrame's hostname clamp). The clamp keeps the FRAME
+    // correct, so this is
     // not a wire-format bug - it is a memory-amplification and contract bug:
     // the HTTP body cap is 1 MiB (kMaxConfigBytes), so one runtime binding can
     // pin ~1 MiB and kMaxStaticBindings (1024) of them ~1 GiB of resident
@@ -2957,7 +2958,8 @@ void TestLeaseHostnameLearnt() {
         CHECK(server.StaticBindings()[0].hostname == at_limit);
 
         // An empty hostname is still accepted - the documented contract is
-        // "preserve the CONFIG-derived hostname for this MAC" (dhcp.cpp:764),
+        // "preserve the CONFIG-derived hostname for this MAC"
+        // (DhcpServer::ReplaceBinding),
         // not "preserve the previous runtime value". With no config binding
         // for this MAC that means the runtime hostname becomes empty, which is
         // why the value is asserted empty rather than `at_limit`.
@@ -3194,7 +3196,8 @@ void TestLeaseHostnameLearnt() {
     // batch109 made a runtime binding RESERVE its address against the dynamic
     // pool (Acquire's reserved_hosts). The other direction was left open:
     // UpsertBinding only looked for collisions with config bindings and with
-    // other runtime bindings (dhcp.cpp:705-714), never with an address that is
+    // other runtime bindings (DhcpServer::ReplaceBinding), never with an address
+    // that is
     // currently held as a DYNAMIC LEASE. So:
     //
     //   1. client A does DISCOVER/REQUEST and is leased 192.168.0.100
@@ -3280,7 +3283,7 @@ void TestLeaseHostnameLearnt() {
     // walk runs under mutex_, the one lock every DHCP frame and every
     // Web/UI binding call also needs.
     //
-    // dhcp.cpp:452-488 (before the fix):
+    // DhcpServer::Acquire (before the fix):
     //   for (offset = 0; offset < pool_size; ++offset) {
     //       for (const auto& pair : leases_) { ... }   // full scan per candidate
     //   }

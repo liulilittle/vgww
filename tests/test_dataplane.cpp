@@ -2928,9 +2928,9 @@ namespace {
         CHECK(dataplane.Stop(stop_error));
     }
     /// drop must be COUNTED. The TX path already does this
-    /// (dataplane.cpp:1900-1904: Push() false -> ++stats->rx_dropped), but the
-    /// four RX enqueue sites ignored the return value, so a full ring silently
-    /// capped throughput with no observable signal.
+    /// (the TX ring Push path: false -> ++stats->rx_dropped), but the four RX
+    /// enqueue sites ignored the return value, so a full ring silently capped
+    /// throughput with no observable signal.
     ///
     /// Requirement asserted (behaviour, not implementation): a burst far larger
     /// than the ring capacity must leave rx_dropped > 0. A ring of 1 slot with

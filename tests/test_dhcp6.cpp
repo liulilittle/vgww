@@ -2492,7 +2492,8 @@ static void TestB81DumpLeasesDoesNotStallLockHolders() {
 
     // batch110 (C7 same-shape sweep): the DHCPv6 runtime store had exactly the
     // same missing cap. Its web route checks kMaxStaticBindings6 out-of-lock
-    // (web_api.cpp:2046) and the loader/ValidateConfig cap too, but
+    // (the Web POST /api/dhcp6/bindings route) and the loader/ValidateConfig
+    // cap too, but
     // Dhcp6Server::UpsertBinding - the choke point the UI binding form also
     // reaches through Dataplane::SetDhcp6Binding - capped nothing.
     //
@@ -2550,8 +2551,8 @@ static void TestB81DumpLeasesDoesNotStallLockHolders() {
     }
 
     // batch111 (C7 same-shape sweep): Dhcp6Server::UpsertBinding had the same
-    // missing hostname bound. The v6 loader (config.cpp:720) and
-    // ValidateConfig (:1533) both cap at 253, and the v6 lease dump copies the
+    // missing hostname bound. The v6 loader (Config::ParseIpv6) and
+    // Config::ValidateConfig both cap at 253, and the v6 lease dump copies the
     // hostname into JSON, so an unbounded runtime hostname is both a contract
     // split and a memory amplification here too.
     //
@@ -3009,7 +3010,7 @@ static void TestB81DumpLeasesDoesNotStallLockHolders() {
     // capped at kMaxStaticBindings6 (1024), so the worst legal shape is 512
     // config + 512 runtime = 262144 comparisons per call, all under mutex_ (the
     // lock Acquire() takes on the RX thread). /api/status polls this every 2 s
-    // (web_api.cpp:2496-2497 -> dataplane.cpp:4570), i.e. MORE often than the
+    // (/api/status -> Dataplane::DhcpBindingCount), i.e. MORE often than the
     // 3 s binding list. The fix builds one unordered_set of the config DUIDs
     // and turns the inner scan into an O(1) lookup; the returned count is
     // unchanged (config entries + runtime entries whose DUID is not in config).
@@ -3212,7 +3213,7 @@ static void TestB81DumpLeasesDoesNotStallLockHolders() {
     // pool forever. The loader must clamp it to
     // config.ipv6.dhcpv6.lease_seconds. (Pool membership is deliberately NOT
     // validated - a legitimately persisted lease survives a pool re-range,
-    // see TestLeases6RoundTrip and the v4 sibling dhcp.cpp:1403-1409.)
+    // see TestLeases6RoundTrip and the v4 sibling DhcpServer::LoadLeases.)
     void TestP145Leases6ExpiresIsClampedToLeaseSeconds() {
         Config config = MakeConfig();
         Dhcp6Server server(config);
@@ -3569,8 +3570,8 @@ static void TestB81DumpLeasesDoesNotStallLockHolders() {
     // rewrites the hostname (its else arm installs the configured one), so it
     // cannot observe which record the collapse carried. The RUNTIME branch
     // rewrites the hostname ONLY when the client reported one
-    // (dhcp6.cpp:652-654, no else arm), and an empty hostname is the normal
-    // DHCPv6 case (HandleFrame passes std::string(), dhcp6.cpp:1840/1858), so
+    // (Dhcp6Server::EnsureLeaseSlot's runtime branch, no else arm), and an empty
+    // hostname is the normal DHCPv6 case (HandleFrame passes std::string()), so
     // the carrier's name survives and the CHOICE of carrier is observable.
     //
     // WHY A FOUR-ROW MATRIX AND NOT ONE CALL: leases_ is an unordered_map, so

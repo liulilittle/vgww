@@ -861,7 +861,7 @@ namespace vgww {
                 // introducing a 16-byte hash.
                 //
                 // P145-B3: the static RESERVATION check moved out of the loop
-                // for the same reason (v4 shape, dhcp.cpp:407-418). Today the
+                // for the same reason (v4 shape, DhcpServer::Acquire's static-binding scan). Today the
                 // per-candidate call to ReservedByStatic scanned every config
                 // binding and every runtime binding, so the real cost was
                 // O(pool_size x bindings) and this comment was wrong. One
@@ -875,7 +875,7 @@ namespace vgww {
                         occupied.insert(IidIndex(pair.second.ip));
                     }
                 }
-                // P145-B3 (v4 shape, dhcp.cpp:407-418): addresses pinned by a
+                // P145-B3 (v4 shape, DhcpServer::Acquire's static-binding scan): addresses pinned by a
                 // static binding - config OR runtime - are collected ONCE, in
                 // the same index space the walk iterates. ReservedByStatic
                 // rescans both binding lists, so calling it per candidate made
@@ -1632,8 +1632,8 @@ namespace vgww {
                 return false;
             }
             // batch111 (C7 same-shape sweep of the v4 fix): 253 bytes is the
-            // DHCP option-value ceiling, and the v6 loader (config.cpp:720)
-            // and ValidateConfig (:1533) both refuse a longer hostname. A
+            // DHCP option-value ceiling, and the v6 loader (Config::ParseIpv6)
+            // and Config::ValidateConfig both refuse a longer hostname. A
             // runtime entry that accepts one makes the two stores disagree
             // about what a legal hostname is, and the lease dump copies the
             // value into JSON, so it is a memory amplification as well.
@@ -1644,7 +1644,7 @@ namespace vgww {
             }
             // batch123 (same-shape sibling of the v4 fix): an ill-formed name
             // makes nlohmann::json::dump() throw type_error.316, and the v6
-            // dump runs on the 60 s control cadence (dataplane.cpp:3403), so a
+            // dump runs on the 60 s control cadence (Dataplane::ControlLoop), so a
             // bad name would abort every dump (RunGuarded then stops the data
             // plane). This is a CONTROL path, so it is rejected like oversize.
             if (!hostname.empty() && !core::IsValidUtf8(hostname)) {
@@ -1704,8 +1704,8 @@ namespace vgww {
             }
             // batch110 (C7 same-shape sweep of the v4 fix): the
             // kMaxStaticBindings6 cap was enforced by the loader
-            // (config.cpp:712), ValidateConfig (:1404) and out-of-lock in the
-            // web route (web_api.cpp:2046), but NOT here - the choke point the
+            // (Config::ParseIpv6), Config::ValidateConfig and out-of-lock in the
+            // Web POST /api/dhcp6/bindings route, but NOT here - the choke point the
             // UI binding form also reaches through
             // Dataplane::SetDhcp6Binding.
             //

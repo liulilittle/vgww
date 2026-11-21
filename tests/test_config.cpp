@@ -2348,9 +2348,10 @@ static void TestB105ProgrammaticConfigObeysLoaderRules() {
 
     // batch135: the v4 loop above asserts BOTH uniqueness rules (same ip, same
     // mac), but the v6 block only checked DUID bounds. The JSON parser rejects
-    // duplicates (config.cpp:698-710), so `ValidateConfig` is the only gate for
-    // PROGRAMMATIC configs - the UI settings draft (settings.cpp:463) and
-    // SaveConfigCmd (controller.cpp:312) both go straight to it. With no rule
+    // duplicates (ParseDhcp, the dhcp.static_bindings duplicate scan), so
+    // `ValidateConfig` is the only gate for PROGRAMMATIC configs - the UI
+    // settings draft (SettingsDraft::ToConfig) and SaveConfigCmd
+    // (UiController::DoSaveConfig) both go straight to it. With no rule
     // here, a UI save could persist two bindings on one address or two
     // addresses for one DUID, and the next start would refuse the file it had
     // just written and reported "saved".
@@ -2384,8 +2385,8 @@ static void TestB105ProgrammaticConfigObeysLoaderRules() {
         CHECK(!vgww::core::ValidateConfig(c, error));
         CHECK(!error.empty());
     }
-    // Out-of-prefix placement is already refused by ValidateConfig (:1253,
-    // inside the DHCPv6-services block) and by the parser, so it is NOT
+    // Out-of-prefix placement is already refused by ValidateConfig (the
+    // DHCPv6 static_bindings loop) and by the parser, so it is NOT
     // re-asserted here: adding a second copy of that rule would be two sources
     // of truth for one invariant (C6), and a test for it would pass with or
     // without the batch135 change (it is covered by the existing reject cases
@@ -3130,7 +3131,7 @@ void TestB34mVlanEnabledWithoutIdRejected() {
 }
 
 // `ipv6.dhcpv6.enabled` only takes effect when `ipv6.enabled` is also true
-// (dataplane.cpp:977 gates assembly on both). A config that enables the
+// (Dataplane::StartAll gates assembly on both). A config that enables the
 // DHCPv6 server while IPv6 is off therefore asks for a service that never
 // runs. The documentation says it "requires ipv6.enabled", so the loader must
 // enforce that instead of accepting a no-op.
@@ -3287,10 +3288,10 @@ static void TestP36ValidateConfigRejectsUnspecifiedDns() {
 }
 
 // `perf.rx_batch` frames are produced per read, but they are buffered in a
-// ring of `perf.ring_capacity` entries (dataplane.cpp:859-861). When one batch
-// is larger than the ring, the producer can never enqueue a full batch, so
-// frames are dropped under load - and the RX push sites ignore Push()'s
-// return value (dataplane.cpp:2367/2393/2412/2433), so the drop is invisible.
+// ring of `perf.ring_capacity` entries (created in Dataplane::StartAll). When
+// one batch is larger than the ring, the producer can never enqueue a full
+// batch, so frames are dropped under load - and the RX push sites COUNT
+// Push()'s return value as rx_dropped, so the drop is never invisible.
 // The combination is therefore a silent throughput cap and must be refused.
 void TestB34mRxBatchMustFitRing() {
     const auto r = LoadFromText(
