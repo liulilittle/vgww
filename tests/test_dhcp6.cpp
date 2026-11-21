@@ -578,6 +578,40 @@ namespace {
         CHECK(leases[0].hostname == want);
     }
 
+    // P155 O1 (v6 sibling of the v4 cap): SanitizeUtf8 expands each
+    // ill-formed byte to a 3-byte U+FFFD, so the lease store must still obey
+    // the 253-byte ceiling the wire path enforces.
+    void TestP155O1Acquire6CapsSanitizedHostname() {
+        Dhcp6Server server(MakeConfig());
+        const auto now = std::chrono::steady_clock::now();
+        const std::string raw(255, static_cast<char>(0xFF));
+        const auto addr = server.Acquire(kClientDuid, 6, now,
+                                         Dhcp6Server::OfferStage::kAck, raw);
+        CHECK(!IsZeroAddr(addr));
+        CHECK(server.LeaseCount() == 1);
+        const auto leases = server.Leases(now);
+        CHECK(leases.size() == 1);
+        std::fprintf(stderr, "[p155-o1-6] stored=%zu expected_max=%zu\n",
+                     leases[0].hostname.size(),
+                     static_cast<size_t>(
+                         ::vgww::core::limits::kMaxHostnameBytes));
+        CHECK(leases[0].hostname.size() <=
+              ::vgww::core::limits::kMaxHostnameBytes);
+        CHECK(vgww::core::IsValidUtf8(leases[0].hostname));
+        // Positive control: a well-formed name exactly at the ceiling is
+        // untouched.
+        Dhcp6Server at_limit(MakeConfig());
+        const std::string ok_name(253, 'b');
+        CHECK(!IsZeroAddr(at_limit.Acquire(kClientDuid, 7, now,
+                                           Dhcp6Server::OfferStage::kAck,
+                                           ok_name)));
+        auto kept = at_limit.Leases(now);
+        CHECK(kept.size() == 1);
+        if (!kept.empty()) {
+            CHECK(kept[0].hostname == ok_name);
+        }
+    }
+
     // --- 4. rapid commit ---------------------------------------------------
     void TestRapidCommit() {
         Dhcp6Server server(MakeConfig());
@@ -3799,12 +3833,57 @@ static void TestB81DumpLeasesDoesNotStallLockHolders() {
         CHECK(!parsed.has_ia);
     }
 
-int main() {
+    // P155 O2 red proof: only the FIRST IA_NA is walked for inner options.
+    // The inner TLV walk lives inside the `if (!out.has_ia_na)` guard
+    // (src/proto/dhcp6.cpp:253-277), so a SECOND IA_NA is only checked for
+    // `olen >= 12` (:246-248) and its inner structure is never validated.
+    // RFC 8415 21.6: an IA_NA whose IAADDR is shorter than 24 bytes is
+    // malformed, so such a frame must be discarded.
+    //
+    // RED contract: on HEAD the malformed second IA_NA parses successfully,
+    // so the final CHECK fails. Falsifiability: moving the inner walk out of
+    // the guard (or rejecting a second IA_NA) makes ParseDhcp6Frame return
+    // false and turns that CHECK green.
+    void TestP155O2SecondIaNaInnerBypass() {
+        Dhcp6View view;
+
+        // Second IA_NA: IAID + T1 + T2 = 12 bytes, then a truncated IAADDR
+        // (option header claims 24 bytes but only 1 byte is present).
+        std::vector<uint8_t> bad_inner;
+        PushU32(bad_inner, 2);    // IAID
+        PushU32(bad_inner, 0);    // T1
+        PushU32(bad_inner, 0);    // T2
+        PushU16(bad_inner, kDhcp6OptIaAddr);
+        PushU16(bad_inner, 24);   // claims a full IAADDR
+        bad_inner.push_back(0xAA);  // ... but carries a single byte
+
+        std::vector<uint8_t> p = {kDhcp6MsgSolicit, 0, 0, 0x51};
+        PushOption(p, kDhcp6OptClientId, kClientDuid);
+        PushOption(p, kDhcp6OptIaNa, IaNaPayload(1, false, nullptr));
+        PushOption(p, kDhcp6OptIaNa, bad_inner);
+        auto f = BuildFrameRaw(p, kClientLl, kDhcp6ClientPort,
+                               kDhcp6ServerPort);
+        const bool parsed = ParseDhcp6Frame(f.data(), f.size(), view);
+        std::fprintf(stderr, "[p155-o2] parsed=%d\n", parsed ? 1 : 0);
+        CHECK(!parsed);
+
+        // Control: the same malformed IA_NA as the FIRST (only) IA_NA must be
+        // rejected - the inner walk does run for the first IA.
+        std::vector<uint8_t> q = {kDhcp6MsgSolicit, 0, 0, 0x52};
+        PushOption(q, kDhcp6OptClientId, kClientDuid);
+        PushOption(q, kDhcp6OptIaNa, bad_inner);
+        auto g = BuildFrameRaw(q, kClientLl, kDhcp6ClientPort,
+                               kDhcp6ServerPort);
+        CHECK(!ParseDhcp6Frame(g.data(), g.size(), view));
+    }
+
+    int main() {
     TestParseDhcp6Malformed();
     TestBuildReplyLayout();
     TestSolicitAdvertise();
     TestSolicitWithoutIaNaDoesNotLease();
     TestAcquireWalkSanitizesHostname();
+    TestP155O1Acquire6CapsSanitizedHostname();
     TestRapidCommit();
     TestParseDhcp6RejectsNonEmptyRapidCommit();
     TestRequestReply();
@@ -3857,6 +3936,7 @@ int main() {
     TestBuildReplyFrameByteOrder();
     TestP154ServerIdAndIaRules();
     TestClassifierDhcpV6();
+    TestP155O2SecondIaNaInnerBypass();
     if (0 == g_failures) {
         std::puts("test_dhcp6: ALL PASS");
         return 0;

@@ -2107,6 +2107,100 @@ namespace {
         }
     }
 
+    // P155 O3: a UDP datagram whose header `length` field disagrees with the
+    // bytes actually held is a malformed datagram (RFC 768: Length is the
+    // UDP header + data length). The relay must DROP it, never forward a
+    // truncated body upstream.
+    //
+    // On HEAD the v4 handler computes `declared = uv.length - 8` and sends
+    // `min(declared, avail)` (dataplane.cpp:3587-3594), so a frame declaring
+    // 100 bytes while carrying only 20 forwards the 20 real bytes upstream.
+    // RED contract: the local upstream sink receives that truncated body, so
+    // the "no upstream datagram" CHECK fails. Falsifiability: dropping on
+    // `uv.length != segment_len` keeps the sink empty and turns it green.
+    void RunUdpLengthMismatchIsDroppedScenario() {
+        vgww::core::Config cfg;
+        cfg.adapter = "TestNIC";
+        cfg.gateway.ipv4 = kGatewayIp;
+        cfg.gateway.mask = (0u) | (0u << 8) | (255u << 16) | (255u << 24);
+        cfg.gateway.mac = kGatewayMac;
+        cfg.perf.workers = 1;
+        cfg.perf.ring_capacity = 256;
+        cfg.perf.max_conns = 64;
+        cfg.perf.dial_timeout_ms = 400;
+
+        const uint16_t kSinkPort = UniqueUdpPort(false);
+        CHECK(0 != kSinkPort);
+
+        // Local upstream sink: captures every datagram the relay forwards.
+        asio::io_context sink_io;
+        asio::ip::udp::socket sink(sink_io);
+        std::error_code sink_err;
+        sink.open(asio::ip::udp::v4(), sink_err);
+        CHECK(!sink_err);
+        sink.bind(asio::ip::udp::endpoint(
+                      asio::ip::make_address("127.0.0.1"), kSinkPort),
+                  sink_err);
+        CHECK(!sink_err);
+        sink.non_blocking(true);
+        std::atomic<bool> sink_stop{false};
+        std::vector<size_t> sink_sizes;
+        std::mutex sink_mutex;
+        std::thread sink_thread([&] {
+            while (!sink_stop.load()) {
+                char buf[2048];
+                asio::ip::udp::endpoint peer;
+                std::error_code err;
+                const size_t n =
+                    sink.receive_from(asio::buffer(buf), peer, 0, err);
+                if (err == asio::error::would_block) {
+                    std::this_thread::sleep_for(std::chrono::milliseconds(2));
+                    continue;
+                }
+                if (err || 0 == n) {
+                    continue;
+                }
+                std::lock_guard<std::mutex> lock(sink_mutex);
+                sink_sizes.push_back(n);
+            }
+        });
+
+        auto fake = std::make_unique<TestDriverClient>();
+        TestDriverClient* raw = fake.get();
+        vgww::runtime::Dataplane dataplane(cfg);
+        dataplane.SetDriverClient(std::move(fake));
+        std::string error;
+        CHECK(dataplane.Start(error));
+
+        // Learn the client MAC (the ARP exchange) before any relay traffic.
+        raw->InjectNow(BuildArpRequest());
+        std::this_thread::sleep_for(std::chrono::milliseconds(300));
+
+        // Malformed: UDP header declares 100 bytes (92 payload) but the IP
+        // datagram carries only 8 + 20. The IP total length stays truthful
+        // (28 + 20 = 48), so the frame is routed to the relay.
+        std::vector<uint8_t> bad = BuildUdpRequest(51077, kSinkPort, "MISMATCH");
+        const size_t udp_off = kEthernetHeaderLen + kIpv4HeaderLenMin + 4;
+        bad[udp_off] = 0;
+        bad[udp_off + 1] = 100;  // declared UDP length = 100
+        raw->InjectNow(bad);
+
+        std::this_thread::sleep_for(std::chrono::milliseconds(800));
+        {
+            std::lock_guard<std::mutex> lock(sink_mutex);
+            std::fprintf(stderr, "[p155-o3] upstream datagrams=%zu\n",
+                         sink_sizes.size());
+            CHECK(sink_sizes.empty());
+        }
+
+        std::string stop_error;
+        CHECK(dataplane.Stop(stop_error));
+        sink_stop.store(true);
+        if (sink_thread.joinable()) {
+            sink_thread.join();
+        }
+    }
+
     // batch205: the driver-reported m_Length is a DWORD with no bound. A
     // length past the fixed INTERMEDIATE_BUFFER array must be rejected (drop),
     // never used to index the frame, or the RX path reads out of bounds. The
@@ -3128,6 +3222,7 @@ int main() {
     RunIcmpReplySizeIsAccountedScenario();
     RunIcmp6ReplySizeIsAccountedScenario();
     RunOverlongReportedLengthIsDroppedScenario();
+    RunUdpLengthMismatchIsDroppedScenario();
     RunHostOriginatedScenario();
     RunRxRingOverflowCountedScenario();
     RunRateTableBoundedUnderForgedMacFloodScenario();

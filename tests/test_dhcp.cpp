@@ -3048,6 +3048,69 @@ void TestLeaseHostnameLearnt() {
         std::filesystem::remove(path, rm_ec_28);
     }
 
+    // P155 O1: SanitizeUtf8 replaces EACH ill-formed byte with U+FFFD
+    // (3 bytes), so a 255-byte option-12 value made entirely of 0xFF
+    // expands to 765 bytes. `Acquire` sanitizes but never truncates, so the
+    // lease store then holds a name far above kMaxHostnameBytes (253) while
+    // the reply builder still clamps the wire copy to 253: the store and the
+    // wire disagree about the same value, and the 253-byte store bound
+    // documented in core/limits.h does not hold on this path.
+    //
+    // RED contract: on HEAD the stored name is 765 bytes, so the size CHECK
+    // fails. Falsifiability: truncating the sanitized name to 253 code-point
+    // bytes inside Acquire makes every CHECK green.
+    void TestP155O1AcquireCapsSanitizedHostname() {
+        vgww::core::Config config;
+        bool ok = false;
+        config.gateway.ipv4 = vgww::core::ParseIpv4("192.168.0.60", ok);
+        CHECK(ok);
+        config.gateway.mask = vgww::core::ParseIpv4("255.255.255.0", ok);
+        CHECK(ok);
+        config.dhcp.pool_start = vgww::core::ParseIpv4("192.168.0.120", ok);
+        CHECK(ok);
+        config.dhcp.pool_end = vgww::core::ParseIpv4("192.168.0.130", ok);
+        CHECK(ok);
+        config.dhcp.lease_seconds = 3600;
+        DhcpServer server(config);
+
+        const WireMac mac{0x02, 0x00, 0x5E, 0x00, 0x00, 0x61};
+        const auto t0 = std::chrono::steady_clock::now();
+
+        // 255 ill-formed bytes: the largest value option 12 can carry (one
+        // TLV length octet), and the worst case for the expansion.
+        std::string raw(255, static_cast<char>(0xFF));
+        CHECK(0 != server.Acquire(mac, t0, DhcpServer::OfferStage::kAck, raw));
+
+        auto leases = server.Leases(t0);
+        CHECK(leases.size() == 1);
+        if (leases.empty()) {
+            return;
+        }
+        const std::string& stored = leases[0].hostname;
+        std::fprintf(stderr, "[p155-o1] stored=%zu expected_max=%zu\n",
+                     stored.size(),
+                     static_cast<size_t>(
+                         ::vgww::core::limits::kMaxHostnameBytes));
+        // The invariant under test: the STORE obeys the same 253-byte
+        // ceiling the wire path enforces.
+        CHECK(stored.size() <= ::vgww::core::limits::kMaxHostnameBytes);
+        // ...and the stored value is still well-formed UTF-8 (the sanitizer
+        // contract is not traded away by the cap).
+        CHECK(vgww::core::IsValidUtf8(stored));
+        // Positive control: a well-formed name exactly at the ceiling is
+        // untouched (the cap must not shorten legal input).
+        DhcpServer at_limit(config);
+        const WireMac mac2{0x02, 0x00, 0x5E, 0x00, 0x00, 0x62};
+        const std::string ok_name(253, 'a');
+        CHECK(0 != at_limit.Acquire(mac2, t0,
+                                    DhcpServer::OfferStage::kAck, ok_name));
+        auto kept = at_limit.Leases(t0);
+        CHECK(kept.size() == 1);
+        if (!kept.empty()) {
+            CHECK(kept[0].hostname == ok_name);
+        }
+    }
+
     // batch123: the CONTROL path (WebUI / POST /api/dhcp/bindings) is operator
     // input, not an untrusted client, so an ill-formed name is REJECTED (return
     // false -> HTTP 400) exactly like the oversize case, leaving the store
@@ -3583,6 +3646,7 @@ int main() {
     TestB111RuntimeBindingRejectsOversizedHostname();
     TestB123AcquireSanitizesIllFormedUtf8Hostname();
     TestB123UpsertBindingRejectsIllFormedUtf8Hostname();
+    TestP155O1AcquireCapsSanitizedHostname();
     TestB112RuntimeBindingRejectsAddressHeldByLiveLease();
     TestB114AcquireWalkDoesNotScanLeasesPerCandidate();
     TestOfferShortHold();

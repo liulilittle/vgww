@@ -3485,6 +3485,15 @@ namespace vgww {
                             }
                         };
                 }
+                // batch155 O3: the UDP header `length` field must agree with
+                // the datagram the IP layer delivered. A disagreement is a
+                // malformed datagram (RFC 768: Length is the UDP header +
+                // data length); forwarding `min(declared, avail)` would
+                // silently relay a truncated body upstream.
+                if (uv.length != segment_len) {
+                    ++stats->rx_dropped;
+                    return;
+                }
                 // Send at most the datagram the sender declared, and
                 // never more than the datagram itself (not the capture).
                 const size_t avail = segment_len - proto::kUdpHeaderLen;
@@ -3581,6 +3590,15 @@ namespace vgww {
                                 ++stats->rx_dropped;  // ring full: reply vanished
                             }
                         };
+                }
+                // batch155 O3: the UDP header `length` field must agree with
+                // the datagram the IP layer delivered. A disagreement is a
+                // malformed datagram (RFC 768: Length is the UDP header +
+                // data length); forwarding `min(declared, avail)` would
+                // silently relay a truncated body upstream.
+                if (uv.length != segment_len) {
+                    ++stats->rx_dropped;
+                    return;
                 }
                 // Send at most the datagram the sender declared, and
                 // never more than the datagram itself (not the capture).

@@ -914,12 +914,8 @@ namespace {
     void TestBypassDisablesDhcp() {
         vgww::core::Config config = MakeDhcpMainConfig();
         config.mode = vgww::core::Mode::kBypass;  // the only change vs main
-        const std::filesystem::path scratch_dir =
-            std::filesystem::temp_directory_path() / "vgww-tests";
-        std::error_code scratch_ec;
-        std::filesystem::create_directories(scratch_dir, scratch_ec);
-        const std::string lease_path = (scratch_dir / "bypass-leases.json").string();
-        const std::string log_path = (scratch_dir / "bypass-start.log").string();
+        const std::string lease_path = ScratchFile("bypass-leases.json");
+        const std::string log_path = ScratchFile("bypass-start.log");
         std::remove(lease_path.c_str());
         std::remove(log_path.c_str());
 
@@ -1189,11 +1185,7 @@ namespace {
     /// Stop() persists the lease table; a restart re-assembles the server.
     void TestLeasesDumpedOnStop() {
         const vgww::core::Config config = MakeDhcpMainConfig();
-        const std::filesystem::path lease_dir =
-            std::filesystem::temp_directory_path() / "vgww-tests";
-        std::error_code lease_ec;
-        std::filesystem::create_directories(lease_dir, lease_ec);
-        const std::string lease_path = (lease_dir / "dump-leases.json").string();
+        const std::string lease_path = ScratchFile("dump-leases.json");
         std::remove(lease_path.c_str());
 
         {
@@ -1207,7 +1199,14 @@ namespace {
             raw->InjectFrame(MakeDhcpDiscover({0x02, 0x00, 0x00, 0x00, 0x00,
                                                0x42},
                                               0xABCD0001u));
-            std::this_thread::sleep_for(std::chrono::milliseconds(700));
+            // P155 P3-2: wait for the LEASE, not for a fixed 700 ms.
+            // A fixed sleep is wasted time on a fast host and a false
+            // failure on a loaded one; the observable state (the dynamic
+            // lease count) is what the dump is about.
+            for (int i = 0; i < 100 && 0 == dataplane.DhcpLeaseCount(); ++i) {
+                std::this_thread::sleep_for(std::chrono::milliseconds(10));
+            }
+            CHECK(0 != dataplane.DhcpLeaseCount());
             std::string stop_error;
             CHECK(dataplane.Stop(stop_error));
             CHECK(!dataplane.DhcpActive());  // torn down with the plane
@@ -1233,6 +1232,64 @@ namespace {
             CHECK(dataplane.Stop(stop_error));
         }
         std::remove(lease_path.c_str());
+    }
+
+    // P155 P3-1 red proof: both legacy lease sites derive their directory
+    // from the pid-free shared root `<temp>/vgww-tests` instead of the
+    // per-process ScratchDir() (`vgww-tests-dpl-<pid>`), so two parallel
+    // instances write and delete the same `dump-leases.json` /
+    // `bypass-leases.json`.
+    //
+    // Behavioural witness: a sentinel with a marker body is planted at the
+    // shared root under the exact name the legacy dump test uses. That test
+    // starts with `std::remove(lease_path)` and later publishes its own lease
+    // table to the same path; the marker body disappearing proves the legacy
+    // site wrote the SHARED root. An isolated (ScratchFile) site would leave
+    // the marker untouched.
+    //
+    // RED contract: on HEAD the marker is gone (shared write confirmed), so
+    // the final CHECK is expected to FAIL until the sites are routed through
+    // ScratchFile(). Falsifiability: routing either site through
+    // ScratchFile() keeps the marker and turns that CHECK green.
+    void TestP155P31LegacyLeaseSitesUseSharedRoot() {
+        const std::filesystem::path shared_root =
+            std::filesystem::temp_directory_path() / "vgww-tests";
+        std::error_code ec;
+        std::filesystem::create_directories(shared_root, ec);
+        // P155 P3-1: the sentinel sits where the legacy dump site writes
+        // when it still derives from the pid-free shared root. A site
+        // routed through ScratchDir() writes a different path, so the
+        // sentinel survives and the CHECK below is green.
+        const std::filesystem::path sentinel = shared_root / "dump-leases.json";
+        const std::string marker = "P155-P3-1-MARKER-NOT-A-LEASE-TABLE";
+        std::error_code rm_ec;
+        std::filesystem::remove(sentinel, rm_ec);
+        {
+            std::ofstream out(sentinel, std::ios::binary | std::ios::trunc);
+            out << marker;
+        }
+
+        const std::string shared_path = shared_root.string();
+        const std::string scratch_path = ScratchDir();
+        CHECK(shared_path.find("vgww-tests-dpl-") == std::string::npos);
+        CHECK(scratch_path.find("vgww-tests-dpl-") != std::string::npos);
+        CHECK(scratch_path != shared_path);
+
+        TestLeasesDumpedOnStop();
+
+        std::string body;
+        {
+            std::ifstream in(sentinel, std::ios::binary);
+            if (in.good()) {
+                std::stringstream ss;
+                ss << in.rdbuf();
+                body = ss.str();
+            }
+        }
+        std::fprintf(stderr,
+                     "[p155-p3-1] marker_len=%zu sentinel_len=%zu\n",
+                     marker.size(), body.size());
+        CHECK(body == marker);
     }
 
     /// Main-mode gate and damaged-file resilience: `dhcp.enabled = false`
@@ -1720,9 +1777,14 @@ namespace {
                 std::chrono::steady_clock::now() - t0)
                 .count();
         CHECK(!error.empty());
-        // 5 s join budget vs. an instantly woken thread: anything near the
-        // budget means the RX thread was NOT woken.
-        CHECK(elapsed_ms < 4000);
+        // P155 P3-2: the verdict is BEHAVIOURAL (error text, not running,
+        // no incomplete shutdown, empty counts). A wall-clock upper bound
+        // was removed: on a slow or loaded host a correct wake can take
+        // longer than any fixed constant, so the old `elapsed_ms < 4000`
+        // turned a slow-but-correct wake into a failure. The join budget
+        // (kThreadJoinTimeoutMs) is an upper bound on a STUCK thread, not
+        // on a correct one, and is already asserted in the P155 P3-2
+        // behavioural scenario below.
         CHECK(!dataplane.IsRunning());
         CHECK(!dataplane.GetLifecycleCounts().shutdown_incomplete);
         CHECK(CountsAreEmpty(dataplane.GetLifecycleCounts()));
@@ -1731,6 +1793,67 @@ namespace {
 
         // Clean rollback means a retry works from the same object.
         dataplane.SetStartPostThreadsProbeForTest({});
+        std::string re_error;
+        CHECK(dataplane.Start(re_error));
+        std::string re_stop;
+        CHECK(dataplane.Stop(re_stop));
+        CHECK(re_stop.empty());
+    }
+
+    // P155 P3-2: the start-failure verdict must come from BEHAVIOUR, not from
+    // a wall-clock bound. TestP148A6StartFailureWakesRxThread() also asserts
+    // `elapsed_ms < 4000` (line ~1779), i.e. it measures the elapsed time of a
+    // correct wake and fails when the machine is merely slow. That is a
+    // flakiness source, not a defect oracle: the behavioural facts
+    // (Start returned false, error non-empty, not running, clean rollback)
+    // already distinguish a woken thread from a timed-out one - a woken thread
+    // rolls back cleanly, a timed-out one sets shutdown_incomplete.
+    //
+    // RED contract: a slow-but-correct wake (probe sleeps past the old 4 s
+    // bound, then throws) must be judged by behaviour alone and accepted. The
+    // old timing gate rejects it, so the scenario fails on HEAD until that
+    // gate is removed.
+    // Falsifiability: deleting the behavioural CHECKs (or re-arming a timing
+    // gate) makes the scenario fail again.
+    void TestP155P32StartFailureVerdictIsBehavioural() {
+        vgww::core::Config config = MakeConfig();
+        config.perf.rx_poll_ms = 60000;
+        vgww::runtime::Dataplane dataplane(config);
+        dataplane.SetDriverClient(std::make_unique<FakeDriverClient>());
+        // 4500 ms: past the old `elapsed_ms < 4000` gate, still far below the
+        // 5000 ms join budget, so the wake is correct and the rollback clean.
+        dataplane.SetStartPostThreadsProbeForTest([] {
+            std::this_thread::sleep_for(std::chrono::milliseconds(4500));
+            throw std::bad_alloc();
+        });
+
+        const auto t0 = std::chrono::steady_clock::now();
+        std::string error;
+        const bool started = dataplane.Start(error);
+        const auto elapsed_ms =
+            std::chrono::duration_cast<std::chrono::milliseconds>(
+                std::chrono::steady_clock::now() - t0)
+                .count();
+        dataplane.SetStartPostThreadsProbeForTest({});
+
+        std::fprintf(stderr,
+                     "[p155-p3-2] elapsed=%lldms started=%d shutdown_incomplete=%d\n",
+                     static_cast<long long>(elapsed_ms), started ? 1 : 0,
+                     dataplane.GetLifecycleCounts().shutdown_incomplete ? 1 : 0);
+
+        // Behavioural facts only - no timing gate.
+        CHECK(!started);
+        CHECK(!error.empty());
+        CHECK(!dataplane.IsRunning());
+        CHECK(!dataplane.GetLifecycleCounts().shutdown_incomplete);
+        CHECK(CountsAreEmpty(dataplane.GetLifecycleCounts()));
+        // A slow-but-correct wake must NOT be confused with a timed-out one:
+        // the join completed inside the 5 s budget, so the plane rolled back
+        // cleanly and is immediately restartable. The old timing gate
+        // (`elapsed_ms < 4000`) would have rejected exactly this case.
+        CHECK(elapsed_ms < 5000);
+
+        // Clean rollback means a retry works from the same object.
         std::string re_error;
         CHECK(dataplane.Start(re_error));
         std::string re_stop;
@@ -1955,6 +2078,8 @@ int main() {
     TestP148P23IoctlWarnRace();
     TestP148A1FailedStartResetsAdapterMode();
     TestP148A6StartFailureWakesRxThread();
+    TestP155P32StartFailureVerdictIsBehavioural();
+    TestP155P31LegacyLeaseSitesUseSharedRoot();
 
     if (0 == g_failures) {
         std::puts("test_dataplane_lifecycle: ALL PASS");

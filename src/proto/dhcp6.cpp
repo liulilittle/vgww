@@ -250,30 +250,36 @@ namespace vgww {
                         // batch154 D1: the IAID and the IAADDR must come from
                         // ONE IA_NA. The first IA wins; a later IA must not
                         // overwrite the IAID while the address stays behind.
-                        if (!out.has_ia_na) {
-                            out.has_ia_na = true;
+                        // batch155 O2: the inner TLV walk must run for EVERY
+                        // IA_NA, so a malformed inner option in a later IA is
+                        // rejected instead of silently skipped.
+                        const bool first_ia = !out.has_ia_na;
+                        out.has_ia_na = true;
+                        if (first_ia) {
                             out.iaid = ReadU32(value);
-                            size_t inner = kDhcp6IaNaMin;
-                            while (inner + 4 <= olen) {
-                                const uint16_t icode = ReadU16(value + inner);
-                                const uint16_t ilen = ReadU16(value + inner + 2);
-                                inner += 4;
-                                if (inner + ilen > olen) {
+                        }
+                        size_t inner = kDhcp6IaNaMin;
+                        while (inner + 4 <= olen) {
+                            const uint16_t icode = ReadU16(value + inner);
+                            const uint16_t ilen = ReadU16(value + inner + 2);
+                            inner += 4;
+                            if (inner + ilen > olen) {
+                                return fail();
+                            }
+                            if (kDhcp6OptIaAddr == icode) {
+                                if (ilen < 24) {
                                     return fail();
                                 }
-                                if (kDhcp6OptIaAddr == icode) {
-                                    if (ilen < 24) {
-                                        return fail();
-                                    }
+                                if (first_ia) {
                                     std::memcpy(out.ia_addr.data(),
                                                 value + inner, 16);
                                     out.has_ia_addr = true;
                                 }
-                                inner += ilen;
                             }
-                            if (inner != olen) {
-                                return fail();
-                            }
+                            inner += ilen;
+                        }
+                        if (inner != olen) {
+                            return fail();
                         }
                         break;
                     }
@@ -702,7 +708,9 @@ namespace vgww {
             // the store only holds well-formed UTF-8. Today the v6 wire never
             // carries a client hostname (callers pass an empty name), but the
             // guard keeps the invariant true if that changes.
-            const std::string reported_name = core::SanitizeUtf8(hostname);
+            const std::string reported_name = core::TruncateUtf8(
+                core::SanitizeUtf8(hostname),
+                ::vgww::core::limits::kMaxHostnameBytes);
             const std::chrono::seconds term =
                 (OfferStage::kOffer == stage)
                     ? std::min(kOfferHold,

@@ -115,4 +115,25 @@ namespace vgww::core {
         return out;
     }
 
+    /// Caps a sanitized value at `limit` bytes, backing off to the last
+    /// well-formed code-point boundary at or below the limit. SanitizeUtf8
+    /// replaces each ill-formed byte with a 3-byte U+FFFD, so the sanitized
+    /// length can exceed the wire value's; this is the same boundary rule the
+    /// reply builder applies (P145-F) so store and wire share one ceiling.
+    /// No-op when the value already fits. The caller passes a well-formed
+    /// value (post-SanitizeUtf8), so the walk never hits an ill-formed byte.
+    inline std::string TruncateUtf8(const std::string& in, std::size_t limit) {
+        if (in.size() <= limit) {
+            return in;
+        }
+        const auto* bytes =
+            reinterpret_cast<const unsigned char*>(in.data());
+        std::size_t cut = limit;
+        while (cut > 0 &&
+               0 == text_detail::SequenceLength(bytes, in.size(), cut)) {
+            --cut;
+        }
+        return in.substr(0, cut);
+    }
+
 }  // namespace vgww::core

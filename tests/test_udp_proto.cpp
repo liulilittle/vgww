@@ -463,11 +463,16 @@ namespace {
         CHECK(!UdpSegmentLengthV4(nullptr, 0, hdr, seg));
     }
 
-    void TestUdpSegmentLengthV4ToleratesAShortCapture() {
+    // batch155 O3: the helper only bounds the SEGMENT (IP layer); it does
+    // NOT judge the UDP header `length` field. The relay handler is the one
+    // that rejects a disagreement (dataplane.cpp HandleUdp/HandleUdpV6:
+    // `uv.length != segment_len` -> rx_dropped), because the IP length is the
+    // authoritative datagram size while the UDP length is a separate claim.
+    void TestUdpSegmentLengthV4IgnoresTheUdpLengthField() {
         size_t hdr = 0;
         size_t seg = 0;
-        // The datagram claims more than the capture holds: deliver what we
-        // have, never bytes beyond the capture.
+        // The IP datagram declares 28 bytes (no payload) while the capture
+        // holds 100: the bound must fall back to what was captured.
         auto truncated = MakeV4Datagram(28, 5, 100);
         CHECK(UdpSegmentLengthV4(truncated.data(), truncated.size(), hdr, seg));
         CHECK(hdr == 20);
@@ -502,7 +507,7 @@ namespace {
         CHECK(!UdpSegmentLengthV6(nullptr, 0, seg));
     }
 
-    void TestUdpSegmentLengthV6ToleratesAShortCapture() {
+    void TestUdpSegmentLengthV6IgnoresTheUdpLengthField() {
         size_t seg = 0;
         auto truncated = MakeV6Packet(48, 100);
         CHECK(UdpSegmentLengthV6(truncated.data(), truncated.size(), seg));
@@ -536,10 +541,10 @@ int main() {
 
     TestUdpSegmentLengthV4UsesTheIpTotalLength();
     TestUdpSegmentLengthV4RejectsMalformed();
-    TestUdpSegmentLengthV4ToleratesAShortCapture();
+    TestUdpSegmentLengthV4IgnoresTheUdpLengthField();
     TestUdpSegmentLengthV6UsesThePayloadLength();
     TestUdpSegmentLengthV6RejectsMalformed();
-    TestUdpSegmentLengthV6ToleratesAShortCapture();
+    TestUdpSegmentLengthV6IgnoresTheUdpLengthField();
     TestUdpSegmentLengthV6RejectsShortCaptureBelowHeader();
 
     TestBuildUdpFrameIpv4WireImage();

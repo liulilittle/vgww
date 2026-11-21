@@ -4,8 +4,9 @@
 // Scope: the virtual gateway answers pings addressed to ITSELF locally
 // (TTL-1 semantics are irrelevant for a local answer); pings for other
 // targets are relayed over a per-worker raw ICMP socket with id-NAT
-// (relay/icmp_relay.{h,cpp}, wired in runtime/dataplane.cpp:485-498 for the
-// socket and :1689-1756 for the send path; replies via HandleIcmpReply).
+// (relay/icmp_relay.{h,cpp}; wired in Dataplane::StartAll - see the raw
+// ICMP socket and IcmpRelay::ArmReceive call - with replies delivered by
+// Dataplane::HandleIcmpReply).
 // ============================================================================
 #pragma once
 
@@ -29,7 +30,8 @@ namespace vgww {
         inline constexpr size_t kIpv4HeaderLenMax = 60;
 
         /// Stack reply-buffer and builder ceiling. The SEND cap is decided by
-        /// Dataplane::AppendDown (src/runtime/dataplane.cpp:3748): 1514 driver
+        /// Dataplane::DownFrameCap (with the frame handed to
+        /// Dataplane::AppendDown): 1514 driver
         /// bytes, minus the 4-byte 802.1Q tag when the access VLAN is enabled
         /// (so 1510 there). A reply larger than the effective cap is refused
         /// by the caller (counted as icmp_too_big) instead of being built,

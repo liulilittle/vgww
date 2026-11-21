@@ -354,7 +354,15 @@ namespace vgww {
             // empty (the "renew without option 12 keeps the learnt name"
             // contract). SanitizeUtf8 is identity for well-formed input, so
             // the common path is unchanged.
-            const std::string reported_name = core::SanitizeUtf8(hostname);
+            //
+            // P155 O1: sanitizing can EXPAND (each ill-formed byte becomes a
+            // 3-byte U+FFFD), so a 255-byte option-12 value can store 765
+            // bytes. Cap the sanitized value on a code-point boundary so the
+            // store obeys the same kMaxHostnameBytes ceiling the wire path
+            // enforces (BuildDhcpReplyFrame push_option, P145-F).
+            const std::string reported_name = core::TruncateUtf8(
+                core::SanitizeUtf8(hostname),
+                ::vgww::core::limits::kMaxHostnameBytes);
 
             // Hold windows: an OFFER pins the address briefly so a client
             // that vanishes before REQUEST cannot drain the pool; DECLINEd
