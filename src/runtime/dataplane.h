@@ -284,6 +284,16 @@ namespace vgww {
             /// never calls this.
             size_t AppendDownForTest(const uint8_t* frame, size_t len);
 
+            /// P158 test seam: makes the worker's ICMP relay branch take its
+            /// RX buffer-pool exhaustion path (BufRef::Acquire returns empty),
+            /// so a test can prove that a pool-exhausted relayed ping is counted
+            /// as dropped instead of being mislabelled as a host passthrough.
+            /// Production leaves this unset.
+            void SetIcmpRelayPoolExhaustedForTest(bool exhausted);
+
+            /// P158 test seam: observed state of the seam above.
+            bool IcmpRelayPoolExhaustedForTest() const noexcept;
+
             /// P3-3: hard cap on the per-worker pending-accept backlog (each
             /// parked flow buffers up to 1 MiB while its upstream dial runs).
             /// pending_accepts can NEVER hold more than this many entries, so

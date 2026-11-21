@@ -756,6 +756,12 @@ namespace vgww {
             /// dereference, while the caller still holds the lifecycle lock.
             std::function<void()> dhcp_facade_probe_;
 
+            /// P158 test seam: forces the worker ICMP relay branch down its
+            /// buffer-pool exhaustion path (see
+            /// SetIcmpRelayPoolExhaustedForTest). Test-thread write before
+            /// Start(); read on the RX thread.
+            std::atomic<bool> icmp_relay_pool_exhausted_{false};
+
             /// batch99: periodic lease snapshot cadence (both families).
             std::atomic<int64_t> lease_dump_interval_ms_{60000};
 
@@ -2838,11 +2844,23 @@ namespace vgww {
                             proto::kIcmpEchoRequest == echo.type) {
                             // Relay toward the internet via a worker.
                             xtcp::buf::BufRef buf =
-                                xtcp::buf::BufRef::Acquire(
-                                    static_cast<UInt32>(ip_len));
-                            if (!buf.IsEmpty()) {
-                                std::memcpy(buf.Data(), ip, ip_len);
-                                buf.SetLen(static_cast<UInt32>(ip_len));
+                                icmp_relay_pool_exhausted_
+                                    ? xtcp::buf::BufRef()
+                                    : xtcp::buf::BufRef::Acquire(
+                                          static_cast<UInt32>(ip_len));
+                            if (buf.IsEmpty()) {
+                                // P158: the pool refused the frame, so it is
+                                // neither relayed nor handed to the host. Count
+                                // it as a drop - the TCP/UDP enqueue sites do
+                                // exactly this, and falling through to
+                                // host_passthrough would misreport a lost
+                                // frame as one that was passed on.
+                                ++stats->rx_dropped;
+                                break;
+                            }
+                            std::memcpy(buf.Data(), ip, ip_len);
+                            buf.SetLen(static_cast<UInt32>(ip_len));
+                            {
                                 const uint64_t hash = dsp::SymmetricFlowHash(view);
                                 const uint32_t worker =
                                     static_cast<uint32_t>(hash % worker_count);
@@ -4443,6 +4461,16 @@ namespace vgww {
                 return 0;
             }
             return impl_->PendingAcceptReserveForTest();
+        }
+
+        void Dataplane::SetIcmpRelayPoolExhaustedForTest(bool exhausted) {
+            if (impl_) {
+                impl_->icmp_relay_pool_exhausted_.store(exhausted);
+            }
+        }
+
+        bool Dataplane::IcmpRelayPoolExhaustedForTest() const noexcept {
+            return impl_ && impl_->icmp_relay_pool_exhausted_.load();
         }
 
         std::vector<Dataplane::ClientRate> Dataplane::ClientRates() const {

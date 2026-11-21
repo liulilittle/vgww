@@ -669,6 +669,34 @@ namespace {
     // socket -> echo -> back). Proves data actually moves both ways.
     // ------------------------------------------------------------------
 
+    /// P158: echo request aimed at a NON-gateway address, i.e. one the data
+    /// plane must RELAY through a worker (the gateway-answered variant is
+    /// answered inline in the RX thread and never reaches HandleIcmp).
+    std::vector<uint8_t> BuildEchoRequestTo(const uint8_t dst_wire[4],
+                                            size_t payload) {
+        const size_t icmp_len = kIcmpHeaderLen + payload;
+        std::vector<uint8_t> f(kEthernetHeaderLen + kIpv4HeaderLenMin + icmp_len);
+        BuildEthHeader(f.data(), kGatewayMac, kClientMac, kEthertypeIpv4);
+        uint8_t* ip = f.data() + kEthernetHeaderLen;
+        ip[0] = 0x45;
+        const uint16_t total = static_cast<uint16_t>(kIpv4HeaderLenMin + icmp_len);
+        ip[2] = static_cast<uint8_t>(total >> 8);
+        ip[3] = static_cast<uint8_t>(total & 0xFF);
+        ip[8] = 64;
+        ip[9] = 1;  // ICMP
+        std::memcpy(ip + 12, &kClientIp, 4);
+        std::memcpy(ip + 16, dst_wire, 4);
+        const uint16_t ip_ck = InternetChecksum(ip, kIpv4HeaderLenMin);
+        ip[10] = static_cast<uint8_t>(ip_ck >> 8);
+        ip[11] = static_cast<uint8_t>(ip_ck & 0xFF);
+        uint8_t* icmp = ip + kIpv4HeaderLenMin;
+        icmp[0] = kIcmpEchoRequest;
+        const uint16_t icmp_ck = InternetChecksum(icmp, icmp_len);
+        icmp[2] = static_cast<uint8_t>(icmp_ck >> 8);
+        icmp[3] = static_cast<uint8_t>(icmp_ck & 0xFF);
+        return f;
+    }
+
     /// Generic checksum-correct TCP segment from the client.
     std::vector<uint8_t> BuildTcpSegment(uint32_t seq, uint32_t ack, uint8_t flags,
                                          const std::string& payload,
@@ -2984,6 +3012,86 @@ namespace {
         CHECK(dataplane.Stop(stop_error));
     }
 
+    /// P158: the RX thread hands a relayed ICMP echo to a worker by copying it
+    /// into a pooled BufRef. When the pool refuses (Acquire returns empty) the
+    /// frame is neither relayed nor passed to the host, so it must be counted
+    /// as a DROP. Before the fix the branch fell through to the
+    /// "other ICMP: host handles" tail and counted host_passthrough instead -
+    /// a lost frame reported as a forwarded one.
+    ///
+    /// The seam drives the exact production branch (same Acquire-failure
+    /// predicate); the assertion is behavioural: rx_dropped advances and
+    /// host_passthrough does NOT.
+    void RunIcmpRelayPoolExhaustionIsCountedScenario() {
+        vgww::core::Config cfg;
+        cfg.adapter = "TestNIC";
+        cfg.gateway.ipv4 = kGatewayIp;
+        cfg.gateway.mask = (0u) | (0u << 8) | (255u << 16) | (255u << 24);
+        cfg.gateway.mac = kGatewayMac;
+        cfg.perf.workers = 1;
+        cfg.perf.ring_capacity = 256;
+        cfg.perf.rx_batch = 1;
+        cfg.perf.max_conns = 64;
+
+        auto fake = std::make_unique<TestDriverClient>();
+        TestDriverClient* raw = fake.get();
+        vgww::runtime::Dataplane dataplane(cfg);
+        dataplane.SetDriverClient(std::move(fake));
+        // Arm the failure BEFORE Start so the first relayed ping hits it.
+        dataplane.SetIcmpRelayPoolExhaustedForTest(true);
+        CHECK(dataplane.IcmpRelayPoolExhaustedForTest());
+
+        std::string error;
+        CHECK(dataplane.Start(error));
+        if (!error.empty()) {
+            std::fprintf(stderr, "[p158] start error: %s\n", error.c_str());
+        }
+
+        // Prime the neighbour table (ARP) so the relay path is reached.
+        raw->InjectNow(BuildArpRequest());
+        CHECK(WaitFor([&] { return dataplane.GetStats().arp_replies.load() > 0; },
+                      3000));
+        std::this_thread::sleep_for(std::chrono::milliseconds(300));
+
+        const uint64_t dropped_before =
+            dataplane.GetStats().rx_dropped.load();
+        const uint64_t pass_before =
+            dataplane.GetStats().host_passthrough.load();
+        const uint8_t dst_wire[4] = {93, 184, 216, 34};  // non-gateway target
+        raw->InjectNow(BuildEchoRequestTo(dst_wire, 16));
+        CHECK(WaitFor(
+            [&] {
+                return dataplane.GetStats().rx_dropped.load() >=
+                       dropped_before + 1;
+            },
+            3000));
+        std::this_thread::sleep_for(std::chrono::milliseconds(300));
+        const uint64_t dropped =
+            dataplane.GetStats().rx_dropped.load() - dropped_before;
+        const uint64_t passed =
+            dataplane.GetStats().host_passthrough.load() - pass_before;
+        std::fprintf(stderr,
+                     "[p158] pool-exhausted relay: rx_dropped=%llu "
+                     "host_passthrough=%llu\n",
+                     static_cast<unsigned long long>(dropped),
+                     static_cast<unsigned long long>(passed));
+        CHECK(dropped >= 1);
+        CHECK(0 == passed);  // a lost frame must not read as a passthrough
+
+        // Disarm: the next relayed ping must take the normal path again, so
+        // the seam does not mask the production branch.
+        dataplane.SetIcmpRelayPoolExhaustedForTest(false);
+        const uint64_t dropped2 = dataplane.GetStats().rx_dropped.load();
+        raw->InjectNow(BuildEchoRequestTo(dst_wire, 16));
+        std::this_thread::sleep_for(std::chrono::milliseconds(800));
+        std::fprintf(stderr, "[p158] after disarm: rx_dropped delta=%llu\n",
+                     static_cast<unsigned long long>(
+                         dataplane.GetStats().rx_dropped.load() - dropped2));
+
+        std::string stop_error;
+        CHECK(dataplane.Stop(stop_error));
+    }
+
     /// P3-1: AppendDown is the single choke point for every VGWW-generated
     /// downstream frame. It checked only the UPPER bound. The 802.1Q splice
     /// copies the fixed 14-byte Ethernet header unconditionally and then
@@ -3225,6 +3333,7 @@ int main() {
     RunUdpLengthMismatchIsDroppedScenario();
     RunHostOriginatedScenario();
     RunRxRingOverflowCountedScenario();
+    RunIcmpRelayPoolExhaustionIsCountedScenario();
     RunRateTableBoundedUnderForgedMacFloodScenario();
     RunClientLanFlagScenario();
     RunTxRingOrderedBatchScenario();
