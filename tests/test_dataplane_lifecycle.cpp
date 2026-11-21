@@ -714,6 +714,100 @@ namespace {
     }
 
 
+    /// Builds an Ethernet+IPv4+UDP+DHCPv4 message (client 68 -> server 67)
+    /// with option 53 = `msg_type` and, when non-zero, option 54 =
+    /// `server_id` (P154 D3).
+    std::vector<uint8_t> MakeDhcp4Request(const std::array<uint8_t, 6>& client,
+                                          uint32_t xid, uint8_t msg_type,
+                                          uint32_t server_id) {
+        std::vector<uint8_t> f = MakeDhcpDiscover(client, xid);
+        const size_t dhcp_at = 14 + 20 + 8;
+        // Replace the {53,1,<type>} option block that MakeDhcpDiscover wrote.
+        f.resize(dhcp_at + 240);
+        const uint8_t options[] = {53, 1, msg_type};
+        f.insert(f.end(), options, options + sizeof(options));
+        if (0 != server_id) {
+            f.push_back(54);
+            f.push_back(4);
+            f.push_back(static_cast<uint8_t>(server_id & 0xFF));
+            f.push_back(static_cast<uint8_t>((server_id >> 8) & 0xFF));
+            f.push_back(static_cast<uint8_t>((server_id >> 16) & 0xFF));
+            f.push_back(static_cast<uint8_t>((server_id >> 24) & 0xFF));
+        }
+        f.push_back(255);
+        const uint16_t total =
+            static_cast<uint16_t>(f.size() - (14 + 20));
+        f[16] = static_cast<uint8_t>(total >> 8);
+        f[17] = static_cast<uint8_t>(total & 0xFF);
+        const uint16_t udp_len = static_cast<uint16_t>(f.size() - (14 + 20));
+        f[14 + 20 + 4] = static_cast<uint8_t>(udp_len >> 8);
+        f[14 + 20 + 5] = static_cast<uint8_t>(udp_len & 0xFF);
+        return f;
+    }
+
+    /// P154 D3 (RFC 2131 4.3.2): a DHCPREQUEST that selects another server
+    /// (option 54 present and != ours) must not be ACKed and must not create
+    /// a lease. A REQUEST without option 54 (INIT-REBOOT/RENEWING/REBINDING)
+    /// stays legal and must still be ACKed.
+    void TestP154V4RequestForForeignServerIsNotAcked() {
+        const vgww::core::Config config = MakeDhcpMainConfig();
+        const std::string lease_path = ScratchFile("p154-request-leases.json");
+        std::remove(lease_path.c_str());
+
+        vgww::runtime::Dataplane dataplane(config, lease_path);
+        auto fake = std::make_unique<FakeDriverClient>();
+        FakeDriverClient* raw = fake.get();
+        dataplane.SetDriverClient(std::move(fake));
+        std::string error;
+        CHECK(dataplane.Start(error));
+        CHECK(dataplane.DhcpActive());
+
+        const std::array<uint8_t, 6> foreign_client = {0x02, 0x00, 0x00,
+                                                       0x00, 0x00, 0x71};
+        bool sid_ok = false;
+        const uint32_t foreign_sid =
+            vgww::core::ParseIpv4("192.168.40.2", sid_ok);
+        CHECK(sid_ok && 0 != foreign_sid);
+        raw->InjectFrame(MakeDhcp4Request(foreign_client, 0x51515151u, 3,
+                                          foreign_sid));
+        std::this_thread::sleep_for(std::chrono::milliseconds(700));
+        CHECK(!HasDhcpReply(raw->SentFrames()));
+        CHECK(0 == dataplane.DhcpLeaseCount());
+
+        // Positive control: the same REQUEST without option 54 is legal.
+        const std::array<uint8_t, 6> no_sid_client = {0x02, 0x00, 0x00,
+                                                      0x00, 0x00, 0x72};
+        raw->InjectFrame(
+            MakeDhcp4Request(no_sid_client, 0x52525252u, 3, 0));
+        const auto deadline =
+            std::chrono::steady_clock::now() + std::chrono::seconds(4);
+        while (std::chrono::steady_clock::now() < deadline &&
+               !HasDhcpReply(raw->SentFrames())) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(100));
+        }
+        CHECK(HasDhcpReply(raw->SentFrames()));
+        CHECK(1 == dataplane.DhcpLeaseCount());
+
+        // And a REQUEST naming THIS gateway is ACKed too.
+        bool ok = false;
+        const uint32_t own_sid = vgww::core::ParseIpv4("192.168.40.1", ok);
+        CHECK(ok && 0 != own_sid);
+        const std::array<uint8_t, 6> own_client = {0x02, 0x00, 0x00,
+                                                   0x00, 0x00, 0x73};
+        raw->InjectFrame(MakeDhcp4Request(own_client, 0x53535353u, 3, own_sid));
+        const auto deadline2 =
+            std::chrono::steady_clock::now() + std::chrono::seconds(4);
+        while (std::chrono::steady_clock::now() < deadline2 &&
+               2 != dataplane.DhcpLeaseCount()) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(100));
+        }
+        CHECK(2 == dataplane.DhcpLeaseCount());
+
+        std::string stop_error;
+        CHECK(dataplane.Stop(stop_error));
+        std::remove(lease_path.c_str());
+    }
+
     void PushDhcp6U16(std::vector<uint8_t>& v, uint16_t x) {
         v.push_back(static_cast<uint8_t>(x >> 8));
         v.push_back(static_cast<uint8_t>(x & 0xFF));
@@ -1843,6 +1937,7 @@ int main() {
     TestInjectedReadFailureStopsCleanly();
     TestBypassDisablesDhcp();
     TestDhcpDiscoverGetsOffer();
+    TestP154V4RequestForForeignServerIsNotAcked();
     TestLeasesDumpedOnStop();
     TestB99V4LeasesDumpedPeriodically();
     TestB100StopReportsLeaseDumpFailure();

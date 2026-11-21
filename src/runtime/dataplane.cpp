@@ -2979,6 +2979,17 @@ namespace vgww {
                         }
                         if (proto::kDhcpMsgDiscover == dhcp.msg_type ||
                             proto::kDhcpMsgRequest == dhcp.msg_type) {
+                            // batch154 D3 (RFC 2131 4.3.2): a DHCPREQUEST
+                            // that selects a different server is only a
+                            // notification - never ACK it and never create a
+                            // lease. An absent option 54 stays legal
+                            // (INIT-REBOOT / RENEWING / REBINDING). The
+                            // comparison matches dhcp.cpp Release().
+                            if (proto::kDhcpMsgRequest == dhcp.msg_type &&
+                                0 != dhcp.server_id &&
+                                dhcp.server_id != config.gateway.ipv4) {
+                                break;
+                            }
                             // OFFER pins the address briefly; only an ACK
                             // grants the full lease (an abandoned offer must
                             // not drain the pool for a whole lease term).

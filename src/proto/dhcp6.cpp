@@ -34,6 +34,54 @@
 namespace vgww {
     namespace proto {
 
+        // batch154: Server Identifier predicates live at namespace scope
+        // (not in the anonymous namespace below) so the Dhcp6Server member
+        // functions can use them too; MSVC two-phase lookup does not find
+        // unnamed-namespace helpers from a class member body.
+        /// RFC 8415 16.2/16.5/16.7: these three must NOT carry a Server
+        /// Identifier. INFORMATION-REQUEST is deliberately absent: 16.12
+        /// allows a Server Identifier there when it names this server.
+        inline bool ForbidsServerId(uint8_t msg_type) noexcept {
+            switch (msg_type) {
+                case kDhcp6MsgSolicit:
+                case kDhcp6MsgConfirm:
+                case kDhcp6MsgRebind:
+                    return true;
+                default:
+                    return false;
+            }
+        }
+
+        /// RFC 8415 16 (last paragraph): SOLICIT/CONFIRM/REBIND and
+        /// INFORMATION-REQUEST MUST arrive on a multicast destination.
+        inline bool RequiresMulticastDst(uint8_t msg_type) noexcept {
+            switch (msg_type) {
+                case kDhcp6MsgSolicit:
+                case kDhcp6MsgConfirm:
+                case kDhcp6MsgRebind:
+                case kDhcp6MsgInformationRequest:
+                    return true;
+                default:
+                    return false;
+            }
+        }
+
+        /// RFC 8415 16.4/16.6/16.8/16.9: these MUST carry a Server
+        /// Identifier. INFORMATION-REQUEST is handled separately: a present
+        /// Server Identifier there is legal only when it names this server
+        /// (16.12).
+        inline bool RequiresServerId(uint8_t msg_type) noexcept {
+            switch (msg_type) {
+                case kDhcp6MsgRequest:
+                case kDhcp6MsgRenew:
+                case kDhcp6MsgDecline:
+                case kDhcp6MsgRelease:
+                    return true;
+                default:
+                    return false;
+            }
+        }
+
         namespace {
 
             /// batch122: cumulative DHCPv6 frames refused by ParseDhcp6Frame
@@ -162,6 +210,7 @@ namespace vgww {
 
             // Strict option walk: every option must fit and the stream must
             // be consumed exactly (trailing bytes are malformed).
+            bool has_any_ia = false;
             size_t pos = 4;
             while (pos + 4 <= payload_len) {
                 const uint16_t code = ReadU16(payload + pos);
@@ -186,32 +235,45 @@ namespace vgww {
                         out.has_server_id = true;
                         out.server_duid.assign(value, value + olen);
                         break;
+                    case kDhcp6OptIaTa:
+                    case kDhcp6OptIaPd:
+                        // RFC 8415 16.12: any IA option makes an
+                        // INFORMATION-REQUEST discardable; stateful frames
+                        // here carry IA_NA, so only the presence is recorded.
+                        has_any_ia = true;
+                        break;
                     case kDhcp6OptIaNa: {
                         if (olen < kDhcp6IaNaMin) {
                             return fail();
                         }
-                        out.has_ia_na = true;
-                        out.iaid = ReadU32(value);
-                        size_t inner = kDhcp6IaNaMin;
-                        while (inner + 4 <= olen) {
-                            const uint16_t icode = ReadU16(value + inner);
-                            const uint16_t ilen = ReadU16(value + inner + 2);
-                            inner += 4;
-                            if (inner + ilen > olen) {
-                                return fail();
-                            }
-                            if (kDhcp6OptIaAddr == icode) {
-                                if (ilen < 24) {
+                        has_any_ia = true;
+                        // batch154 D1: the IAID and the IAADDR must come from
+                        // ONE IA_NA. The first IA wins; a later IA must not
+                        // overwrite the IAID while the address stays behind.
+                        if (!out.has_ia_na) {
+                            out.has_ia_na = true;
+                            out.iaid = ReadU32(value);
+                            size_t inner = kDhcp6IaNaMin;
+                            while (inner + 4 <= olen) {
+                                const uint16_t icode = ReadU16(value + inner);
+                                const uint16_t ilen = ReadU16(value + inner + 2);
+                                inner += 4;
+                                if (inner + ilen > olen) {
                                     return fail();
                                 }
-                                std::memcpy(out.ia_addr.data(), value + inner,
-                                            16);
-                                out.has_ia_addr = true;
+                                if (kDhcp6OptIaAddr == icode) {
+                                    if (ilen < 24) {
+                                        return fail();
+                                    }
+                                    std::memcpy(out.ia_addr.data(),
+                                                value + inner, 16);
+                                    out.has_ia_addr = true;
+                                }
+                                inner += ilen;
                             }
-                            inner += ilen;
-                        }
-                        if (inner != olen) {
-                            return fail();
+                            if (inner != olen) {
+                                return fail();
+                            }
                         }
                         break;
                     }
@@ -233,6 +295,23 @@ namespace vgww {
                 return fail();  // RFC 8415 16.1: Client Identifier mandatory
             }
             if (RequiresIaNa(msg_type) && !out.has_ia_na) {
+                return fail();
+            }
+            // RFC 8415 16.2/16.5/16.7: these messages must not carry a
+            // Server Identifier.
+            if (ForbidsServerId(msg_type) && out.has_server_id) {
+                return fail();
+            }
+            // RFC 8415 16.4/16.6/16.8/16.9: these messages must carry one.
+            if (RequiresServerId(msg_type) && !out.has_server_id) {
+                return fail();
+            }
+            // RFC 8415 16.12: INFORMATION-REQUEST may not carry an IA.
+            if (kDhcp6MsgInformationRequest == msg_type && has_any_ia) {
+                return fail();
+            }
+            // RFC 8415 16 (last paragraph): these four are multicast-only.
+            if (0xFF != out.dst_ip[0] && RequiresMulticastDst(msg_type)) {
                 return fail();
             }
             return true;
@@ -1799,6 +1878,14 @@ namespace vgww {
             if (view.client_duid.empty()) {
                 return false;
             }
+            // batch154 C/E4: the public entry point must not rely on the
+            // parser's preconditions. RFC 8415 16.4/16.6/16.8/16.9 make the
+            // Server Identifier mandatory, so a directly built view without
+            // one can never be served (this also closes Release()'s lenient
+            // "empty server-id" path for callers that bypass the parser).
+            if (proto::RequiresServerId(view.msg_type) && !view.has_server_id) {
+                return false;
+            }
             // Per-DUID anti-storm budget before any reply work; a silent
             // drop is correct (clients retry with backoff).
             if (!AllowFrame(view.client_duid, now)) {
@@ -1885,17 +1972,26 @@ namespace vgww {
                     break;
                 }
                 case proto::kDhcp6MsgConfirm: {
+                    // RFC 8415 18.3.3: when the CONFIRM carries no addresses
+                    // in any IA, the server MUST NOT send a Reply at all.
+                    if (!view.has_ia_addr) {
+                        return false;
+                    }
                     // RFC 8415 18.3.3: top-level Success when the address is
                     // still on-link, NotOnLink otherwise. No lease change.
                     reply.with_status = true;
                     reply.status_in_ia = false;
-                    reply.status =
-                        (view.has_ia_addr && InPrefix(view.ia_addr))
-                            ? proto::kDhcp6StatusSuccess
-                            : proto::kDhcp6StatusNotOnLink;
+                    reply.status = InPrefix(view.ia_addr)
+                                        ? proto::kDhcp6StatusSuccess
+                                        : proto::kDhcp6StatusNotOnLink;
                     break;
                 }
                 case proto::kDhcp6MsgInformationRequest: {
+                    // RFC 8415 16.12: a Server Identifier is legal only when
+                    // it names this server; a foreign one must be discarded.
+                    if (view.has_server_id && view.server_duid != server_duid_) {
+                        return false;
+                    }
                     // DNS-only reply; no address assignment (RFC 8415 18.3.6).
                     break;
                 }

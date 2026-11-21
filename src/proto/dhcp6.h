@@ -52,7 +52,9 @@ namespace vgww {
         inline constexpr uint16_t kDhcp6OptClientId = 1;
         inline constexpr uint16_t kDhcp6OptServerId = 2;
         inline constexpr uint16_t kDhcp6OptIaNa = 3;
+        inline constexpr uint16_t kDhcp6OptIaTa = 4;
         inline constexpr uint16_t kDhcp6OptIaAddr = 5;
+        inline constexpr uint16_t kDhcp6OptIaPd = 25;
         inline constexpr uint16_t kDhcp6OptOro = 6;
         inline constexpr uint16_t kDhcp6OptElapsed = 8;
         inline constexpr uint16_t kDhcp6OptStatusCode = 13;

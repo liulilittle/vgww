@@ -92,6 +92,9 @@ namespace {
                                              0xBB, 0xCC, 0xDD, 0xEE, 0x02};
     const std::vector<uint8_t> kStaticDuid = {0x00, 0x03, 0x00, 0x01, 0x11,
                                               0x22, 0x33, 0x44, 0x55, 0x66};
+    /// The gateway DUID derived from kGatewayMac (DUID-LL, RFC 8415 11.2).
+    const std::vector<uint8_t> kServerDuid = {0x00, 0x03, 0x00, 0x01, 0x30,
+                                              0xFC, 0x68, 0x88, 0xB4, 0xA9};
 
     const std::array<uint8_t, 16> kDns1 = {
         0xFD, 0x00, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0, 0, 0, 0, 0, 0, 0,
@@ -152,6 +155,18 @@ namespace {
             udp[4] = static_cast<uint8_t>(udp_len_override >> 8);
             udp[5] = static_cast<uint8_t>(udp_len_override & 0xFF);
         }
+        return frame;
+    }
+
+    /// Builds a full client request frame with an explicit IPv6 destination
+    /// (used to exercise the RFC 8415 16 multicast-only rule).
+    std::vector<uint8_t> BuildFrameRawTo(const std::vector<uint8_t>& payload,
+                                         const std::array<uint8_t, 16>& src,
+                                         const std::array<uint8_t, 16>& dst) {
+        std::vector<uint8_t> frame;
+        BuildUdpFrameV6(frame, kDhcp6MulticastMac, kClientMac, src.data(),
+                        kDhcp6ClientPort, dst.data(), kDhcp6ServerPort,
+                        payload.data(), payload.size());
         return frame;
     }
 
@@ -1733,25 +1748,30 @@ namespace {
         }
 
         // Server Identifier has the same 1..128 bound; empty and 129 reject.
+        // P154 A1: SOLICIT must not carry a Server Identifier, so the bound
+        // is exercised with REQUEST (which requires one, RFC 8415 16.4).
         {
-            std::vector<uint8_t> p = {kDhcp6MsgSolicit, 0, 0, 21};
+            std::vector<uint8_t> p = {kDhcp6MsgRequest, 0, 0, 21};
             PushOption(p, kDhcp6OptClientId, kClientDuid);
             PushOption(p, kDhcp6OptServerId, {});
+            PushOption(p, kDhcp6OptIaNa, IaNaPayload(1, false, nullptr));
             auto f = BuildFrameRaw(p, kClientLl, kDhcp6ClientPort,
                                    kDhcp6ServerPort);
             CHECK(!ParseDhcp6Frame(f.data(), f.size(), view));
 
-            std::vector<uint8_t> p2 = {kDhcp6MsgSolicit, 0, 0, 22};
+            std::vector<uint8_t> p2 = {kDhcp6MsgRequest, 0, 0, 22};
             PushOption(p2, kDhcp6OptClientId, kClientDuid);
             PushOption(p2, kDhcp6OptServerId, std::vector<uint8_t>(129, 0x11));
+            PushOption(p2, kDhcp6OptIaNa, IaNaPayload(1, false, nullptr));
             auto f2 = BuildFrameRaw(p2, kClientLl, kDhcp6ClientPort,
                                     kDhcp6ServerPort);
             CHECK(!ParseDhcp6Frame(f2.data(), f2.size(), view));
 
             // Control: a 128-byte server DUID (the documented maximum) parses.
-            std::vector<uint8_t> p3 = {kDhcp6MsgSolicit, 0, 0, 23};
+            std::vector<uint8_t> p3 = {kDhcp6MsgRequest, 0, 0, 23};
             PushOption(p3, kDhcp6OptClientId, kClientDuid);
             PushOption(p3, kDhcp6OptServerId, std::vector<uint8_t>(128, 0x22));
+            PushOption(p3, kDhcp6OptIaNa, IaNaPayload(1, false, nullptr));
             auto f3 = BuildFrameRaw(p3, kClientLl, kDhcp6ClientPort,
                                     kDhcp6ServerPort);
             CHECK(ParseDhcp6Frame(f3.data(), f3.size(), view));
@@ -1881,17 +1901,40 @@ namespace {
 
         // Every message type that requires IA_NA is enforced, and every one
         // that does not is accepted without it.
+        // P154: RFC 8415 16.4/16.6/16.8/16.9 make the Server Identifier
+        // mandatory for REQUEST/RENEW/RELEASE/DECLINE, while 16.2/16.5/16.7
+        // forbid it for SOLICIT/CONFIRM/REBIND. The two groups therefore
+        // need different frames to parse.
         {
-            const std::vector<uint8_t> needs = {
-                kDhcp6MsgRequest, kDhcp6MsgConfirm, kDhcp6MsgRenew,
-                kDhcp6MsgRebind, kDhcp6MsgRelease, kDhcp6MsgDecline};
-            for (uint8_t mt : needs) {
+            const std::vector<uint8_t> needs_sid = {kDhcp6MsgRequest,
+                                                    kDhcp6MsgRenew,
+                                                    kDhcp6MsgRelease,
+                                                    kDhcp6MsgDecline};
+            for (uint8_t mt : needs_sid) {
+                std::vector<uint8_t> p = {mt, 0, 0, 33};
+                PushOption(p, kDhcp6OptClientId, kClientDuid);
+                PushOption(p, kDhcp6OptIaNa, IaNaPayload(1, false, nullptr));
+                auto f = BuildFrameRaw(p, kClientLl, kDhcp6ClientPort,
+                                       kDhcp6ServerPort);
+                CHECK(!ParseDhcp6Frame(f.data(), f.size(), view));
+                // Control: adding the Server Identifier makes each one parse.
+                std::vector<uint8_t> p2 = {mt, 0, 0, 34};
+                PushOption(p2, kDhcp6OptClientId, kClientDuid);
+                PushOption(p2, kDhcp6OptServerId, kServerDuid);
+                PushOption(p2, kDhcp6OptIaNa, IaNaPayload(1, false, nullptr));
+                auto f2 = BuildFrameRaw(p2, kClientLl, kDhcp6ClientPort,
+                                        kDhcp6ServerPort);
+                CHECK(ParseDhcp6Frame(f2.data(), f2.size(), view));
+            }
+            const std::vector<uint8_t> needs_ia_no_sid = {kDhcp6MsgConfirm,
+                                                          kDhcp6MsgRebind};
+            for (uint8_t mt : needs_ia_no_sid) {
                 std::vector<uint8_t> p = {mt, 0, 0, 33};
                 PushOption(p, kDhcp6OptClientId, kClientDuid);
                 auto f = BuildFrameRaw(p, kClientLl, kDhcp6ClientPort,
                                        kDhcp6ServerPort);
                 CHECK(!ParseDhcp6Frame(f.data(), f.size(), view));
-                // Control: adding IA_NA makes each one parse.
+                // Control: adding IA_NA makes each one parse (no Server Id).
                 std::vector<uint8_t> p2 = {mt, 0, 0, 34};
                 PushOption(p2, kDhcp6OptClientId, kClientDuid);
                 PushOption(p2, kDhcp6OptIaNa, IaNaPayload(1, false, nullptr));
@@ -1908,6 +1951,205 @@ namespace {
                                        kDhcp6ServerPort);
                 CHECK(!ParseDhcp6Frame(f.data(), f.size(), view) == false);
             }
+        }
+    }
+
+    /// P154: RFC 8415 section 16 Server Identifier / IA rules and the
+    /// CONFIRM/INFORMATION-REQUEST contracts.
+    void TestP154ServerIdAndIaRules() {
+        Dhcp6View view;
+        const std::array<uint8_t, 16> kUnicast = {
+            0xFD, 0x00, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0, 0, 0, 0,
+            0,    0,    0,    0x01};
+
+        // A1 (16.2/16.5/16.7): SOLICIT/CONFIRM/REBIND must not carry a
+        // Server Identifier - neither our own nor a foreign one.
+        for (uint8_t mt : {kDhcp6MsgSolicit, kDhcp6MsgConfirm,
+                           kDhcp6MsgRebind}) {
+            const bool needs_ia = kDhcp6MsgSolicit != mt;
+            for (const std::vector<uint8_t>* sid :
+                 {&kServerDuid, &kOtherDuid}) {
+                auto bad = BuildRequest(mt, 0x300001, kClientDuid, needs_ia, 1,
+                                        false, nullptr, false, *sid);
+                CHECK(!ParseDhcp6Frame(bad.data(), bad.size(), view));
+            }
+            // Positive control: the same message without one parses.
+            auto ok = BuildRequest(mt, 0x300002, kClientDuid, needs_ia, 1,
+                                   false, nullptr, false);
+            CHECK(ParseDhcp6Frame(ok.data(), ok.size(), view));
+        }
+
+        // A2 (16.4/16.6/16.8/16.9): REQUEST/RENEW/RELEASE/DECLINE must carry
+        // one. Missing it is rejected; our own Server Identifier parses.
+        for (uint8_t mt : {kDhcp6MsgRequest, kDhcp6MsgRenew,
+                           kDhcp6MsgRelease, kDhcp6MsgDecline}) {
+            auto missing = BuildRequest(mt, 0x300003, kClientDuid, true, 1,
+                                        false, nullptr, false);
+            CHECK(!ParseDhcp6Frame(missing.data(), missing.size(), view));
+            auto own = BuildRequest(mt, 0x300004, kClientDuid, true, 1, false,
+                                    nullptr, false, kServerDuid);
+            CHECK(ParseDhcp6Frame(own.data(), own.size(), view));
+            CHECK(view.has_server_id && view.server_duid == kServerDuid);
+        }
+
+        // A3 (16.12): INFORMATION-REQUEST carrying any IA option is
+        // discarded. IA_TA (4) and IA_PD (25) were previously swallowed by
+        // the default branch, so they are exercised explicitly.
+        {
+            for (uint16_t ia_code :
+                 {uint16_t{kDhcp6OptIaNa}, uint16_t{kDhcp6OptIaTa},
+                  uint16_t{kDhcp6OptIaPd}}) {
+                std::vector<uint8_t> p = {kDhcp6MsgInformationRequest, 0, 0,
+                                          0x36};
+                PushOption(p, kDhcp6OptClientId, kClientDuid);
+                std::vector<uint8_t> ia;
+                PushU32(ia, 7);
+                PushU32(ia, 0);
+                PushU32(ia, 0);
+                PushOption(p, ia_code, ia);
+                auto f = BuildFrameRaw(p, kClientLl, kDhcp6ClientPort,
+                                       kDhcp6ServerPort);
+                CHECK(!ParseDhcp6Frame(f.data(), f.size(), view));
+            }
+            // Positive control: an IA-less INFORMATION-REQUEST parses.
+            auto ok = BuildRequest(kDhcp6MsgInformationRequest, 0x300005,
+                                   kClientDuid, false, 0, false, nullptr,
+                                   false, std::vector<uint8_t>(),
+                                   /*oro=*/true);
+            CHECK(ParseDhcp6Frame(ok.data(), ok.size(), view));
+        }
+
+        // A5 (16 last paragraph): SOLICIT/CONFIRM/REBIND/INFORMATION-REQUEST
+        // must arrive on a multicast destination; the other four must not be
+        // constrained by this rule.
+        {
+            for (uint8_t mt : {kDhcp6MsgSolicit, kDhcp6MsgConfirm,
+                               kDhcp6MsgRebind,
+                               kDhcp6MsgInformationRequest}) {
+                std::vector<uint8_t> p = {mt, 0, 0, 0x37};
+                PushOption(p, kDhcp6OptClientId, kClientDuid);
+                if (kDhcp6MsgInformationRequest != mt) {
+                    PushOption(p, kDhcp6OptIaNa,
+                               IaNaPayload(1, false, nullptr));
+                }
+                auto unicast =
+                    BuildFrameRawTo(p, kClientLl, kUnicast);
+                CHECK(!ParseDhcp6Frame(unicast.data(), unicast.size(), view));
+                auto group = BuildFrameRaw(p, kClientLl, kDhcp6ClientPort,
+                                           kDhcp6ServerPort);
+                CHECK(ParseDhcp6Frame(group.data(), group.size(), view));
+            }
+            // Control: a REQUEST to a unicast destination stays legal.
+            std::vector<uint8_t> req = {kDhcp6MsgRequest, 0, 0, 0x38};
+            PushOption(req, kDhcp6OptClientId, kClientDuid);
+            PushOption(req, kDhcp6OptServerId, kServerDuid);
+            PushOption(req, kDhcp6OptIaNa, IaNaPayload(1, false, nullptr));
+            auto req_unicast = BuildFrameRawTo(req, kClientLl, kUnicast);
+            CHECK(ParseDhcp6Frame(req_unicast.data(), req_unicast.size(), view));
+        }
+
+        // D1: two IA_NA options - the IAID and the IAADDR must come from the
+        // SAME IA. The first IA wins, so iaid==1 with the first IA's address.
+        {
+            std::array<uint8_t, 16> wanted = kPoolStart;
+            std::vector<uint8_t> p = {kDhcp6MsgSolicit, 0, 0, 0x39};
+            PushOption(p, kDhcp6OptClientId, kClientDuid);
+            PushOption(p, kDhcp6OptIaNa,
+                       IaNaPayload(1, true, &wanted));
+            PushOption(p, kDhcp6OptIaNa,
+                       IaNaPayload(2, false, nullptr));
+            auto f = BuildFrameRaw(p, kClientLl, kDhcp6ClientPort,
+                                   kDhcp6ServerPort);
+            CHECK(ParseDhcp6Frame(f.data(), f.size(), view));
+            CHECK(view.has_ia_na);
+            CHECK(view.iaid == 1);
+            CHECK(view.has_ia_addr && view.ia_addr == wanted);
+        }
+
+        // A4 (16.12): INFORMATION-REQUEST with a foreign Server Identifier is
+        // discarded; our own Server Identifier stays legal.
+        {
+            Dhcp6Server server(MakeConfig());
+            const auto now = std::chrono::steady_clock::now();
+            auto foreign = BuildRequest(kDhcp6MsgInformationRequest, 0x300006,
+                                        kClientDuid, false, 0, false, nullptr,
+                                        false, kOtherDuid, /*oro=*/true);
+            Dhcp6View foreign_view;
+            CHECK(ParseDhcp6Frame(foreign.data(), foreign.size(),
+                                  foreign_view));
+            std::vector<uint8_t> ignored;
+            CHECK(!server.HandleFrame(foreign_view, kClientMac, kClientLl, now,
+                                      ignored));
+
+            Dhcp6Server own_server(MakeConfig());
+            auto own = BuildRequest(kDhcp6MsgInformationRequest, 0x300007,
+                                    kClientDuid, false, 0, false, nullptr,
+                                    false, own_server.ServerDuid(),
+                                    /*oro=*/true);
+            Dhcp6View own_view;
+            CHECK(ParseDhcp6Frame(own.data(), own.size(), own_view));
+            std::vector<uint8_t> reply;
+            CHECK(own_server.HandleFrame(own_view, kClientMac, kClientLl, now,
+                                         reply));
+            ParsedReply parsed;
+            CHECK(ParseReply(reply, parsed));
+            CHECK(parsed.msg_type == kDhcp6MsgReply);
+            CHECK(parsed.dns.size() == 2);
+        }
+
+        // B' (18.3.3): a CONFIRM whose IA carries no IAADDR must not be
+        // answered at all.
+        {
+            Dhcp6Server server(MakeConfig());
+            const auto now = std::chrono::steady_clock::now();
+            auto no_addr = BuildRequest(kDhcp6MsgConfirm, 0x300008, kClientDuid,
+                                        true, 1, false, nullptr, false);
+            Dhcp6View no_addr_view;
+            CHECK(ParseDhcp6Frame(no_addr.data(), no_addr.size(),
+                                  no_addr_view));
+            CHECK(!no_addr_view.has_ia_addr);
+            std::vector<uint8_t> ignored;
+            CHECK(!server.HandleFrame(no_addr_view, kClientMac, kClientLl, now,
+                                      ignored));
+
+            // Positive control: with an in-prefix IAADDR a Reply is sent.
+            std::array<uint8_t, 16> on_link = kPoolStart;
+            auto with_addr = BuildRequest(kDhcp6MsgConfirm, 0x300009,
+                                          kClientDuid, true, 1, true, &on_link,
+                                          false);
+            Dhcp6View with_addr_view;
+            CHECK(ParseDhcp6Frame(with_addr.data(), with_addr.size(),
+                                  with_addr_view));
+            std::vector<uint8_t> reply;
+            CHECK(server.HandleFrame(with_addr_view, kClientMac, kClientLl, now,
+                                     reply));
+            ParsedReply parsed;
+            CHECK(ParseReply(reply, parsed));
+            CHECK(parsed.msg_type == kDhcp6MsgReply);
+            CHECK(parsed.has_status &&
+                  parsed.status == kDhcp6StatusSuccess && parsed.top_status);
+        }
+
+        // C/E4: HandleFrame is public, so a directly built RELEASE view with
+        // no Server Identifier must not fall through to Release()'s lenient
+        // "empty server-id" deletion.
+        {
+            Dhcp6Server server(MakeConfig());
+            const auto t0 = std::chrono::steady_clock::now();
+            const auto held = server.Acquire(kClientDuid, 9, t0,
+                                             Dhcp6Server::OfferStage::kAck);
+            CHECK(!IsZeroAddr(held));
+            CHECK(server.LeaseCount() == 1);
+            Dhcp6View bare;
+            bare.msg_type = kDhcp6MsgRelease;
+            bare.xid = 0x30000A;
+            bare.client_duid = kClientDuid;
+            bare.has_ia_na = true;
+            bare.iaid = 9;
+            std::vector<uint8_t> ignored;
+            CHECK(!server.HandleFrame(bare, kClientMac, kClientLl, t0,
+                                      ignored));
+            CHECK(server.LeaseCount() == 1);
         }
     }
 
@@ -3613,6 +3855,7 @@ int main() {
     TestParseDhcp6HeaderGates();
     TestParseDhcp6OptionEdges();
     TestBuildReplyFrameByteOrder();
+    TestP154ServerIdAndIaRules();
     TestClassifierDhcpV6();
     if (0 == g_failures) {
         std::puts("test_dhcp6: ALL PASS");
