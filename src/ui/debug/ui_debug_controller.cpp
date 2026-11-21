@@ -164,13 +164,15 @@ namespace vgww {
                 return j;
             }
 
-            /// Standard half-open AABB intersection. `Rect` only provides
-            /// Contains (element.h), and occlusion needs rect-vs-rect overlap
-            /// for the spec's "later-drawn op whose rect overlaps the target"
-            /// (spec L105-106). Touching edges do not count as overlap.
+            /// Standard half-open AABB intersection, delegated to the single
+            /// shared predicate Rect::Intersects (element.h) so the UI layer
+            /// keeps ONE overlap implementation: RenderCtx::CulledOut and the
+            /// window's dirty-vs-titlebar test route through the same call and
+            /// a degenerate box (w/h <= 0) never overlaps. A local copy of the
+            /// interval test omitted that guard, so a zero-extent target whose
+            /// anchor lay inside an op's box was reported as covered.
             bool RectsOverlap(const Rect& a, const Rect& b) noexcept {
-                return !(a.x + a.w <= b.x || b.x + b.w <= a.x ||
-                         a.y + a.h <= b.y || b.y + b.h <= a.y);
+                return a.Intersects(b);
             }
 
             /// Exact field match used to locate the target element's own op

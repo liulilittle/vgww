@@ -9510,6 +9510,53 @@ static void TestDebugDrawOps() {
     }
 }
 
+// P160: `occlusion` id/path mode must use the SAME half-open overlap predicate
+// as the rest of the UI layer (Rect::Intersects, element.h) - documented there
+// as the ONE shared predicate whose degenerate box never overlaps. The
+// controller's local RectsOverlap omits that guard, so a zero-extent target
+// whose anchor lies strictly inside an op's box is reported as covered.
+static void TestP160OcclusionDegenerateTarget() {
+    using namespace vgww::ui;
+    FixTextMetrics();
+
+    // Absolute-positioned panel: every child keeps the rect Arrange gave it,
+    // so the zero-extent target can sit strictly inside the covering box.
+    OverlapPanel root;
+    root.id = "root";
+    // A zero-extent box anchored strictly INSIDE the covering box below.
+    auto* zero = static_cast<ColorBox*>(
+        root.Add(std::make_unique<ColorBox>(Color{1.0f, 0.0f, 0.0f, 1.0f})));
+    zero->id = "zero";
+    auto* over = static_cast<ColorBox*>(
+        root.Add(std::make_unique<ColorBox>(Color{0.0f, 0.0f, 1.0f, 1.0f})));
+    over->id = "over";
+    root.Arrange({0.0f, 0.0f, 200.0f, 120.0f});
+    zero->Arrange(Rect{100.0f, 60.0f, 0.0f, 0.0f});
+    CHECK(zero->visible);
+    CHECK(zero->bounds().w == 0.0f && zero->bounds().h == 0.0f);
+    CHECK(over->bounds().w == 200.0f && over->bounds().h == 120.0f);
+
+    VgwwWindow w;
+    w.SetRoot(&root);
+    UiDebugController c;
+    c.Bind(&root, &w, nullptr, nullptr);
+
+    // Ground truth: the shared predicate says a degenerate box never overlaps.
+    CHECK(!zero->bounds().Intersects(over->bounds()));
+
+    const auto occ = c.RunOneCommand({{"op", "occlusion"}, {"id", "zero"}});
+    CHECK(occ.value("ok", false) == true);
+    if (occ.contains("data") && occ["data"].is_object() &&
+        occ["data"].contains("coverage") &&
+        occ["data"]["coverage"].is_array()) {
+        const auto& cov = occ["data"]["coverage"];
+        std::printf("P160 degenerate coverage=%zu\n", cov.size());
+        CHECK(cov.empty());  // a zero-area target is covered by nothing
+    } else {
+        CHECK(false);  // occlusion data.coverage missing
+    }
+}
+
 // ---- Task 6: HTTP batch protocol + UI-thread marshaling ----
 
 // Minimal asio loopback HTTP client for the UiDebugServer round-trip test.
@@ -39396,6 +39443,7 @@ int main() {
     TestDebugInput();
     TestDebugControl();
     TestDebugDrawOps();
+    TestP160OcclusionDegenerateTarget();
     TestDebugServerHttp();
     TestDebugOnUiDebugHook();
     TestDebugServerRoute();
